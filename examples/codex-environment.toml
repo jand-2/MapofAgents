@@ -1,0 +1,12 @@
+# Sample Codex desktop environment file.
+# Keep local .codex/ directories out of git.
+version = 1
+name = "mapofagents"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "Run"
+icon = "run"
+command = "./script/build_and_run.sh"
