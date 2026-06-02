@@ -254,9 +254,7 @@ public final class WorkflowSupervisorStore {
     }
 
     public func connectCodexRemote(_ remote: CodexDesktopRemote) async {
-        codexRemoteDiagnostics[remote.id] = [
-            RuntimeDiagnosticStep(id: "connect", title: "Remote connection", status: .running, detail: remote.hostname ?? remote.hostID),
-        ]
+        codexRemoteDiagnostics[remote.id] = CodexRemoteTunnelService.pendingConnectionDiagnosticSteps(for: remote)
         await supervisor.upsertMachine(
             SupervisorMachine(
                 id: remote.id,
@@ -274,30 +272,52 @@ public final class WorkflowSupervisorStore {
                 remoteTunnels[remote.id] = nil
             }
 
-            let tunnel = try await CodexRemoteTunnelService.startTunnel(for: remote)
+            let tunnelResult = try await CodexRemoteTunnelService.startTunnelWithDiagnostics(
+                for: remote,
+                onDiagnosticsUpdate: { [weak self] steps in
+                    await MainActor.run {
+                        self?.codexRemoteDiagnostics[remote.id] = steps
+                    }
+                }
+            )
+            let tunnel = tunnelResult.tunnel
+            var diagnostics = tunnelResult.diagnostics
             remoteTunnels[remote.id] = tunnel
             if await connectRemote(tunnel.endpoint) {
                 await hostRegistry.record(id: remote.id, name: remote.displayName, endpointURL: tunnel.endpoint.url)
-                codexRemoteDiagnostics[remote.id] = [
-                    RuntimeDiagnosticStep(id: "connect", title: "Remote connection", status: .passed, detail: tunnel.endpoint.url.absoluteString),
-                ]
+                diagnostics.append(
+                    RuntimeDiagnosticStep(
+                        id: "relay-handshake",
+                        title: "Relay handshake connected",
+                        status: .passed,
+                        detail: tunnel.endpoint.url.absoluteString,
+                        evidence: "initialize + initialized over workflow relay endpoint"
+                    )
+                )
+                codexRemoteDiagnostics[remote.id] = diagnostics
             } else {
                 tunnel.stop()
                 remoteTunnels[remote.id] = nil
-                codexRemoteDiagnostics[remote.id] = [
+                diagnostics.append(
                     RuntimeDiagnosticStep(
-                        id: "connect",
-                        title: "Remote connection",
+                        id: "relay-handshake",
+                        title: "Relay handshake connected",
                         status: .failed,
                         detail: "Tunnel opened, but the Codex App Server handshake failed.",
+                        evidence: "workflow relay initialize failed after tunnel verification",
                         action: .restartAppServer
-                    ),
-                ]
+                    )
+                )
+                codexRemoteDiagnostics[remote.id] = diagnostics
             }
         } catch {
-            codexRemoteDiagnostics[remote.id] = [
-                RuntimeDiagnosticStep(id: "connect", title: "Remote connection", status: .failed, detail: error.localizedDescription),
-            ]
+            if let tunnelError = error as? CodexRemoteTunnelError, !tunnelError.diagnosticSteps.isEmpty {
+                codexRemoteDiagnostics[remote.id] = tunnelError.diagnosticSteps
+            } else {
+                codexRemoteDiagnostics[remote.id] = [
+                    RuntimeDiagnosticStep(id: "connect", title: "Remote connection", status: .failed, detail: error.localizedDescription),
+                ]
+            }
             await supervisor.upsertMachine(
                 SupervisorMachine(
                     id: remote.id,
@@ -313,13 +333,16 @@ public final class WorkflowSupervisorStore {
     }
 
     public func diagnoseCodexRemote(_ remote: CodexDesktopRemote) async {
-        codexRemoteDiagnostics[remote.id] = [
-            RuntimeDiagnosticStep(id: "ssh", title: "SSH connection", status: .running, detail: remote.hostname ?? remote.hostID),
-            RuntimeDiagnosticStep(id: "codex", title: "Codex CLI", status: .pending),
-            RuntimeDiagnosticStep(id: "app-server", title: "App Server command", status: .pending),
-        ]
+        codexRemoteDiagnostics[remote.id] = CodexRemoteTunnelService.pendingConnectionDiagnosticSteps(for: remote)
 
-        codexRemoteDiagnostics[remote.id] = await CodexRemoteTunnelService.diagnose(remote: remote)
+        codexRemoteDiagnostics[remote.id] = await CodexRemoteTunnelService.diagnose(
+            remote: remote,
+            onDiagnosticsUpdate: { [weak self] steps in
+                await MainActor.run {
+                    self?.codexRemoteDiagnostics[remote.id] = steps
+                }
+            }
+        )
     }
 
     public func performCodexRemoteAction(_ action: RuntimeDiagnosticAction, for remote: CodexDesktopRemote) async {
@@ -336,10 +359,24 @@ public final class WorkflowSupervisorStore {
             switch action {
             case .installCodexCLI:
                 try await CodexRemoteTunnelService.installCodexCLI(on: remote)
-                codexRemoteDiagnostics[remote.id] = await CodexRemoteTunnelService.diagnose(remote: remote)
+                codexRemoteDiagnostics[remote.id] = await CodexRemoteTunnelService.diagnose(
+                    remote: remote,
+                    onDiagnosticsUpdate: { [weak self] steps in
+                        await MainActor.run {
+                            self?.codexRemoteDiagnostics[remote.id] = steps
+                        }
+                    }
+                )
             case .updateCodexCLI:
                 try await CodexRemoteTunnelService.updateCodexCLI(on: remote)
-                codexRemoteDiagnostics[remote.id] = await CodexRemoteTunnelService.diagnose(remote: remote)
+                codexRemoteDiagnostics[remote.id] = await CodexRemoteTunnelService.diagnose(
+                    remote: remote,
+                    onDiagnosticsUpdate: { [weak self] steps in
+                        await MainActor.run {
+                            self?.codexRemoteDiagnostics[remote.id] = steps
+                        }
+                    }
+                )
             case .startAppServer:
                 try await CodexRemoteTunnelService.startAppServer(on: remote)
                 await connectCodexRemote(remote)
@@ -378,6 +415,10 @@ public final class WorkflowSupervisorStore {
         await discoverTailnetMachines()
 
         for hostID in hostIDs where hostID != localHostID {
+            if hasRelay(for: hostID) {
+                continue
+            }
+
             if let remote = codexRemotes.first(where: { $0.id == hostID }), remote.isConnectable {
                 if CodexRemoteIdentityStore.requiresPreparation(for: remote) {
                     codexRemoteDiagnostics[remote.id] = [

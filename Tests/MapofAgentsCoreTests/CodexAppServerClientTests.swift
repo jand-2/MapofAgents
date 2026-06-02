@@ -48,6 +48,36 @@ func endpointVerifierRejectsGenericCapabilitiesOnlyInitializeResults() {
 }
 
 @Test
+func endpointVerifierTrustsWindowsCodexRuntimeIdentityWithoutCapabilities() {
+    let windowsCodexResult: JSONValue = .object([
+        "userAgent": .string("mapofagents-ssh-verify/0.135.0 (Windows 10.0.26200; x86_64)"),
+        "codexHome": .string("C:\\Users\\User\\.codex"),
+        "platformFamily": .string("windows"),
+        "platformOs": .string("windows"),
+    ])
+    let platformOnlyResult: JSONValue = .object([
+        "platformFamily": .string("windows"),
+    ])
+
+    #expect(AppServerEndpointVerifier.isTrustedInitializeResult(windowsCodexResult))
+    #expect(AppServerEndpointVerifier.isTrustedInitializeResult(platformOnlyResult) == false)
+}
+
+@Test
+func endpointVerifierUntrustedInitializeErrorListsResponseKeys() {
+    let result: JSONValue = .object([
+        "unexpected": .string("shape"),
+        "platformFamily": .string("windows"),
+    ])
+    let error = AppServerEndpointVerificationError.untrustedInitializeResult(
+        keys: AppServerEndpointVerifier.initializeResultKeys(result)
+    )
+
+    #expect(error.localizedDescription.contains("platformFamily"))
+    #expect(error.localizedDescription.contains("unexpected"))
+}
+
+@Test
 func appServerRelayEndpointRejectsInsecureRemotePolicies() throws {
     let loopback = try #require(URL(string: "ws://127.0.0.1:18945"))
     let remoteCleartext = try #require(URL(string: "ws://mac.lan:18945"))

@@ -37,10 +37,8 @@ public enum CodexRemoteIdentityStore {
         )
 
         if fileManager.fileExists(atPath: target.path) {
-            if try isImportedKeyCurrent(source: source, target: target) {
-                return target.path
-            }
-            try fileManager.removeItem(at: target)
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+            return target.path
         }
 
         try fileManager.copyItem(at: source, to: target)
@@ -105,26 +103,6 @@ public enum CodexRemoteIdentityStore {
         let candidatePath = URL(fileURLWithPath: path).standardizedFileURL.path
         return candidatePath == appSupportPath
             || candidatePath.hasPrefix(appSupportPath + "/")
-    }
-
-    private static func isImportedKeyCurrent(source: URL, target: URL) throws -> Bool {
-        let fileManager = FileManager.default
-        let sourceAttributes = try fileManager.attributesOfItem(atPath: source.path)
-        let targetAttributes = try fileManager.attributesOfItem(atPath: target.path)
-
-        let sourceSize = sourceAttributes[.size] as? NSNumber
-        let targetSize = targetAttributes[.size] as? NSNumber
-        let sourceModified = sourceAttributes[.modificationDate] as? Date
-        let targetModified = targetAttributes[.modificationDate] as? Date
-
-        guard sourceSize == targetSize else {
-            return false
-        }
-        if let sourceModified, let targetModified, targetModified < sourceModified {
-            return false
-        }
-
-        return try Data(contentsOf: source) == Data(contentsOf: target)
     }
 
     private static func sanitized(_ value: String) -> String {

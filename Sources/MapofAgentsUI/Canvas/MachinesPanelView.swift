@@ -220,6 +220,7 @@ struct MachinesPanelView: View {
                             LazyVStack(spacing: 7) {
                                 ForEach(supervisorStore.codexRemotes) { remote in
                                     CodexRemoteRowView(
+                                        supervisorStore: supervisorStore,
                                         remote: remote,
                                         diagnostics: supervisorStore.codexRemoteDiagnostics[remote.id] ?? [],
                                         onConnect: {
@@ -358,6 +359,7 @@ struct MachinesPanelView: View {
 }
 
 private struct CodexRemoteRowView: View {
+    @Bindable var supervisorStore: WorkflowSupervisorStore
     var remote: CodexDesktopRemote
     var diagnostics: [RuntimeDiagnosticStep]
     var onConnect: () -> Void
@@ -365,6 +367,9 @@ private struct CodexRemoteRowView: View {
     var onAction: (RuntimeDiagnosticAction) -> Void
 
     @State private var pendingIdentityAction: IdentityAction?
+    #if os(macOS)
+    @State private var diagnosticsWindow: CodexRemoteDiagnosticsWindowPresenter?
+    #endif
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -394,6 +399,18 @@ private struct CodexRemoteRowView: View {
                 }
 
                 Spacer(minLength: 6)
+
+                #if os(macOS)
+                Button {
+                    openDiagnosticsWindow()
+                } label: {
+                    Image(systemName: "list.clipboard")
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("Open remote diagnostics")
+                .accessibilityLabel("Open diagnostics for \(remote.displayName)")
+                #endif
 
                 FeedbackButton(
                     unavailableReason: actionUnavailableReason,
@@ -497,6 +514,23 @@ private struct CodexRemoteRowView: View {
             onConnect()
         }
     }
+
+    #if os(macOS)
+    private func openDiagnosticsWindow() {
+        let presenter = CodexRemoteDiagnosticsWindowPresenter(
+            supervisorStore: supervisorStore,
+            remote: remote,
+            onConnect: onConnect,
+            onDiagnose: onDiagnose,
+            onAction: onAction,
+            onClose: {
+                diagnosticsWindow = nil
+            }
+        )
+        diagnosticsWindow = presenter
+        presenter.show()
+    }
+    #endif
 
     private enum IdentityAction {
         case diagnose

@@ -78,6 +78,49 @@ func codexRemotePortHintsPreferWindowsAppServerPort() {
 }
 
 @Test
+func codexRemoteDebugReportRedactsTokensButKeepsDiagnosticShape() {
+    let remote = CodexDesktopRemote(
+        id: HostID(rawValue: "codex-remote-windows-example"),
+        displayName: "Windows DESKTOP-EXAMPLE",
+        hostID: "remote-ssh-codex-managed:Windows%20DESKTOP-EXAMPLE",
+        hostname: "User@windows.example.ts.net",
+        identityPath: "/Users/example/.ssh/codex_example",
+        sshPort: 22,
+        source: "codex-managed"
+    )
+    let steps = [
+        RuntimeDiagnosticStep(
+            id: "remote-token",
+            title: "Token file found and valid",
+            status: .passed,
+            detail: "token:abcdef1234567890",
+            evidence: "codex app-server --ws-token-file C:\\Temp\\mapofagents-codex-app-server-14500.token"
+        ),
+        RuntimeDiagnosticStep(
+            id: "websocket-initialize",
+            title: "WebSocket initialize passed",
+            status: .failed,
+            detail: "Bearer abcdef1234567890 was rejected",
+            evidence: "initialize response fields: codexHome, platformFamily"
+        ),
+    ]
+
+    let report = CodexRemoteTunnelService.debugReport(
+        for: remote,
+        steps: steps,
+        generatedAt: Date(timeIntervalSince1970: 0)
+    )
+
+    #expect(report.contains("sshTarget: User@windows.example.ts.net"))
+    #expect(report.contains("appServerPortCandidates: 14500, 18945"))
+    #expect(report.contains("WebSocket initialize passed"))
+    #expect(report.contains("token:<redacted>"))
+    #expect(report.contains("Bearer <redacted>"))
+    #expect(!report.contains("abcdef1234567890"))
+    #expect(!report.contains("mapofagents-codex-app-server-14500.token"))
+}
+
+@Test
 func remoteStartCommandRequiresAuthenticatedAppServerToken() throws {
     let linuxRemote = CodexDesktopRemote(
         id: HostID(rawValue: "linux"),

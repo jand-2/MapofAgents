@@ -110,42 +110,14 @@ public enum BoundedProcessRunner {
         maxOutputBytes: Int = 1_048_576
     ) async throws -> BoundedProcessResult {
         #if os(macOS)
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = arguments
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        try process.run()
-
-        let stdoutTask = Task.detached(priority: .utility) {
-            drain(stdoutPipe.fileHandleForReading, maxBytes: maxOutputBytes)
-        }
-        let stderrTask = Task.detached(priority: .utility) {
-            drain(stderrPipe.fileHandleForReading, maxBytes: maxOutputBytes)
-        }
-
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
-        }
-
-        if process.isRunning {
-            process.terminate()
-            let graceDeadline = Date().addingTimeInterval(1)
-            while process.isRunning && Date() < graceDeadline {
-                try await Task.sleep(for: .milliseconds(50))
-            }
-        }
-
-        return BoundedProcessResult(
-            terminationStatus: process.isRunning ? -1 : process.terminationStatus,
-            stdout: await stdoutTask.value,
-            stderr: await stderrTask.value
-        )
+        return try await Task.detached(priority: .utility) {
+            try runBlocking(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout,
+                maxOutputBytes: maxOutputBytes
+            )
+        }.value
         #else
         throw CodexAppServerError.unsupportedPlatform
         #endif

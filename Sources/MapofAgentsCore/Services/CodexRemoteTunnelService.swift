@@ -10,6 +10,7 @@ public enum CodexRemoteTunnelError: LocalizedError, Sendable {
     case noOpenPort
     case unsupportedPlatform
     case tunnelFailed(String)
+    case diagnosticFailure(String, [RuntimeDiagnosticStep])
 
     public var errorDescription: String? {
         switch self {
@@ -23,6 +24,17 @@ public enum CodexRemoteTunnelError: LocalizedError, Sendable {
             return "Codex remote tunnels are only available on macOS in this build."
         case .tunnelFailed(let message):
             return message.isEmpty ? "Could not start the SSH tunnel." : message
+        case .diagnosticFailure(let message, _):
+            return message.isEmpty ? "Could not start the SSH tunnel." : message
+        }
+    }
+
+    public var diagnosticSteps: [RuntimeDiagnosticStep] {
+        switch self {
+        case .diagnosticFailure(_, let steps):
+            return steps
+        case .notConnectable, .invalidSSHTarget, .noOpenPort, .unsupportedPlatform, .tunnelFailed:
+            return []
         }
     }
 }
@@ -55,6 +67,16 @@ public final class CodexRemoteTunnel: @unchecked Sendable {
     }
 }
 
+public struct CodexRemoteTunnelStartResult {
+    public var tunnel: CodexRemoteTunnel
+    public var diagnostics: [RuntimeDiagnosticStep]
+
+    public init(tunnel: CodexRemoteTunnel, diagnostics: [RuntimeDiagnosticStep]) {
+        self.tunnel = tunnel
+        self.diagnostics = diagnostics
+    }
+}
+
 public enum CodexRemoteTunnelService {
     private struct RemoteAppServerSession {
         var port: Int
@@ -70,12 +92,81 @@ public enum CodexRemoteTunnelService {
         }
     }
 
-    public static func diagnose(remote: CodexDesktopRemote) async -> [RuntimeDiagnosticStep] {
+    public static func debugReport(
+        for remote: CodexDesktopRemote,
+        steps: [RuntimeDiagnosticStep],
+        generatedAt: Date = Date()
+    ) -> String {
+        let formatter = ISO8601DateFormatter()
+        let lines = [
+            "MapofAgents Remote Diagnostics",
+            "generatedAt: \(formatter.string(from: generatedAt))",
+            "remoteName: \(remote.displayName)",
+            "remoteID: \(remote.id.rawValue)",
+            "platform: \(remote.platform.rawValue)",
+            "sshTarget: \(remote.hostname ?? "missing")",
+            "sshPort: \(remote.sshPort.map(String.init) ?? "default")",
+            "identity: \(remote.identityPath?.isEmpty == false ? "configured" : "not configured")",
+            "appServerPortCandidates: \(remoteAppServerPortCandidates(for: remote).map(String.init).joined(separator: ", "))",
+            "",
+            "Steps:",
+        ] + steps.map { step in
+            let status = step.status.rawValue
+            let detail = step.detail.isEmpty ? "no detail" : redactSensitiveDiagnosticText(step.detail)
+            let evidence = step.evidence.isEmpty ? "no evidence" : redactSensitiveDiagnosticText(step.evidence)
+            return "- [\(status)] \(step.title)\n  detail: \(detail)\n  evidence: \(evidence)"
+        }
+        return redactSensitiveDiagnosticText(lines.joined(separator: "\n"))
+    }
+
+    public static func pendingConnectionDiagnosticSteps(for remote: CodexDesktopRemote) -> [RuntimeDiagnosticStep] {
+        [
+            RuntimeDiagnosticStep(
+                id: "ssh-reachable",
+                title: "SSH reachable",
+                status: .running,
+                detail: remote.hostname ?? remote.hostID,
+                evidence: "ssh -o BatchMode=yes <ssh-target> echo mapofagents-ssh-ok"
+            ),
+            RuntimeDiagnosticStep(id: "ssh-key", title: "SSH key accepted"),
+            RuntimeDiagnosticStep(id: "codex", title: "Codex CLI found"),
+            RuntimeDiagnosticStep(id: "app-server-command", title: "App Server command available"),
+            RuntimeDiagnosticStep(id: "remote-listener", title: "Remote listener found or started"),
+            RuntimeDiagnosticStep(id: "remote-token", title: "Token file found and valid"),
+            RuntimeDiagnosticStep(id: "ssh-tunnel", title: "SSH tunnel opened"),
+            RuntimeDiagnosticStep(id: "local-readyz", title: "Local tunnel /readyz passed"),
+            RuntimeDiagnosticStep(id: "websocket-initialize", title: "WebSocket initialize passed"),
+            RuntimeDiagnosticStep(id: "relay-handshake", title: "Relay handshake connected"),
+        ]
+    }
+
+    public static func redactSensitiveDiagnosticText(_ value: String) -> String {
+        var redacted = value
+        let replacements: [(String, String)] = [
+            (#"token:[A-Za-z0-9._~+/=-]{8,}"#, "token:<redacted>"),
+            (#"Bearer\s+[A-Za-z0-9._~+/=-]{8,}"#, "Bearer <redacted>"),
+            (#"--ws-token-file\s+("[^"]+"|'[^']+'|\S+)"#, "--ws-token-file <token-file>"),
+            (#"mapofagents-codex-app-server-[0-9]+\.token"#, "mapofagents-codex-app-server-<port>.token"),
+        ]
+        for (pattern, replacement) in replacements {
+            redacted = redacted.replacingOccurrences(
+                of: pattern,
+                with: replacement,
+                options: .regularExpression
+            )
+        }
+        return redacted
+    }
+
+    public static func diagnose(
+        remote: CodexDesktopRemote,
+        onDiagnosticsUpdate: (@Sendable ([RuntimeDiagnosticStep]) async -> Void)? = nil
+    ) async -> [RuntimeDiagnosticStep] {
         #if os(macOS)
-        guard let hostname = remote.hostname, !hostname.isEmpty else {
+        guard remote.hostname?.isEmpty == false else {
             return [
                 RuntimeDiagnosticStep(
-                    id: "ssh",
+                    id: "ssh-target",
                     title: "SSH target",
                     status: .failed,
                     detail: "Missing SSH hostname"
@@ -83,103 +174,41 @@ public enum CodexRemoteTunnelService {
             ]
         }
 
-        var steps: [RuntimeDiagnosticStep] = []
-
         do {
-            _ = try await runSSHCommand(
-                remote: remote,
-                hostname: hostname,
-                remoteCommand: "echo mapofagents-ssh-ok",
-                timeout: 6
-            )
-            steps.append(RuntimeDiagnosticStep(id: "ssh", title: "SSH connection", status: .passed, detail: hostname))
-        } catch {
-            steps.append(RuntimeDiagnosticStep(id: "ssh", title: "SSH connection", status: .failed, detail: error.localizedDescription))
-            return steps
-        }
-
-        let remoteCodexVersion: String
-        do {
-            let output = try await runSSHCommand(
-                remote: remote,
-                hostname: hostname,
-                remoteCommand: "codex --version",
-                timeout: 8
-            )
-            remoteCodexVersion = output.trimmedForDisplay
-            steps.append(RuntimeDiagnosticStep(id: "codex", title: "Codex CLI", status: .passed, detail: remoteCodexVersion))
-        } catch {
-            steps.append(
+            let result = try await startTunnelWithDiagnostics(for: remote, onDiagnosticsUpdate: onDiagnosticsUpdate)
+            await result.tunnel.stop()
+            return result.diagnostics + [
                 RuntimeDiagnosticStep(
-                    id: "codex",
-                    title: "Codex CLI",
+                    id: "relay-handshake",
+                    title: "Relay handshake connected",
+                    status: .pending,
+                    detail: "Use Connect to attach the workflow relay.",
+                    evidence: "diagnose verified transport only"
+                ),
+            ]
+        } catch let error as CodexRemoteTunnelError {
+            if !error.diagnosticSteps.isEmpty {
+                return error.diagnosticSteps
+            }
+            return [
+                RuntimeDiagnosticStep(
+                    id: "remote-diagnostic",
+                    title: "Remote diagnostic",
                     status: .failed,
                     detail: error.localizedDescription,
-                    action: .installCodexCLI
-                )
-            )
-            return steps
-        }
-
-        if let localVersion = await localCodexVersion(),
-           Self.codexVersion(localVersion, isNewerThan: remoteCodexVersion) {
-            steps.append(
-                RuntimeDiagnosticStep(
-                    id: "codex-update",
-                    title: "Codex update",
-                    status: .warning,
-                    detail: "remote \(Self.versionNumber(from: remoteCodexVersion) ?? remoteCodexVersion); local \(Self.versionNumber(from: localVersion) ?? localVersion)",
-                    action: .updateCodexCLI
-                )
-            )
-        }
-
-        do {
-            _ = try await runSSHCommand(
-                remote: remote,
-                hostname: hostname,
-                remoteCommand: "codex app-server --help",
-                timeout: 8
-            )
-            steps.append(RuntimeDiagnosticStep(id: "app-server", title: "App Server command", status: .passed, detail: "codex app-server available"))
+                    action: .restartAppServer
+                ),
+            ]
         } catch {
-            steps.append(
+            return [
                 RuntimeDiagnosticStep(
-                    id: "app-server",
-                    title: "App Server command",
+                    id: "remote-diagnostic",
+                    title: "Remote diagnostic",
                     status: .failed,
-                    detail: error.localizedDescription,
-                    action: .updateCodexCLI
-                )
-            )
-            return steps
+                    detail: error.localizedDescription
+                ),
+            ]
         }
-
-        if let readySession = await firstAuthenticatedRemoteSession(remote: remote, hostname: hostname) {
-            steps.append(
-                RuntimeDiagnosticStep(
-                    id: "listener",
-                    title: "App Server listener",
-                    status: .passed,
-                    detail: "authenticated on 127.0.0.1:\(readySession.port)"
-                )
-            )
-        } else {
-            let ports = remotePortCandidates(for: remote)
-                .map(String.init)
-                .joined(separator: ", ")
-            steps.append(
-                RuntimeDiagnosticStep(
-                    id: "listener",
-                    title: "App Server listener",
-                    status: .failed,
-                    detail: "No ready listener on \(ports).",
-                    action: .startAppServer
-                )
-            )
-        }
-
-        return steps
         #else
         return [
             RuntimeDiagnosticStep(
@@ -193,29 +222,232 @@ public enum CodexRemoteTunnelService {
     }
 
     public static func startTunnel(for remote: CodexDesktopRemote) async throws -> CodexRemoteTunnel {
+        try await startTunnelWithDiagnostics(for: remote).tunnel
+    }
+
+    public static func startTunnelWithDiagnostics(
+        for remote: CodexDesktopRemote,
+        onDiagnosticsUpdate: (@Sendable ([RuntimeDiagnosticStep]) async -> Void)? = nil
+    ) async throws -> CodexRemoteTunnelStartResult {
         #if os(macOS)
         guard let hostname = remote.hostname, !hostname.isEmpty else {
             throw CodexRemoteTunnelError.notConnectable
         }
 
-        let localPort = try openLocalPort()
-        let remoteSession = try await ensureRemoteAppServer(remote: remote, hostname: hostname)
+        var steps: [RuntimeDiagnosticStep] = []
 
-        let tunnelProcess = try startForwardingTunnel(
-            remote: remote,
-            hostname: hostname,
-            localPort: localPort,
-            remotePort: remoteSession.port
-        )
-        guard await waitForLocalAppServer(
+        func publish() async {
+            guard let onDiagnosticsUpdate else { return }
+            await onDiagnosticsUpdate(steps)
+        }
+
+        func appendStep(_ step: RuntimeDiagnosticStep) async {
+            steps.append(step)
+            await publish()
+        }
+
+        func appendSteps(_ newSteps: [RuntimeDiagnosticStep]) async {
+            steps.append(contentsOf: newSteps)
+            await publish()
+        }
+
+        func fail(_ message: String, appending step: RuntimeDiagnosticStep? = nil) async throws -> Never {
+            if let step {
+                steps.append(step)
+                await publish()
+            }
+            throw CodexRemoteTunnelError.diagnosticFailure(message, steps)
+        }
+
+        do {
+            _ = try await runSSHCommand(
+                remote: remote,
+                hostname: hostname,
+                remoteCommand: "echo mapofagents-ssh-ok",
+                timeout: 6
+            )
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "ssh-reachable",
+                    title: "SSH reachable",
+                    status: .passed,
+                    detail: hostname,
+                    evidence: "ssh -o BatchMode=yes \(hostname) echo mapofagents-ssh-ok"
+                )
+            )
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "ssh-key",
+                    title: "SSH key accepted",
+                    status: .passed,
+                    detail: "BatchMode authentication succeeded",
+                    evidence: remote.identityPath?.isEmpty == false ? "identity: configured" : "identity: SSH config/default"
+                )
+            )
+        } catch {
+            try await fail(
+                error.localizedDescription,
+                appending: RuntimeDiagnosticStep(
+                    id: "ssh-reachable",
+                    title: "SSH reachable",
+                    status: .failed,
+                    detail: error.localizedDescription,
+                    evidence: "ssh -o BatchMode=yes \(hostname) echo mapofagents-ssh-ok"
+                )
+            )
+        }
+
+        let remoteCodexVersion: String
+        do {
+            let output = try await runSSHCommand(
+                remote: remote,
+                hostname: hostname,
+                remoteCommand: "codex --version",
+                timeout: 8
+            )
+            remoteCodexVersion = output.trimmedForDisplay
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "codex",
+                    title: "Codex CLI found",
+                    status: .passed,
+                    detail: remoteCodexVersion,
+                    evidence: "codex --version"
+                )
+            )
+        } catch {
+            try await fail(
+                error.localizedDescription,
+                appending: RuntimeDiagnosticStep(
+                    id: "codex",
+                    title: "Codex CLI found",
+                    status: .failed,
+                    detail: error.localizedDescription,
+                    evidence: "codex --version",
+                    action: .installCodexCLI
+                )
+            )
+        }
+
+        if let localVersion = await localCodexVersion(),
+           Self.codexVersion(localVersion, isNewerThan: remoteCodexVersion) {
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "codex-update",
+                    title: "Codex update",
+                    status: .warning,
+                    detail: "remote \(Self.versionNumber(from: remoteCodexVersion) ?? remoteCodexVersion); local \(Self.versionNumber(from: localVersion) ?? localVersion)",
+                    evidence: "local codex --version compared with remote codex --version",
+                    action: .updateCodexCLI
+                )
+            )
+        }
+
+        do {
+            _ = try await runSSHCommand(
+                remote: remote,
+                hostname: hostname,
+                remoteCommand: "codex app-server --help",
+                timeout: 8
+            )
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "app-server-command",
+                    title: "App Server command available",
+                    status: .passed,
+                    detail: "codex app-server available",
+                    evidence: "codex app-server --help"
+                )
+            )
+        } catch {
+            try await fail(
+                error.localizedDescription,
+                appending: RuntimeDiagnosticStep(
+                    id: "app-server-command",
+                    title: "App Server command available",
+                    status: .failed,
+                    detail: error.localizedDescription,
+                    evidence: "codex app-server --help",
+                    action: .updateCodexCLI
+                )
+            )
+        }
+
+        let localPort = try openLocalPort()
+        let remoteSession: RemoteAppServerSession
+        do {
+            remoteSession = try await ensureRemoteAppServer(remote: remote, hostname: hostname)
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "remote-listener",
+                    title: "Remote listener found or started",
+                    status: .passed,
+                    detail: "authenticated on 127.0.0.1:\(remoteSession.port)",
+                    evidence: "remote ports: \(remotePortCandidates(for: remote).map(String.init).joined(separator: ", "))"
+                )
+            )
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "remote-token",
+                    title: "Token file found and valid",
+                    status: .passed,
+                    detail: "token length \(remoteSession.bearerToken.count)",
+                    evidence: "tracked pid/token files matched authenticated app-server command line"
+                )
+            )
+        } catch {
+            try await fail(
+                error.localizedDescription,
+                appending: RuntimeDiagnosticStep(
+                    id: "remote-listener",
+                    title: "Remote listener found or started",
+                    status: .failed,
+                    detail: error.localizedDescription,
+                    evidence: "try ports: \(remotePortCandidates(for: remote).map(String.init).joined(separator: ", "))",
+                    action: .restartAppServer
+                )
+            )
+        }
+
+        let tunnelProcess: Process
+        do {
+            tunnelProcess = try startForwardingTunnel(
+                remote: remote,
+                hostname: hostname,
+                localPort: localPort,
+                remotePort: remoteSession.port
+            )
+            await appendStep(
+                RuntimeDiagnosticStep(
+                    id: "ssh-tunnel",
+                    title: "SSH tunnel opened",
+                    status: .passed,
+                    detail: "127.0.0.1:\(localPort) -> 127.0.0.1:\(remoteSession.port)",
+                    evidence: "ssh -N -L 127.0.0.1:\(localPort):127.0.0.1:\(remoteSession.port) \(hostname)"
+                )
+            )
+        } catch {
+            try await fail(
+                error.localizedDescription,
+                appending: RuntimeDiagnosticStep(
+                    id: "ssh-tunnel",
+                    title: "SSH tunnel opened",
+                    status: .failed,
+                    detail: error.localizedDescription,
+                    evidence: "ssh -N -L 127.0.0.1:\(localPort):127.0.0.1:\(remoteSession.port) \(hostname)"
+                )
+            )
+        }
+
+        let localProbe = await localAppServerProbeSteps(
             localPort: localPort,
             bearerToken: remoteSession.bearerToken,
             timeout: 4
-        ) else {
+        )
+        await appendSteps(localProbe.steps)
+        guard localProbe.succeeded else {
             tunnelProcess.terminate()
-            throw CodexRemoteTunnelError.tunnelFailed(
-                "SSH tunnel opened, but Codex App Server did not answer on 127.0.0.1:\(localPort)."
-            )
+            throw CodexRemoteTunnelError.diagnosticFailure(localProbe.failureMessage, steps)
         }
 
         let endpoint = AppServerRelayEndpoint(
@@ -224,7 +456,8 @@ public enum CodexRemoteTunnelService {
             url: URL(string: "ws://127.0.0.1:\(localPort)")!,
             bearerToken: remoteSession.bearerToken
         )
-        return await CodexRemoteTunnel(endpoint: endpoint, tunnelProcess: tunnelProcess)
+        let tunnel = await CodexRemoteTunnel(endpoint: endpoint, tunnelProcess: tunnelProcess)
+        return CodexRemoteTunnelStartResult(tunnel: tunnel, diagnostics: steps)
         #else
         throw CodexRemoteTunnelError.unsupportedPlatform
         #endif
@@ -723,6 +956,113 @@ public enum CodexRemoteTunnelService {
             try? await Task.sleep(for: .milliseconds(200))
         }
         return false
+    }
+
+    private struct LocalAppServerProbe {
+        var succeeded: Bool
+        var failureMessage: String
+        var steps: [RuntimeDiagnosticStep]
+    }
+
+    private static func localAppServerProbeSteps(
+        localPort: Int,
+        bearerToken: String,
+        timeout: TimeInterval
+    ) async -> LocalAppServerProbe {
+        let readyURL = URL(string: "http://127.0.0.1:\(localPort)/readyz")!
+        let webSocketURL = URL(string: "ws://127.0.0.1:\(localPort)")!
+        var steps: [RuntimeDiagnosticStep] = []
+
+        do {
+            var request = URLRequest(url: readyURL)
+            request.timeoutInterval = min(timeout, 2)
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw CodexRemoteTunnelError.tunnelFailed("No HTTP response from /readyz.")
+            }
+            guard httpResponse.statusCode == 200 else {
+                throw CodexRemoteTunnelError.tunnelFailed("/readyz returned HTTP \(httpResponse.statusCode).")
+            }
+            steps.append(
+                RuntimeDiagnosticStep(
+                    id: "local-readyz",
+                    title: "Local tunnel /readyz passed",
+                    status: .passed,
+                    detail: "HTTP 200 on 127.0.0.1:\(localPort)",
+                    evidence: "GET \(readyURL.absoluteString)"
+                )
+            )
+        } catch {
+            let message = error.localizedDescription
+            steps.append(
+                RuntimeDiagnosticStep(
+                    id: "local-readyz",
+                    title: "Local tunnel /readyz passed",
+                    status: .failed,
+                    detail: message,
+                    evidence: "GET \(readyURL.absoluteString)",
+                    action: .restartAppServer
+                )
+            )
+            return LocalAppServerProbe(
+                succeeded: false,
+                failureMessage: "SSH tunnel opened, but /readyz failed on 127.0.0.1:\(localPort): \(message)",
+                steps: steps
+            )
+        }
+
+        do {
+            let verification = try await AppServerEndpointVerifier.verifyDetailed(
+                url: webSocketURL,
+                bearerToken: bearerToken,
+                timeout: min(timeout, 3)
+            )
+            let keys = AppServerEndpointVerifier.initializeResultKeys(verification.initializeResult)
+            steps.append(
+                RuntimeDiagnosticStep(
+                    id: "websocket-initialize",
+                    title: "WebSocket initialize passed",
+                    status: .passed,
+                    detail: keys.isEmpty ? "initialize response accepted" : "fields: \(keys.joined(separator: ", "))",
+                    evidence: "initialize over \(webSocketURL.absoluteString) with bearer token"
+                )
+            )
+            return LocalAppServerProbe(succeeded: true, failureMessage: "", steps: steps)
+        } catch let error as AppServerEndpointVerificationError {
+            let message = error.localizedDescription
+            steps.append(
+                RuntimeDiagnosticStep(
+                    id: "websocket-initialize",
+                    title: "WebSocket initialize passed",
+                    status: .failed,
+                    detail: message,
+                    evidence: "initialize over \(webSocketURL.absoluteString) with bearer token",
+                    action: .restartAppServer
+                )
+            )
+            return LocalAppServerProbe(
+                succeeded: false,
+                failureMessage: "Codex App Server answered /readyz, but WebSocket initialize failed on 127.0.0.1:\(localPort): \(message)",
+                steps: steps
+            )
+        } catch {
+            let message = error.localizedDescription
+            steps.append(
+                RuntimeDiagnosticStep(
+                    id: "websocket-initialize",
+                    title: "WebSocket initialize passed",
+                    status: .failed,
+                    detail: message,
+                    evidence: "initialize over \(webSocketURL.absoluteString) with bearer token",
+                    action: .restartAppServer
+                )
+            )
+            return LocalAppServerProbe(
+                succeeded: false,
+                failureMessage: "Codex App Server answered /readyz, but WebSocket initialize failed on 127.0.0.1:\(localPort): \(message)",
+                steps: steps
+            )
+        }
     }
 
     private static func isLocalAppServerReady(localPort: Int, bearerToken: String) async -> Bool {

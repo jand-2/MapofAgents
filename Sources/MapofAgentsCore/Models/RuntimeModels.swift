@@ -764,6 +764,7 @@ public struct RuntimeDiagnosticStep: Codable, Identifiable, Hashable, Sendable {
     public var title: String
     public var status: RuntimeDiagnosticStatus
     public var detail: String
+    public var evidence: String
     public var action: RuntimeDiagnosticAction?
 
     public init(
@@ -771,12 +772,14 @@ public struct RuntimeDiagnosticStep: Codable, Identifiable, Hashable, Sendable {
         title: String,
         status: RuntimeDiagnosticStatus = .pending,
         detail: String = "",
+        evidence: String = "",
         action: RuntimeDiagnosticAction? = nil
     ) {
         self.id = id
         self.title = title
         self.status = status
         self.detail = detail
+        self.evidence = evidence
         self.action = action
     }
 }

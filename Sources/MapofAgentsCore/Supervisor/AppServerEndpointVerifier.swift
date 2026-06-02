@@ -12,32 +12,71 @@ public struct AppServerEndpointVerification: Hashable, Sendable {
     }
 }
 
+public enum AppServerEndpointVerificationError: LocalizedError, Hashable, Sendable {
+    case connectionSecurity(String)
+    case invalidResponse(String)
+    case server(String)
+    case timedOut(TimeInterval)
+    case transport(String)
+    case untrustedInitializeResult(keys: [String])
+
+    public var errorDescription: String? {
+        switch self {
+        case .connectionSecurity(let message):
+            return message
+        case .invalidResponse(let message):
+            return message
+        case .server(let message):
+            return message
+        case .timedOut(let timeout):
+            return "Timed out verifying Codex App Server after \(String(format: "%.1f", timeout))s."
+        case .transport(let message):
+            return message.isEmpty ? "Could not connect to Codex App Server." : message
+        case .untrustedInitializeResult(let keys):
+            let fieldList = keys.isEmpty ? "none" : keys.joined(separator: ", ")
+            return "App Server answered initialize, but MapofAgents did not recognize the response fields: \(fieldList)."
+        }
+    }
+}
+
 public enum AppServerEndpointVerifier {
     public static func verify(
         url: URL,
         bearerToken: String?,
         timeout: TimeInterval = 3
     ) async throws -> AppServerEndpointVerification {
+        do {
+            return try await verifyDetailed(url: url, bearerToken: bearerToken, timeout: timeout)
+        } catch let error as AppServerEndpointVerificationError {
+            throw CodexAppServerError.transport(error.localizedDescription)
+        }
+    }
+
+    public static func verifyDetailed(
+        url: URL,
+        bearerToken: String?,
+        timeout: TimeInterval = 3
+    ) async throws -> AppServerEndpointVerification {
         try await withThrowingTaskGroup(of: AppServerEndpointVerification.self) { group in
             group.addTask {
-                try await verifyWithoutTimeout(url: url, bearerToken: bearerToken)
+                try await verifyWithoutTimeoutDetailed(url: url, bearerToken: bearerToken)
             }
             group.addTask {
                 try await Task.sleep(for: .milliseconds(Int(timeout * 1_000)))
-                throw CodexAppServerError.transport("Timed out verifying Codex App Server.")
+                throw AppServerEndpointVerificationError.timedOut(timeout)
             }
 
             guard let result = try await group.next() else {
-                throw CodexAppServerError.invalidResponse
+                throw AppServerEndpointVerificationError.invalidResponse("Codex App Server did not return an initialize response.")
             }
             group.cancelAll()
             return result
         }
     }
 
-    private static func verifyWithoutTimeout(url: URL, bearerToken: String?) async throws -> AppServerEndpointVerification {
+    private static func verifyWithoutTimeoutDetailed(url: URL, bearerToken: String?) async throws -> AppServerEndpointVerification {
         if let securityError = AppServerRelayEndpoint.connectionSecurityError(url: url, bearerToken: bearerToken) {
-            throw CodexAppServerError.transport(securityError)
+            throw AppServerEndpointVerificationError.connectionSecurity(securityError)
         }
 
         var request = URLRequest(url: url)
@@ -66,11 +105,20 @@ public enum AppServerEndpointVerifier {
         ])
         let data = try JSONEncoder().encode(initialize)
         guard let text = String(data: data, encoding: .utf8) else {
-            throw CodexAppServerError.invalidResponse
+            throw AppServerEndpointVerificationError.invalidResponse("Could not encode initialize request.")
         }
-        try await task.send(.string(text))
+        do {
+            try await task.send(.string(text))
+        } catch {
+            throw AppServerEndpointVerificationError.transport(error.localizedDescription)
+        }
 
-        let response = try await task.receive()
+        let response: URLSessionWebSocketTask.Message
+        do {
+            response = try await task.receive()
+        } catch {
+            throw AppServerEndpointVerificationError.transport(error.localizedDescription)
+        }
         let responseData: Data
         switch response {
         case .data(let data):
@@ -78,7 +126,7 @@ public enum AppServerEndpointVerifier {
         case .string(let text):
             responseData = Data(text.utf8)
         @unknown default:
-            throw CodexAppServerError.invalidResponse
+            throw AppServerEndpointVerificationError.invalidResponse("Codex App Server returned an unknown WebSocket message type.")
         }
 
         guard
@@ -86,16 +134,16 @@ public enum AppServerEndpointVerifier {
             let object = value.objectValue,
             object["id"]?.intValue == 1
         else {
-            throw CodexAppServerError.invalidResponse
+            throw AppServerEndpointVerificationError.invalidResponse("Codex App Server returned an invalid initialize response.")
         }
 
         if let error = object["error"] {
-            throw CodexAppServerError.server(readableDescription(error))
+            throw AppServerEndpointVerificationError.server(readableDescription(error))
         }
 
         let result = object["result"] ?? .null
         guard isTrustedInitializeResult(result) else {
-            throw CodexAppServerError.invalidResponse
+            throw AppServerEndpointVerificationError.untrustedInitializeResult(keys: initializeResultKeys(result))
         }
 
         let initialized: JSONValue = .object(["method": .string("initialized")])
@@ -119,7 +167,14 @@ public enum AppServerEndpointVerifier {
             ?? result["serverInfo"]?["title"]?.stringValue
         let hasCodexNamedServer = serverName?.localizedCaseInsensitiveContains("codex") == true
         let hasCapabilities = result["capabilities"]?.objectValue != nil
-        return (hasCodexHome || hasPlatform || hasCodexNamedServer) && (hasCapabilities || hasCodexNamedServer)
+        let hasCodexRuntimeIdentity = hasCodexHome && hasPlatform
+        return hasCodexNamedServer
+            || hasCodexRuntimeIdentity
+            || (hasCapabilities && (hasCodexHome || hasPlatform))
+    }
+
+    public static func initializeResultKeys(_ result: JSONValue) -> [String] {
+        result.objectValue?.keys.sorted() ?? []
     }
 
     private static func readableDescription(_ value: JSONValue) -> String {
