@@ -80,6 +80,7 @@ struct MachinesPanelView: View {
                         MachineRowView(
                             machine: machine,
                             isLocal: machine.id == localHostID,
+                            remote: browsableCodexRemote(for: machine),
                             isExpanded: expandedMachineID == machine.id,
                             onToggleExpanded: {
                                 withAnimation(.snappy) {
@@ -340,6 +341,14 @@ struct MachinesPanelView: View {
         withAnimation(.snappy) {
             isShowingAddRemote = true
         }
+    }
+
+    private func browsableCodexRemote(for machine: SupervisorMachine) -> CodexDesktopRemote? {
+        guard let remote = supervisorStore.codexRemote(for: machine.id),
+              CodexRemoteTunnelService.canBrowseRemoteFolders(for: remote) else {
+            return nil
+        }
+        return remote
     }
 
     private func disconnectDialogTitle(for machine: SupervisorMachine) -> String {
@@ -709,6 +718,7 @@ private extension RuntimeDiagnosticAction {
 private struct MachineRowView: View {
     var machine: SupervisorMachine
     var isLocal: Bool
+    var remote: CodexDesktopRemote?
     var isExpanded: Bool
     var onToggleExpanded: () -> Void
     var onAddFolder: (String) -> Void
@@ -716,6 +726,7 @@ private struct MachineRowView: View {
 
     @State private var isAddingFolder = false
     @State private var folderPath = ""
+    @State private var folderPickerRemote: CodexDesktopRemote?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -757,17 +768,21 @@ private struct MachineRowView: View {
                     FeedbackButton(
                         unavailableReason: folderActionUnavailableReason,
                         action: {
-                            folderPath = folderPath.isEmpty ? defaultFolderPath : folderPath
-                            withAnimation(.snappy) {
-                                isAddingFolder.toggle()
+                            if let remote {
+                                folderPickerRemote = remote
+                            } else {
+                                folderPath = folderPath.isEmpty ? defaultFolderPath : folderPath
+                                withAnimation(.snappy) {
+                                    isAddingFolder.toggle()
+                                }
                             }
                         }
                     ) {
-                        Image(systemName: isAddingFolder ? "xmark" : "folder.badge.plus")
+                        Image(systemName: folderButtonIcon)
                             .frame(width: 22, height: 22)
                     }
                     .buttonStyle(.plain)
-                    .help(folderActionUnavailableReason ?? (isAddingFolder ? "Cancel folder" : "Add folder"))
+                    .help(folderHelp)
 
                     Button(action: onDisconnect) {
                         Image(systemName: "stop.circle")
@@ -819,6 +834,23 @@ private struct MachineRowView: View {
         .padding(.vertical, 7)
         .padding(.horizontal, 8)
         .background(.background.opacity(0.30), in: RoundedRectangle(cornerRadius: 8))
+        .sheet(item: $folderPickerRemote) { remote in
+            RemoteFolderPickerView(
+                remote: remote,
+                initialPath: folderPath.isEmpty ? defaultFolderPath : folderPath,
+                onCancel: {
+                    folderPickerRemote = nil
+                },
+                onSelect: { path in
+                    onAddFolder(path)
+                    folderPath = ""
+                    folderPickerRemote = nil
+                    withAnimation(.snappy) {
+                        isAddingFolder = false
+                    }
+                }
+            )
+        }
     }
 
     private var detail: String {
@@ -850,6 +882,23 @@ private struct MachineRowView: View {
 
     private var folderActionUnavailableReason: String? {
         machine.status == .connected ? nil : "Connect this machine before adding a folder."
+    }
+
+    private var folderButtonIcon: String {
+        if remote != nil {
+            return "folder"
+        }
+        return isAddingFolder ? "xmark" : "folder.badge.plus"
+    }
+
+    private var folderHelp: String {
+        if let folderActionUnavailableReason {
+            return folderActionUnavailableReason
+        }
+        if remote != nil {
+            return "Browse project folders"
+        }
+        return isAddingFolder ? "Cancel folder" : "Add folder"
     }
 
     private var windowsUserHome: String? {

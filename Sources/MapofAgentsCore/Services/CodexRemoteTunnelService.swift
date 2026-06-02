@@ -77,10 +77,39 @@ public struct CodexRemoteTunnelStartResult {
     }
 }
 
+public struct RemoteFolderEntry: Codable, Identifiable, Hashable, Sendable {
+    public var id: String { path }
+    public var name: String
+    public var path: String
+
+    public init(name: String, path: String) {
+        self.name = name
+        self.path = path
+    }
+}
+
+public struct RemoteFolderListing: Hashable, Sendable {
+    public var path: String
+    public var parentPath: String?
+    public var entries: [RemoteFolderEntry]
+
+    public init(path: String, parentPath: String? = nil, entries: [RemoteFolderEntry]) {
+        self.path = path
+        self.parentPath = parentPath
+        self.entries = entries
+    }
+}
+
 public enum CodexRemoteTunnelService {
     private struct RemoteAppServerSession {
         var port: Int
         var bearerToken: String
+    }
+
+    private struct RemoteFolderListingPayload: Decodable {
+        var path: String
+        var parent: String?
+        var entries: [RemoteFolderEntry]
     }
 
     public static func remoteAppServerPortCandidates(for remote: CodexDesktopRemote) -> [Int] {
@@ -90,6 +119,44 @@ public enum CodexRemoteTunnelService {
         case .macOS, .iOS, .iPadOS, .linux, .unknown:
             return [18_945, 14_500]
         }
+    }
+
+    public static func canBrowseRemoteFolders(for remote: CodexDesktopRemote) -> Bool {
+        guard remote.isConnectable else { return false }
+        switch remote.platform {
+        case .windows, .macOS, .linux:
+            return true
+        case .iOS, .iPadOS, .unknown:
+            return false
+        }
+    }
+
+    public static func listRemoteFolders(
+        on remote: CodexDesktopRemote,
+        path: String
+    ) async throws -> RemoteFolderListing {
+        #if os(macOS)
+        guard canBrowseRemoteFolders(for: remote) else {
+            throw CodexRemoteTunnelError.unsupportedPlatform
+        }
+
+        let hostname = try sshHostname(for: remote)
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = remoteListFoldersCommand(
+            remote: remote,
+            path: trimmedPath.isEmpty ? "~" : trimmedPath
+        )
+        let output = try await runSSHCommand(
+            remote: remote,
+            hostname: hostname,
+            remoteCommand: command,
+            timeout: 12,
+            maxOutputBytes: 512 * 1_024
+        )
+        return try remoteFolderListing(from: output)
+        #else
+        throw CodexRemoteTunnelError.unsupportedPlatform
+        #endif
     }
 
     public static func debugReport(
@@ -1197,6 +1264,105 @@ public enum CodexRemoteTunnelService {
         return "sh -lc \(shellSingleQuoted("base64 < \(shellSingleQuoted(path))"))"
     }
 
+    static func remoteListFoldersCommand(remote: CodexDesktopRemote, path: String) -> String {
+        if remote.platform == .windows {
+            return windowsPowerShellCommand(
+                """
+                $ErrorActionPreference = 'Stop'
+                $rawPath = \(powerShellSingleQuoted(path))
+                if ([string]::IsNullOrWhiteSpace($rawPath) -or $rawPath -eq '~') {
+                    $rawPath = [Environment]::GetFolderPath('UserProfile')
+                }
+                $resolvedPath = Resolve-Path -LiteralPath $rawPath -ErrorAction Stop | Select-Object -First 1
+                $resolved = $resolvedPath.ProviderPath
+                if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+                    throw "Not a directory: $rawPath"
+                }
+                $parent = Split-Path -Path $resolved -Parent
+                if ([string]::IsNullOrWhiteSpace($parent)) {
+                    $parent = $null
+                }
+                $entries = @(
+                    Get-ChildItem -LiteralPath $resolved -Directory -Force -ErrorAction SilentlyContinue |
+                        Sort-Object Name |
+                        Select-Object -First 300 |
+                        ForEach-Object {
+                            [pscustomobject]@{
+                                name = $_.Name
+                                path = $_.FullName
+                            }
+                        }
+                )
+                [pscustomobject]@{
+                    path = $resolved
+                    parent = $parent
+                    entries = $entries
+                } | ConvertTo-Json -Depth 4 -Compress
+                """
+            )
+        }
+
+        let script = """
+        import json
+        import os
+        import sys
+
+        raw = os.environ.get("MAPOFAGENTS_DIR", "").strip() or "~"
+        path = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(path):
+            sys.stderr.write("Not a directory: " + raw + "\\n")
+            raise SystemExit(2)
+
+        names = sorted(os.listdir(path), key=str.casefold)
+        entries = []
+        for name in names:
+            child = os.path.join(path, name)
+            try:
+                if os.path.isdir(child):
+                    entries.append({"name": name, "path": child})
+            except OSError:
+                pass
+
+        parent = os.path.dirname(path)
+        if parent == path:
+            parent = None
+        print(json.dumps(
+            {"path": path, "parent": parent, "entries": entries[:300]},
+            separators=(",", ":")
+        ))
+        """
+        let command = "MAPOFAGENTS_DIR=\(shellSingleQuoted(path)) python3 - <<'PY'\n\(script)\nPY"
+        return "sh -lc \(shellSingleQuoted(command))"
+    }
+
+    static func remoteFolderListing(from output: String) throws -> RemoteFolderListing {
+        guard
+            let start = output.firstIndex(of: "{"),
+            let end = output.lastIndex(of: "}"),
+            start <= end
+        else {
+            throw CodexRemoteTunnelError.tunnelFailed("Remote folder listing did not return JSON.")
+        }
+
+        let json = String(output[start...end])
+        guard let data = json.data(using: .utf8) else {
+            throw CodexRemoteTunnelError.tunnelFailed("Remote folder listing could not be decoded.")
+        }
+
+        do {
+            let payload = try JSONDecoder().decode(RemoteFolderListingPayload.self, from: data)
+            let parentPath = payload.parent?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return RemoteFolderListing(
+                path: payload.path,
+                parentPath: parentPath?.isEmpty == false ? parentPath : nil,
+                entries: payload.entries
+            )
+        } catch {
+            throw CodexRemoteTunnelError.tunnelFailed("Remote folder listing JSON was invalid: \(error.localizedDescription)")
+        }
+    }
+
     private static func bearerToken(fromCommandOutput output: String) -> String? {
         output
             .split(whereSeparator: \.isNewline)
@@ -1216,6 +1382,10 @@ public enum CodexRemoteTunnelService {
 
     private static func shellSingleQuoted(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
+    }
+
+    private static func powerShellSingleQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "''"))'"
     }
 
     private static func windowsPowerShellCommand(_ script: String) -> String {

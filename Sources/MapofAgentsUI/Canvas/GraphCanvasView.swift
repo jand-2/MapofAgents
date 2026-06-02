@@ -64,6 +64,14 @@ public struct GraphCanvasView: View {
         }
     }
 
+    private struct RemoteFolderPickerRequest: Identifiable, Hashable {
+        var id: HostID { hostID }
+        var remote: CodexDesktopRemote
+        var hostID: HostID
+        var platform: HostPlatform
+        var initialPath: String
+    }
+
     private static let userTurnMarkerLeadWindow: TimeInterval = 5
     private static let userTurnMarkerFollowWindow: TimeInterval = 5 * 60
     private static let userTurnAttributionRetention: TimeInterval = 20 * 60
@@ -119,6 +127,7 @@ public struct GraphCanvasView: View {
     @State private var suppressedNodeControlTapID: NodeID?
     @State private var transientViewport: CanvasViewport?
     @State private var viewportCommitTask: Task<Void, Never>?
+    @State private var remoteFolderPickerRequest: RemoteFolderPickerRequest?
 
     public init(
         graphStore: GraphStore,
@@ -316,6 +325,25 @@ public struct GraphCanvasView: View {
                 }
             } message: { action in
                 Text(action.message)
+            }
+            .sheet(item: $remoteFolderPickerRequest) { request in
+                RemoteFolderPickerView(
+                    remote: request.remote,
+                    initialPath: request.initialPath,
+                    onCancel: {
+                        remoteFolderPickerRequest = nil
+                    },
+                    onSelect: { path in
+                        remoteFolderPickerRequest = nil
+                        Task {
+                            await graphStore.addFolder(
+                                path: path,
+                                hostID: request.hostID,
+                                platform: request.platform
+                            )
+                        }
+                    }
+                )
             }
             .onAppear {
                 onCanvasSizeChange(proxy.size)
@@ -2550,8 +2578,25 @@ public struct GraphCanvasView: View {
     private func pickMachineFolderAction(for node: CanvasNode) -> (() -> Void)? {
         guard
             node.kind == .machine,
-            node.metadata.hostID == runtimeStore.localHost.id
+            let hostID = node.metadata.hostID
         else {
+            return nil
+        }
+
+        if hostID != runtimeStore.localHost.id,
+           let remote = supervisorStore.codexRemote(for: hostID),
+           CodexRemoteTunnelService.canBrowseRemoteFolders(for: remote) {
+            return {
+                remoteFolderPickerRequest = RemoteFolderPickerRequest(
+                    remote: remote,
+                    hostID: hostID,
+                    platform: node.metadata.platform ?? remote.platform,
+                    initialPath: defaultFolderPath(for: node) ?? "~"
+                )
+            }
+        }
+
+        guard hostID == runtimeStore.localHost.id else {
             return nil
         }
 

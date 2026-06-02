@@ -78,6 +78,41 @@ func codexRemotePortHintsPreferWindowsAppServerPort() {
 }
 
 @Test
+func codexRemoteFolderBrowserSupportsConnectableWindowsRemotes() {
+    let windowsRemote = CodexDesktopRemote(
+        id: HostID(rawValue: "codex-remote-windows"),
+        displayName: "Windows DESKTOP-EXAMPLE",
+        hostID: "remote-ssh-codex-managed:Windows%20DESKTOP-EXAMPLE",
+        hostname: "User@windows.example.ts.net",
+        source: "codex-managed"
+    )
+    let disconnectedRemote = CodexDesktopRemote(
+        id: HostID(rawValue: "codex-remote-discovered"),
+        displayName: "windows-erp",
+        hostID: "remote-ssh-discovered:windows-erp",
+        source: "discovered"
+    )
+
+    #expect(CodexRemoteTunnelService.canBrowseRemoteFolders(for: windowsRemote))
+    #expect(CodexRemoteTunnelService.canBrowseRemoteFolders(for: disconnectedRemote) == false)
+}
+
+@Test
+func codexRemoteFolderListingParsesJSONEnvelope() throws {
+    let output = """
+    PowerShell banner text
+    {"path":"C:\\\\Users\\\\Example","parent":"C:\\\\Users","entries":[{"name":"Desktop","path":"C:\\\\Users\\\\Example\\\\Desktop"},{"name":"Documents","path":"C:\\\\Users\\\\Example\\\\Documents"}]}
+    """
+
+    let listing = try CodexRemoteTunnelService.remoteFolderListing(from: output)
+
+    #expect(listing.path == "C:\\Users\\Example")
+    #expect(listing.parentPath == "C:\\Users")
+    #expect(listing.entries.map(\.name) == ["Desktop", "Documents"])
+    #expect(listing.entries.first?.path == "C:\\Users\\Example\\Desktop")
+}
+
+@Test
 func codexRemoteDebugReportRedactsTokensButKeepsDiagnosticShape() {
     let remote = CodexDesktopRemote(
         id: HostID(rawValue: "codex-remote-windows-example"),
