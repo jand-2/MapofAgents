@@ -260,6 +260,13 @@ public struct GraphCanvasView: View {
                         .padding(.top, 58)
                 }
             }
+            .overlay(alignment: .bottomTrailing) {
+                if showsDesktopRails && !isReadingModePresented {
+                    threadInboxLayer()
+                        .padding(.trailing, 14)
+                        .padding(.bottom, 14)
+                }
+            }
             .onChange(of: selectedThreadKey) { _, _ in
                 if selectedThreadKey != nil {
                     transientOpenGeneration &+= 1
@@ -455,7 +462,10 @@ public struct GraphCanvasView: View {
         if selectedManualEdge != nil {
             return true
         }
-        return graphStore.selectedNode != nil
+        guard let selectedNode = graphStore.selectedNode else {
+            return false
+        }
+        return selectedNode.kind != .machine
     }
 
     private var graphContentSignature: String {
@@ -669,10 +679,52 @@ public struct GraphCanvasView: View {
             onDeclineTypedAttention: { request in
                 Task { await declineTypedAttentionRequest(request) }
             },
+            showsThreadInbox: false,
             isMachinesPanelPresented: $isMachinesPanelPresented,
             isMachineRecoveryPresented: $isMachineRecoveryPresented
         )
         .padding(14)
+    }
+
+    private func threadInboxLayer() -> some View {
+        let attentionRequests = runtimeStore.pendingAttentionRequests + supervisorStore.pendingAttentionRequests
+        return ThreadInboxPanelView(
+            catalogStore: threadCatalogStore,
+            onRefresh: {
+                Task { await refreshThreadInbox() }
+            },
+            onSearch: {
+                Task { await searchThreadInbox() }
+            },
+            onOpen: { entry in
+                openInboxThread(entry)
+            },
+            onAddToCanvas: { entry in
+                Task { await addInboxThreadToCanvas(entry) }
+            },
+            onArchive: { entry in
+                Task { await archiveInboxThread(entry) }
+            },
+            onMarkRead: { entry, isRead in
+                Task { await setInboxThread(entry, read: isRead) }
+            },
+            onHoverNode: { nodeID in
+                hoveredInboxNodeID = nodeID
+            },
+            attentionRequests: attentionRequests,
+            onFocusAttention: { request in
+                focusAttentionRequest(request)
+            },
+            onRespondToAttention: { request, allow in
+                Task { await respondToAttentionRequest(request, allow: allow) }
+            },
+            onRespondToAttentionWithText: { request, text in
+                Task { await respondToAttentionRequest(request, text: text) }
+            },
+            onDeclineTypedAttention: { request in
+                Task { await declineTypedAttentionRequest(request) }
+            }
+        )
     }
 
     @ViewBuilder

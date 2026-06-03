@@ -25,6 +25,7 @@ struct GraphCanvasOperationalRails: View {
     var onRespondToAttention: (RuntimeAttentionRequest, Bool) -> Void
     var onRespondToAttentionWithText: (RuntimeAttentionRequest, String) -> Void
     var onDeclineTypedAttention: (RuntimeAttentionRequest) -> Void
+    var showsThreadInbox: Bool = true
     @Binding var isMachinesPanelPresented: Bool
     @Binding var isMachineRecoveryPresented: Bool
 
@@ -66,21 +67,23 @@ struct GraphCanvasOperationalRails: View {
                     .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
 
-                ThreadInboxPanelView(
-                    catalogStore: threadCatalogStore,
-                    onRefresh: onRefreshThreadInbox,
-                    onSearch: onSearchThreadInbox,
-                    onOpen: onOpenInboxThread,
-                    onAddToCanvas: onAddInboxThreadToCanvas,
-                    onArchive: onArchiveInboxThread,
-                    onMarkRead: onMarkInboxThreadRead,
-                    onHoverNode: onHoverInboxNode,
-                    attentionRequests: attentionRequests,
-                    onFocusAttention: onFocusAttention,
-                    onRespondToAttention: onRespondToAttention,
-                    onRespondToAttentionWithText: onRespondToAttentionWithText,
-                    onDeclineTypedAttention: onDeclineTypedAttention
-                )
+                if showsThreadInbox {
+                    ThreadInboxPanelView(
+                        catalogStore: threadCatalogStore,
+                        onRefresh: onRefreshThreadInbox,
+                        onSearch: onSearchThreadInbox,
+                        onOpen: onOpenInboxThread,
+                        onAddToCanvas: onAddInboxThreadToCanvas,
+                        onArchive: onArchiveInboxThread,
+                        onMarkRead: onMarkInboxThreadRead,
+                        onHoverNode: onHoverInboxNode,
+                        attentionRequests: attentionRequests,
+                        onFocusAttention: onFocusAttention,
+                        onRespondToAttention: onRespondToAttention,
+                        onRespondToAttentionWithText: onRespondToAttentionWithText,
+                        onDeclineTypedAttention: onDeclineTypedAttention
+                    )
+                }
 
                 if !attentionRequests.isEmpty {
                     AttentionRequestsRailView(

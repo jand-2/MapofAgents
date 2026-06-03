@@ -99,7 +99,8 @@ struct ThreadInboxPanelView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(.quaternary, lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.12), radius: 12, x: 0, y: 6)
+        .compositingGroup()
+        .shadow(color: .black.opacity(0.10), radius: 10, x: 0, y: 4)
         .confirmationDialog(
             "Archive Thread?",
             isPresented: Binding(
