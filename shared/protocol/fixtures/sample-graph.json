@@ -1,0 +1,65 @@
+{
+  "workspaceID": "workspace-example",
+  "title": "mapofagents",
+  "nodes": {
+    "machine-local-windows": {
+      "id": "machine-local-windows",
+      "kind": "machine",
+      "title": "DESKTOP-EXAMPLE",
+      "subtitle": "windows - local preview",
+      "position": {
+        "x": 96,
+        "y": 96
+      },
+      "size": {
+        "width": 190,
+        "height": 90
+      },
+      "metadata": {
+        "hostID": "local-windows",
+        "platform": "windows",
+        "hostStatus": "disconnected"
+      },
+      "zIndex": 0
+    },
+    "folder-desktop": {
+      "id": "folder-desktop",
+      "kind": "folder",
+      "title": "Desktop",
+      "subtitle": "C:\\Users\\example\\Desktop",
+      "position": {
+        "x": 360,
+        "y": 150
+      },
+      "size": {
+        "width": 210,
+        "height": 96
+      },
+      "metadata": {
+        "hostID": "local-windows",
+        "platform": "windows",
+        "folderPath": "C:\\Users\\example\\Desktop"
+      },
+      "zIndex": 0
+    }
+  },
+  "manualEdges": {
+    "edge-local-desktop": {
+      "id": "edge-local-desktop",
+      "source": "machine-local-windows",
+      "target": "folder-desktop",
+      "kind": "machineFolder",
+      "isManual": false
+    }
+  },
+  "messageRoutes": {},
+  "suppressedAutoMaterializedThreadIDs": [],
+  "viewport": {
+    "scale": 1,
+    "offset": {
+      "x": 0,
+      "y": 0
+    }
+  },
+  "updatedAt": "2026-06-02T00:00:00Z"
+}

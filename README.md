@@ -93,6 +93,13 @@ The iOS app expects authenticated Codex App Server or supervisor endpoints.
 Remote endpoints should use `wss://` with a bearer token. Loopback `ws://`
 endpoints are intended for local tunnels.
 
+## Windows Preview
+
+A native Windows preview lives under `windows/` as a C#/.NET WinUI 3 app with a
+WebView2 graph renderer. It is kept in this repository so the Apple and Windows
+clients can share protocol fixtures and App Server behavior. See
+`docs/windows-port.md` for build steps and current scope.
+
 For local development on the Mac, this script starts an authenticated loopback
 App Server and writes its token under the user's Application Support directory:
 

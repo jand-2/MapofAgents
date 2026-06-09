@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mapofagents.dev/schema/graph.schema.json",
+  "title": "MapofAgents graph",
+  "type": "object",
+  "required": ["workspaceID", "title", "nodes", "manualEdges", "viewport", "updatedAt"],
+  "properties": {
+    "workspaceID": { "type": "string" },
+    "title": { "type": "string" },
+    "nodes": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/canvasNode" }
+    },
+    "manualEdges": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/canvasEdge" }
+    },
+    "messageRoutes": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "suppressedAutoMaterializedThreadIDs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "viewport": { "$ref": "#/$defs/canvasViewport" },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "canvasPoint": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" }
+      }
+    },
+    "canvasSize": {
+      "type": "object",
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "number" },
+        "height": { "type": "number" }
+      }
+    },
+    "canvasViewport": {
+      "type": "object",
+      "required": ["scale", "offset"],
+      "properties": {
+        "scale": { "type": "number" },
+        "offset": { "$ref": "#/$defs/canvasPoint" }
+      }
+    },
+    "threadRef": {
+      "type": "object",
+      "required": ["hostID", "threadID", "cwd"],
+      "properties": {
+        "hostID": { "type": "string" },
+        "threadID": { "type": "string" },
+        "cwd": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "nodeMetadata": {
+      "type": "object",
+      "properties": {
+        "hostID": { "type": "string" },
+        "platform": {
+          "enum": ["macOS", "iOS", "iPadOS", "windows", "linux", "unknown"]
+        },
+        "hostStatus": {
+          "enum": ["connected", "connecting", "disconnected", "unavailable"]
+        },
+        "codexHome": { "type": "string" },
+        "folderPath": { "type": "string" },
+        "threadRef": { "$ref": "#/$defs/threadRef" },
+        "model": { "type": "string" },
+        "reasoningEffort": { "type": "string" },
+        "runStatus": {
+          "enum": ["idle", "running", "needsInput", "failed", "complete", "unknown"]
+        },
+        "isUnread": { "type": "boolean" },
+        "hasManualPosition": { "type": "boolean" }
+      }
+    },
+    "canvasNode": {
+      "type": "object",
+      "required": ["id", "kind", "title", "subtitle", "position", "size", "metadata", "zIndex"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": {
+          "enum": ["machine", "folder", "codexThread"]
+        },
+        "title": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "position": { "$ref": "#/$defs/canvasPoint" },
+        "size": { "$ref": "#/$defs/canvasSize" },
+        "metadata": { "$ref": "#/$defs/nodeMetadata" },
+        "zIndex": { "type": "integer" }
+      }
+    },
+    "canvasEdge": {
+      "type": "object",
+      "required": ["id", "source", "target", "kind", "isManual"],
+      "properties": {
+        "id": { "type": "string" },
+        "source": { "type": "string" },
+        "target": { "type": "string" },
+        "kind": {
+          "enum": ["machineFolder", "folderThread", "machineThread", "manualNote", "threadMessage", "createdBy"]
+        },
+        "isManual": { "type": "boolean" },
+        "label": { "type": "string" }
+      }
+    }
+  }
+}

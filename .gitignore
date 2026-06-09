@@ -21,3 +21,17 @@ xcuserdata/
 *.p12
 *.mobileprovision
 .gitignored/
+
+# Windows / .NET build outputs
+**/bin/
+**/obj/
+**/TestResults/
+**/.vs/
+**/AppPackages/
+*.suo
+*.user
+*.rsuser
+*.pdb
+*.msix
+*.msixbundle
+*.appinstaller

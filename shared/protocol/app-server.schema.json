@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mapofagents.dev/schema/app-server.schema.json",
+  "title": "MapofAgents App Server protocol scaffold",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/relayEndpoint" },
+    { "$ref": "#/$defs/jsonRpcRequest" },
+    { "$ref": "#/$defs/jsonRpcResponse" }
+  ],
+  "$defs": {
+    "relayEndpoint": {
+      "type": "object",
+      "required": ["id", "name", "url"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "url": {
+          "type": "string",
+          "pattern": "^wss?://"
+        },
+        "bearerToken": {
+          "type": "string",
+          "description": "Runtime-only secret; persisted endpoint descriptors should redact or omit this value."
+        }
+      }
+    },
+    "jsonValue": true,
+    "jsonRpcRequest": {
+      "type": "object",
+      "required": ["method"],
+      "properties": {
+        "id": {
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "string" }
+          ]
+        },
+        "method": { "type": "string" },
+        "params": { "$ref": "#/$defs/jsonValue" }
+      }
+    },
+    "jsonRpcResponse": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "string" }
+          ]
+        },
+        "result": { "$ref": "#/$defs/jsonValue" },
+        "error": { "$ref": "#/$defs/jsonValue" }
+      }
+    }
+  }
+}
