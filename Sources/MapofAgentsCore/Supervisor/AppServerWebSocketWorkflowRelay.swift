@@ -241,7 +241,9 @@ public actor AppServerWebSocketWorkflowRelay {
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         failPendingRequests()
-        onDisconnected?(endpoint.id)
+        if markDisconnected {
+            onDisconnected?(endpoint.id)
+        }
         if markDisconnected {
             await supervisor.updateMachineStatus(endpoint.id, status: .disconnected)
         }

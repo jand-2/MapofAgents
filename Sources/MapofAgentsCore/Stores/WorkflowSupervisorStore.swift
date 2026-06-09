@@ -59,6 +59,8 @@ public final class WorkflowSupervisorStore {
     private var relays: [HostID: AppServerWebSocketWorkflowRelay] = [:]
     private var remoteTunnels: [HostID: CodexRemoteTunnel] = [:]
     private var activeRelayEndpointsByHostID: [HostID: AppServerRelayEndpoint] = [:]
+    private var codexRemoteRecoveryFailures: [HostID: Int] = [:]
+    @ObservationIgnored nonisolated(unsafe) private var codexRemoteRecoveryTasks: [HostID: Task<Void, Never>] = [:]
     @ObservationIgnored nonisolated(unsafe) private var snapshotTask: Task<Void, Never>?
     private var localHostID = HostID(rawValue: "local")
     private var workflowThreadRefs: [ThreadRef] = []
@@ -76,6 +78,7 @@ public final class WorkflowSupervisorStore {
 
     deinit {
         snapshotTask?.cancel()
+        codexRemoteRecoveryTasks.values.forEach { $0.cancel() }
     }
 
     public func start() {
@@ -254,6 +257,18 @@ public final class WorkflowSupervisorStore {
     }
 
     public func connectCodexRemote(_ remote: CodexDesktopRemote) async {
+        await connectCodexRemote(remote, cancelPendingRecovery: true, retryOnFailure: false)
+    }
+
+    private func connectCodexRemote(
+        _ remote: CodexDesktopRemote,
+        cancelPendingRecovery: Bool,
+        retryOnFailure: Bool
+    ) async {
+        if cancelPendingRecovery {
+            cancelCodexRemoteRecovery(hostID: remote.id)
+        }
+
         codexRemoteDiagnostics[remote.id] = CodexRemoteTunnelService.pendingConnectionDiagnosticSteps(for: remote)
         await supervisor.upsertMachine(
             SupervisorMachine(
@@ -267,10 +282,14 @@ public final class WorkflowSupervisorStore {
         await refreshSnapshots()
 
         do {
+            if let existingRelay = relays.removeValue(forKey: remote.id) {
+                await existingRelay.stop(markDisconnected: false)
+            }
             if let existingTunnel = remoteTunnels[remote.id] {
                 existingTunnel.stop()
                 remoteTunnels[remote.id] = nil
             }
+            activeRelayEndpointsByHostID[remote.id] = nil
 
             let tunnelResult = try await CodexRemoteTunnelService.startTunnelWithDiagnostics(
                 for: remote,
@@ -295,9 +314,14 @@ public final class WorkflowSupervisorStore {
                     )
                 )
                 codexRemoteDiagnostics[remote.id] = diagnostics
+                codexRemoteRecoveryFailures[remote.id] = nil
             } else {
                 tunnel.stop()
                 remoteTunnels[remote.id] = nil
+                if let failedRelay = relays.removeValue(forKey: remote.id) {
+                    await failedRelay.stop(markDisconnected: false)
+                }
+                activeRelayEndpointsByHostID[remote.id] = nil
                 diagnostics.append(
                     RuntimeDiagnosticStep(
                         id: "relay-handshake",
@@ -309,6 +333,12 @@ public final class WorkflowSupervisorStore {
                     )
                 )
                 codexRemoteDiagnostics[remote.id] = diagnostics
+                if retryOnFailure {
+                    await scheduleCodexRemoteRecovery(
+                        hostID: remote.id,
+                        reason: "Relay handshake failed after rebuilding the SSH tunnel."
+                    )
+                }
             }
         } catch {
             if let tunnelError = error as? CodexRemoteTunnelError, !tunnelError.diagnosticSteps.isEmpty {
@@ -329,6 +359,9 @@ public final class WorkflowSupervisorStore {
                 )
             )
             await refreshSnapshots()
+            if retryOnFailure {
+                await scheduleCodexRemoteRecovery(hostID: remote.id, reason: error.localizedDescription)
+            }
         }
     }
 
@@ -538,6 +571,10 @@ public final class WorkflowSupervisorStore {
         TimeInterval(min(30, max(2, failures * 2)))
     }
 
+    public static func codexRemoteRecoveryDelay(forConsecutiveFailures failures: Int) -> TimeInterval {
+        TimeInterval(min(30, max(2, failures * 2)))
+    }
+
     public func codexRemote(for hostID: HostID) -> CodexDesktopRemote? {
         codexRemotes.first { $0.id == hostID }
     }
@@ -601,6 +638,13 @@ public final class WorkflowSupervisorStore {
     }
 
     public func reconnect(_ hostID: HostID) async {
+        if hostID.rawValue.hasPrefix("codex-remote-"),
+           let remote = await codexRemoteForRecovery(hostID: hostID),
+           remote.isConnectable {
+            await connectCodexRemote(remote)
+            return
+        }
+
         guard let endpoint = relayEndpoints.first(where: { $0.id == hostID }) else {
             return
         }
@@ -728,6 +772,109 @@ public final class WorkflowSupervisorStore {
         }
         codexRemotes = discovered
         return discovered.first { $0.id == hostID }
+    }
+
+    private func codexRemoteForRecovery(hostID: HostID) async -> CodexDesktopRemote? {
+        if let remote = codexRemote(for: hostID), remote.isConnectable {
+            return remote
+        }
+
+        guard let discovered = try? await CodexDesktopRemoteService.discover() else {
+            return nil
+        }
+        codexRemotes = discovered
+        return discovered.first { $0.id == hostID && $0.isConnectable }
+    }
+
+    func hasPendingCodexRemoteRecovery(for hostID: HostID) -> Bool {
+        codexRemoteRecoveryTasks[hostID] != nil
+    }
+
+    func hasActiveCodexRemoteRecovery(for hostID: HostID) -> Bool {
+        codexRemoteRecoveryFailures[hostID] != nil
+    }
+
+    @discardableResult
+    private func cancelCodexRemoteRecovery(hostID: HostID) -> Bool {
+        let hadPendingRecovery = codexRemoteRecoveryTasks[hostID] != nil
+            || codexRemoteRecoveryFailures[hostID] != nil
+        codexRemoteRecoveryTasks[hostID]?.cancel()
+        codexRemoteRecoveryTasks[hostID] = nil
+        codexRemoteRecoveryFailures[hostID] = nil
+        return hadPendingRecovery
+    }
+
+    func scheduleCodexRemoteRecovery(hostID: HostID, reason: String) async {
+        guard codexRemoteRecoveryTasks[hostID] == nil else {
+            return
+        }
+
+        let failureCount = (codexRemoteRecoveryFailures[hostID] ?? 0) + 1
+        codexRemoteRecoveryFailures[hostID] = failureCount
+        let delay = Self.codexRemoteRecoveryDelay(forConsecutiveFailures: failureCount)
+        let delayDescription = "\(Int(delay))s"
+
+        codexRemoteDiagnostics[hostID] = [
+            RuntimeDiagnosticStep(
+                id: "route-recovery",
+                title: "Route recovery",
+                status: .running,
+                detail: "Retrying in \(delayDescription): \(reason)",
+                evidence: "stop stale WebSocket relay, stop stale SSH tunnel, rediscover Codex remote, rebuild authenticated tunnel",
+                action: .restartAppServer
+            ),
+        ]
+        if let machine = machines.first(where: { $0.id == hostID }) {
+            await supervisor.upsertMachine(
+                SupervisorMachine(
+                    id: machine.id,
+                    name: machine.name,
+                    endpointDescription: machine.endpointDescription,
+                    status: .connecting,
+                    platform: machine.platform,
+                    codexHome: machine.codexHome,
+                    lastEventAt: machine.lastEventAt,
+                    lastError: reason
+                )
+            )
+            await refreshSnapshots()
+        }
+
+        codexRemoteRecoveryTasks[hostID] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            await self?.runCodexRemoteRecovery(hostID: hostID)
+        }
+    }
+
+    private func runCodexRemoteRecovery(hostID: HostID) async {
+        codexRemoteRecoveryTasks[hostID] = nil
+        guard hasActiveCodexRemoteRecovery(for: hostID) else {
+            return
+        }
+        guard let remote = await codexRemoteForRecovery(hostID: hostID) else {
+            guard hasActiveCodexRemoteRecovery(for: hostID) else {
+                return
+            }
+            codexRemoteDiagnostics[hostID] = [
+                RuntimeDiagnosticStep(
+                    id: "route-recovery",
+                    title: "Route recovery",
+                    status: .failed,
+                    detail: "Codex Desktop remote is not discoverable yet.",
+                    evidence: "rediscover Codex Desktop remotes from local state",
+                    action: .restartAppServer
+                ),
+            ]
+            await supervisor.updateMachineFailure(hostID, message: "Codex Desktop remote is not discoverable yet.")
+            await refreshSnapshots()
+            return
+        }
+
+        guard hasActiveCodexRemoteRecovery(for: hostID) else {
+            return
+        }
+        await connectCodexRemote(remote, cancelPendingRecovery: false, retryOnFailure: true)
     }
 
     public func sendMessage(
@@ -916,7 +1063,7 @@ public final class WorkflowSupervisorStore {
             },
             onDisconnected: { [weak self] hostID in
                 Task { @MainActor in
-                    self?.handleRelayDisconnected(hostID: hostID)
+                    await self?.handleRelayDisconnected(hostID: hostID)
                 }
             }
         )
@@ -936,6 +1083,7 @@ public final class WorkflowSupervisorStore {
 
     public func disconnect(_ machineID: HostID) async {
         guard machineID != localHostID else { return }
+        cancelCodexRemoteRecovery(hostID: machineID)
         relayEndpoints.removeAll { $0.id == machineID }
         if let tunnel = remoteTunnels.removeValue(forKey: machineID) {
             tunnel.stop()
@@ -977,8 +1125,24 @@ public final class WorkflowSupervisorStore {
         reduceRuntimeState(notification: notification, hostID: hostID)
     }
 
-    private func handleRelayDisconnected(hostID: HostID) {
+    private func handleRelayDisconnected(hostID: HostID) async {
         clearHostScopedRuntimeState(hostID: hostID)
+        guard remoteTunnels[hostID] != nil else {
+            return
+        }
+
+        let failedRelay = relays.removeValue(forKey: hostID)
+        let failedTunnel = remoteTunnels.removeValue(forKey: hostID)
+        activeRelayEndpointsByHostID[hostID] = nil
+        failedTunnel?.stop()
+        if let failedRelay {
+            await failedRelay.stop(markDisconnected: false)
+        }
+
+        await scheduleCodexRemoteRecovery(
+            hostID: hostID,
+            reason: "The App Server route dropped; rebuilding the SSH tunnel."
+        )
     }
 
     private func reduceRuntimeState(notification: CodexServerNotification, hostID: HostID) {

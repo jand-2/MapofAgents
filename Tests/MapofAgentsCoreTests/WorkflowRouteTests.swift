@@ -46,14 +46,14 @@ func relayCanStopForEndpointReplacementWithoutDisconnectingMachine() async throw
         SupervisorMachine(
             id: hostID,
             name: "Paired Mac",
-            endpointDescription: "ws://10.0.0.4:18945",
+            endpointDescription: "ws://192.0.2.10:18945",
             status: .connected
         )
     )
     let endpoint = AppServerRelayEndpoint(
         id: hostID,
         name: "Paired Mac",
-        url: try #require(URL(string: "ws://10.0.0.4:18945"))
+        url: try #require(URL(string: "ws://192.0.2.10:18945"))
     )
     let relay = AppServerWebSocketWorkflowRelay(endpoint: endpoint, supervisor: supervisor)
 
@@ -62,6 +62,46 @@ func relayCanStopForEndpointReplacementWithoutDisconnectingMachine() async throw
 
     await relay.stop()
     #expect(await supervisor.machineSnapshot().first { $0.id == hostID }?.status == .disconnected)
+}
+
+@Test
+func relayStopForEndpointReplacementDoesNotNotifyDisconnected() async throws {
+    let supervisor = WorkflowSupervisor()
+    let hostID = HostID(rawValue: "paired-mac")
+    let endpoint = AppServerRelayEndpoint(
+        id: hostID,
+        name: "Paired Mac",
+        url: try #require(URL(string: "ws://192.0.2.10:18945"))
+    )
+    let recorder = HostIDRecorder()
+    let relay = AppServerWebSocketWorkflowRelay(
+        endpoint: endpoint,
+        supervisor: supervisor,
+        onDisconnected: { hostID in
+            recorder.append(hostID)
+        }
+    )
+
+    await relay.stop(markDisconnected: false)
+    #expect(recorder.recorded.isEmpty)
+
+    await relay.stop()
+    #expect(recorder.recorded == [hostID])
+}
+
+@Test
+@MainActor
+func disconnectCancelsPendingCodexRemoteRecovery() async {
+    let store = WorkflowSupervisorStore()
+    let hostID = HostID(rawValue: "codex-remote-windows")
+
+    await store.scheduleCodexRemoteRecovery(hostID: hostID, reason: "Route dropped during test.")
+    #expect(store.hasPendingCodexRemoteRecovery(for: hostID))
+    #expect(store.hasActiveCodexRemoteRecovery(for: hostID))
+
+    await store.disconnect(hostID)
+    #expect(!store.hasPendingCodexRemoteRecovery(for: hostID))
+    #expect(!store.hasActiveCodexRemoteRecovery(for: hostID))
 }
 
 @Test
@@ -227,8 +267,8 @@ func hostRegistryReusesExplicitStableHostIDAcrossEndpointAliases() async throws 
         .appendingPathComponent("mapofagents-host-registry-tests-\(UUID().uuidString)", isDirectory: true)
     let registryURL = directory.appendingPathComponent("host-registry.json")
     let registry = HostRegistry(url: registryURL)
-    let firstURL = try #require(URL(string: "ws://mac-host.lan:18945"))
-    let secondURL = try #require(URL(string: "ws://mac-mini.example.ts.net:18945"))
+    let firstURL = try #require(URL(string: "ws://paired-a.example.test:18945"))
+    let secondURL = try #require(URL(string: "ws://paired-b.example.test:18945"))
     let pairedMacID = HostID(rawValue: "paired-mac")
 
     let firstID = await registry.hostID(explicitID: pairedMacID, name: "Mac mini", endpointURL: firstURL)
@@ -249,8 +289,8 @@ func hostRegistryDoesNotCollapseDistinctMachinesWithSameDisplayName() async thro
         .appendingPathComponent("mapofagents-host-registry-tests-\(UUID().uuidString)", isDirectory: true)
     let registryURL = directory.appendingPathComponent("host-registry.json")
     let registry = HostRegistry(url: registryURL)
-    let firstURL = try #require(URL(string: "ws://lab-a.tailnet.ts.net:18945"))
-    let secondURL = try #require(URL(string: "ws://lab-b.tailnet.ts.net:18945"))
+    let firstURL = try #require(URL(string: "ws://lab-a.example.test:18945"))
+    let secondURL = try #require(URL(string: "ws://lab-b.example.test:18945"))
 
     let firstID = await registry.hostID(explicitID: nil, name: "Mac mini", endpointURL: firstURL)
     let secondID = await registry.hostID(explicitID: nil, name: "Mac mini", endpointURL: secondURL)
@@ -266,8 +306,8 @@ func hostRegistryDoesNotMergeSameHostnameDifferentPortsWithoutExplicitID() async
         .appendingPathComponent("mapofagents-host-registry-tests-\(UUID().uuidString)", isDirectory: true)
     let registryURL = directory.appendingPathComponent("host-registry.json")
     let registry = HostRegistry(url: registryURL)
-    let firstURL = try #require(URL(string: "ws://mac.lan:18945"))
-    let secondURL = try #require(URL(string: "ws://mac.lan:14500"))
+    let firstURL = try #require(URL(string: "ws://same-host.example.test:18945"))
+    let secondURL = try #require(URL(string: "ws://same-host.example.test:14500"))
 
     let firstID = await registry.hostID(explicitID: nil, name: "Mac mini", endpointURL: firstURL)
     let secondID = await registry.hostID(explicitID: nil, name: "Mac mini", endpointURL: secondURL)
@@ -319,4 +359,21 @@ private func decodedPowerShellScript(from command: String) throws -> String {
     let encoded = command.replacingOccurrences(of: prefix, with: "")
     let data = try #require(Data(base64Encoded: encoded))
     return try #require(String(data: data, encoding: .utf16LittleEndian))
+}
+
+private final class HostIDRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [HostID] = []
+
+    var recorded: [HostID] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+
+    func append(_ hostID: HostID) {
+        lock.lock()
+        defer { lock.unlock() }
+        values.append(hostID)
+    }
 }
