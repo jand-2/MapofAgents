@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|exec_command|shell|functions.exec_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/script/mapofagents-post-tool-use-hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking folder creation"
+          }
+        ]
+      }
+    ]
+  }
+}

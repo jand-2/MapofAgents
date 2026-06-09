@@ -619,6 +619,23 @@ struct RootView: View {
             } ?? false
             return sourceMatches || childMatches
         }
+        if event.kind == .folderCreated {
+            guard event.childFolderPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+                return false
+            }
+
+            let sourceMatches = event.threadID.map { threadID in
+                graphStore.workflowThreadRefs.contains { threadRef in
+                    threadRef.matches(hostID: event.hostID, threadID: threadID)
+                }
+            } ?? false
+            let targetHostID = event.childHostID ?? event.hostID ?? runtimeStore.localHost.id
+            let targetHostMatches = targetHostID == runtimeStore.localHost.id
+                || graphStore.graph.nodes.values.contains {
+                    $0.kind == .machine && $0.metadata.hostID == targetHostID
+                }
+            return sourceMatches || targetHostMatches
+        }
 
         guard let threadID = event.threadID else {
             return false
@@ -638,6 +655,8 @@ struct RootView: View {
             return "\(name) finished"
         case .threadCreated:
             return "\(name) created a thread"
+        case .folderCreated:
+            return "\(name) created a folder"
         case .needsInput:
             return "\(name) needs input"
         case .failed:
@@ -652,7 +671,7 @@ struct RootView: View {
                 return "Started by \(origin)"
             case .turnCompleted:
                 return "Triggered by \(origin)"
-            case .threadCreated, .needsInput, .failed:
+            case .threadCreated, .folderCreated, .needsInput, .failed:
                 break
             }
         }
@@ -668,6 +687,8 @@ struct RootView: View {
             return "Turn completed"
         case .threadCreated:
             return "Thread created"
+        case .folderCreated:
+            return "Folder created"
         case .needsInput:
             return "Needs input"
         case .failed:
@@ -943,6 +964,8 @@ private enum TopNotificationKind: Hashable {
                 return "checkmark.circle.fill"
             case .threadCreated:
                 return "plus.circle.fill"
+            case .folderCreated:
+                return "folder.badge.plus"
             case .needsInput:
                 return "exclamationmark.bubble.fill"
             case .failed:
@@ -963,6 +986,8 @@ private enum TopNotificationKind: Hashable {
                 return .green
             case .threadCreated:
                 return .orange
+            case .folderCreated:
+                return .yellow
             case .needsInput:
                 return .orange
             case .failed:

@@ -127,6 +127,17 @@ child_cwd = first_string(
     "child_cwd",
     "cwd",
 )
+child_folder_path = first_string(
+    "MAPOFAGENTS_CHILD_FOLDER_PATH",
+    "MAPOFAGENTS_FOLDER_PATH",
+    "CHILD_FOLDER_PATH",
+    "FOLDER_PATH",
+    "childFolderPath",
+    "child_folder_path",
+    "folderPath",
+    "folder_path",
+    "path",
+) or child_cwd
 child_title = first_string(
     "MAPOFAGENTS_CHILD_TITLE",
     "CHILD_TITLE",
@@ -165,6 +176,33 @@ if normalized in ("thread.created", "thread-created", "thread-create") or normal
         record["childThreadID"] = child_thread_id
     if child_cwd:
         record["cwd"] = child_cwd
+    if child_title:
+        record["title"] = child_title
+    if stdin_payload.strip():
+        record["raw"] = payload
+
+    with open(event_file, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    raise SystemExit(0)
+
+if normalized in ("folder.created", "folder-created", "folder-create", "workspace-created", "workspace-create", "project-created", "project-create") or normalized.endswith("-folder-created"):
+    record = {
+        "id": os.environ.get("MAPOFAGENTS_HOOK_EVENT_ID") or str(uuid.uuid4()),
+        "source": "codex-hook",
+        "type": "folder.created",
+        "method": "folder/created",
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    if source_host_id:
+        record["sourceHostID"] = source_host_id
+    if source_thread_id:
+        record["sourceThreadID"] = source_thread_id
+    if source_turn_id:
+        record["sourceTurnID"] = source_turn_id
+    if child_host_id or source_host_id:
+        record["childHostID"] = child_host_id or source_host_id
+    if child_folder_path:
+        record["folderPath"] = child_folder_path
     if child_title:
         record["title"] = child_title
     if stdin_payload.strip():

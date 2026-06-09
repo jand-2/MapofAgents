@@ -150,7 +150,7 @@ public struct ThreadRuntimeState: Codable, Identifiable, Hashable, Sendable {
             activeFlags.insert(.unread)
             lastError = event.summary
             currentActivitySummary = event.summary.nilIfEmpty ?? "Turn failed"
-        case .threadCreated:
+        case .threadCreated, .folderCreated:
             currentActivitySummary = event.summary.nilIfEmpty ?? currentActivitySummary
         }
     }
@@ -1982,7 +1982,7 @@ public final class ThreadCatalogStore {
 
     public func apply(events: [WorkflowEvent], graph: AgentGraph, defaultHostID: HostID? = nil) {
         for event in events.sorted(by: { $0.createdAt < $1.createdAt }) {
-            guard event.kind != .threadCreated else { continue }
+            guard event.kind != .threadCreated && event.kind != .folderCreated else { continue }
             guard let threadID = event.threadID else { continue }
             let hostID = event.hostID ?? defaultHostID ?? HostID(rawValue: "local")
             let key = ThreadRef.qualifiedID(hostID: hostID, threadID: threadID)
@@ -2238,7 +2238,7 @@ private extension ThreadRunStatus {
             self = .running
         case .turnCompleted:
             self = .complete
-        case .threadCreated:
+        case .threadCreated, .folderCreated:
             self = .complete
         case .needsInput:
             self = .needsInput

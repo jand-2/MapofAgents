@@ -644,6 +644,53 @@ public final class GraphStore {
         await createCreatedByEdge(from: sourceID, to: targetID)
     }
 
+    @discardableResult
+    public func materializeWorkflowFolderRoot(
+        path: String,
+        hostID: HostID,
+        title: String? = nil
+    ) async -> NodeID? {
+        let folderPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !folderPath.isEmpty else {
+            return nil
+        }
+
+        if let existingID = matchingFolderNodeID(hostID: hostID, path: folderPath) {
+            await updateExistingWorkflowFolder(id: existingID, path: folderPath, title: title)
+            return existingID
+        }
+
+        guard !isDescendantOfExistingFolderRoot(path: folderPath, hostID: hostID) else {
+            return nil
+        }
+
+        let platform = graph.nodes.values.first {
+            $0.kind == .machine && $0.metadata.hostID == hostID
+        }?.metadata.platform
+            ?? graph.nodes.values.first {
+                $0.metadata.hostID == hostID && $0.metadata.platform != nil
+            }?.metadata.platform
+            ?? .macOS
+        let displayTitle = Self.preferredDisplayName(title, Self.folderTitle(for: folderPath))
+            ?? Self.folderTitle(for: folderPath)
+        let node = CanvasNode(
+            kind: .folder,
+            title: displayTitle,
+            subtitle: folderPath,
+            position: nextFolderPosition(hostID: hostID),
+            size: .folder,
+            metadata: NodeMetadata(
+                hostID: hostID,
+                platform: platform,
+                folderPath: folderPath,
+                hasManualPosition: false
+            ),
+            zIndex: nextZIndex()
+        )
+        await apply(.upsertNode(node))
+        return node.id
+    }
+
     private func createdThreadDisplayTitle(
         for threadRef: ThreadRef,
         title: String?,
@@ -843,7 +890,7 @@ public final class GraphStore {
             return .running
         case .turnCompleted:
             return .complete
-        case .threadCreated:
+        case .threadCreated, .folderCreated:
             return .complete
         case .needsInput:
             return .needsInput
@@ -1294,6 +1341,57 @@ public final class GraphStore {
         return nil
     }
 
+    private func matchingFolderNodeID(hostID: HostID, path: String) -> NodeID? {
+        let normalizedPath = Self.standardizePath(path)
+        return graph.nodes.values.first { node in
+            guard node.kind == .folder,
+                  node.metadata.hostID == hostID,
+                  let existingPath = node.metadata.folderPath
+            else {
+                return false
+            }
+            return Self.standardizePath(existingPath) == normalizedPath
+        }?.id
+    }
+
+    private func updateExistingWorkflowFolder(id: NodeID, path: String, title: String?) async {
+        guard var node = graph.nodes[id] else {
+            return
+        }
+
+        let preferredTitle = Self.preferredDisplayName(node.title, title)
+        var changed = false
+        if let preferredTitle, preferredTitle != node.title {
+            node.title = preferredTitle
+            changed = true
+        }
+        if node.metadata.folderPath != path {
+            node.metadata.folderPath = path
+            node.subtitle = path
+            changed = true
+        }
+
+        if changed {
+            await apply(.upsertNode(node))
+        }
+    }
+
+    private func isDescendantOfExistingFolderRoot(path: String, hostID: HostID) -> Bool {
+        let normalizedPath = Self.standardizePath(path)
+        return graph.nodes.values.contains { node in
+            guard node.kind == .folder,
+                  node.metadata.hostID == hostID,
+                  let existingPath = node.metadata.folderPath
+            else {
+                return false
+            }
+
+            let normalizedExistingPath = Self.standardizePath(existingPath)
+            return normalizedPath != normalizedExistingPath
+                && Self.path(path, isInsideOrEqualTo: existingPath)
+        }
+    }
+
     private static func clamped(_ viewport: CanvasViewport) -> CanvasViewport {
         CanvasViewport(
             scale: min(1.8, max(0.45, viewport.scale)),
@@ -1330,7 +1428,8 @@ public final class GraphStore {
 
     private static func standardizePath(_ path: String) -> String {
         let slashNormalized = path.replacingOccurrences(of: "\\", with: "/")
-        if slashNormalized.range(of: #"^[A-Za-z]:"#, options: .regularExpression) != nil {
+        if slashNormalized.range(of: #"^[A-Za-z]:"#, options: .regularExpression) != nil
+            || slashNormalized.hasPrefix("//") {
             return slashNormalized.lowercased()
                 .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         }

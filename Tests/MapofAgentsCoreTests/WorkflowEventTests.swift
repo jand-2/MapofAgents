@@ -370,6 +370,45 @@ func workflowHookEventParserMapsThreadCreatedBridgeEvent() async throws {
 }
 
 @Test
+func workflowHookEventParserMapsFolderCreatedBridgeEvent() async throws {
+    let line = """
+    {
+      "type": "folder.created",
+      "sourceHostID": "local",
+      "sourceThreadID": "source-thread",
+      "sourceTurnID": "turn-1",
+      "childHostID": "remote",
+      "folderPath": "/Users/example/projects/new-workspace",
+      "title": "new-workspace",
+      "createdAt": "2026-05-28T10:17:30Z"
+    }
+    """
+
+    let event = try #require(
+        WorkflowHookEventParser.workflowEvent(
+            from: line,
+            defaultHostID: HostID(rawValue: "fallback")
+        )
+    )
+
+    #expect(event.kind == .folderCreated)
+    #expect(event.hostID == HostID(rawValue: "local"))
+    #expect(event.threadID == "source-thread")
+    #expect(event.turnID == "turn-1")
+    #expect(event.childHostID == HostID(rawValue: "remote"))
+    #expect(event.childFolderPath == "/Users/example/projects/new-workspace")
+    #expect(event.childTitle == "new-workspace")
+    #expect(event.method == "folder/created")
+    #expect(event.summary == "Created folder new-workspace")
+    #expect(event.dedupeKey == WorkflowEvent.folderCreatedID(
+        sourceHostID: HostID(rawValue: "local"),
+        sourceThreadID: "source-thread",
+        childHostID: HostID(rawValue: "remote"),
+        childFolderPath: "/Users/example/projects/new-workspace"
+    ))
+}
+
+@Test
 func workflowHookEventParserIgnoresUnknownLines() async throws {
     #expect(WorkflowHookEventParser.workflowEvent(from: "not json", defaultHostID: HostID(rawValue: "local")) == nil)
     #expect(WorkflowHookEventParser.workflowEvent(from: "{\"event\":\"noise\"}", defaultHostID: HostID(rawValue: "local")) == nil)

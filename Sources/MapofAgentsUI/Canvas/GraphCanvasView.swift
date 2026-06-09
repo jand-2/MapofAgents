@@ -2757,7 +2757,7 @@ public struct GraphCanvasView: View {
         case .turnCompleted, .failed, .needsInput:
             await refreshOpenTranscripts(for: threadRef)
             awaitingResponseThreadKeys.remove(key)
-        case .threadCreated:
+        case .threadCreated, .folderCreated:
             break
         }
     }
@@ -2925,6 +2925,7 @@ public struct GraphCanvasView: View {
                 await graphStore.applyWorkflowEvent(event, markUnread: shouldMarkUnread(for: event))
             }
             if isLiveEvent {
+                await materializeCreatedFolderIfNeeded(from: event)
                 await materializeCreatedThreadIfNeeded(from: event)
                 await refreshVisibleTranscripts(after: event)
 
@@ -2970,6 +2971,36 @@ public struct GraphCanvasView: View {
             workflowName: activeWorkflowName
         )
         return ThreadWorkflowMembership.merging(workflowMemberships, active: active)
+    }
+
+    private func materializeCreatedFolderIfNeeded(from event: WorkflowEvent) async {
+        if event.kind == .folderCreated {
+            guard let path = event.childFolderPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !path.isEmpty,
+                  let hostID = event.childHostID ?? event.hostID
+            else {
+                return
+            }
+
+            await graphStore.materializeWorkflowFolderRoot(
+                path: path,
+                hostID: hostID,
+                title: event.childTitle
+            )
+            return
+        }
+
+        guard event.kind == .threadCreated,
+              let childThreadRef = event.childThreadRef,
+              !childThreadRef.cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return
+        }
+
+        await graphStore.materializeWorkflowFolderRoot(
+            path: childThreadRef.cwd,
+            hostID: childThreadRef.hostID
+        )
     }
 
     private func materializeCreatedThreadIfNeeded(from event: WorkflowEvent) async {
@@ -3035,7 +3066,7 @@ public struct GraphCanvasView: View {
     }
 
     private func shouldApplyEventToRunState(_ event: WorkflowEvent) -> Bool {
-        guard event.kind != .threadCreated else {
+        guard event.kind != .threadCreated && event.kind != .folderCreated else {
             return false
         }
         return event.kind != .turnStarted || event.createdAt >= workflowEventStateStartedAt
@@ -3130,7 +3161,7 @@ public struct GraphCanvasView: View {
             return .running
         case .turnCompleted:
             return .complete
-        case .threadCreated:
+        case .threadCreated, .folderCreated:
             return .complete
         case .needsInput:
             return .needsInput
@@ -3802,7 +3833,7 @@ private extension WorkflowNotificationPreferences {
         switch kind {
         case .turnStarted:
             return false
-        case .threadCreated:
+        case .threadCreated, .folderCreated:
             return false
         case .turnCompleted:
             return notifyOnCompleted

@@ -31,10 +31,11 @@ public enum WorkflowHookEventParser {
         ) else {
             return nil
         }
+        let isCreationEvent = kind == .threadCreated || kind == .folderCreated
 
         let hostID = string(
             in: object,
-            keys: kind == .threadCreated
+            keys: isCreationEvent
                 ? ["sourceHostID", "sourceHostId", "source_host_id", "sourceHost", "hostID", "hostId", "host_id", "host"]
                 : ["hostID", "hostId", "host_id", "host"]
         )
@@ -42,19 +43,19 @@ public enum WorkflowHookEventParser {
             ?? defaultHostID
         let threadID = string(
             in: object,
-            keys: kind == .threadCreated
+            keys: isCreationEvent
                 ? ["sourceThreadID", "sourceThreadId", "source_thread_id", "sourceSessionID", "sourceSessionId", "source_session_id", "threadID", "threadId", "thread_id", "sessionID", "sessionId", "session_id"]
                 : ["threadID", "threadId", "thread_id", "sessionID", "sessionId", "session_id"]
         ) ?? object["thread"]?["id"]?.stringValue?.nilIfBlank
         let turnID = string(
             in: object,
-            keys: kind == .threadCreated
+            keys: isCreationEvent
                 ? ["sourceTurnID", "sourceTurnId", "source_turn_id", "turnID", "turnId", "turn_id", "rolloutID", "rolloutId", "rollout_id"]
                 : ["turnID", "turnId", "turn_id", "rolloutID", "rolloutId", "rollout_id"]
         ) ?? object["turn"]?["id"]?.stringValue?.nilIfBlank
         let childHostID = string(in: object, keys: ["childHostID", "childHostId", "child_host_id", "targetHostID", "targetHostId", "target_host_id"])
             .map(HostID.init(rawValue:))
-            ?? (kind == .threadCreated ? hostID : nil)
+            ?? (isCreationEvent ? hostID : nil)
         let childThreadID = string(in: object, keys: ["childThreadID", "childThreadId", "child_thread_id", "childSessionID", "childSessionId", "child_session_id", "targetThreadID", "targetThreadId", "target_thread_id"])
             ?? object["childThread"]?["id"]?.stringValue?.nilIfBlank
             ?? object["child"]?["threadID"]?.stringValue?.nilIfBlank
@@ -63,6 +64,12 @@ public enum WorkflowHookEventParser {
         let childCWD = string(in: object, keys: ["childCWD", "childCwd", "child_cwd", "childWorkspace", "child_workspace", "cwd"])
             ?? object["childThread"]?["cwd"]?.stringValue?.nilIfBlank
             ?? object["child"]?["cwd"]?.stringValue?.nilIfBlank
+        let childFolderPath = string(in: object, keys: ["childFolderPath", "child_folder_path", "folderPath", "folder_path", "path"])
+            ?? object["childFolder"]?["path"]?.stringValue?.nilIfBlank
+            ?? object["folder"]?["path"]?.stringValue?.nilIfBlank
+            ?? object["child"]?["folderPath"]?.stringValue?.nilIfBlank
+            ?? object["child"]?["folder_path"]?.stringValue?.nilIfBlank
+            ?? (kind == .folderCreated ? childCWD : nil)
         let childTitle = string(in: object, keys: ["childTitle", "child_title", "threadTitle", "thread_title", "name", "title"])
             ?? object["childThread"]?["title"]?.stringValue?.nilIfBlank
             ?? object["child"]?["title"]?.stringValue?.nilIfBlank
@@ -79,9 +86,8 @@ public enum WorkflowHookEventParser {
             fallback: receivedAt
         )
         let summary = string(in: object, keys: ["summary", "message"])
-            ?? (kind == .threadCreated
-                ? threadCreatedSummary(title: childTitle, threadID: childThreadID)
-                : defaultSummary(for: kind, method: method))
+            ?? creationSummary(for: kind, title: childTitle, threadID: childThreadID, folderPath: childFolderPath)
+            ?? defaultSummary(for: kind, method: method)
         let effectiveMethod = method ?? defaultMethod(for: kind)
         let explicitID = explicitID(
             in: object,
@@ -91,6 +97,7 @@ public enum WorkflowHookEventParser {
             turnID: turnID,
             childHostID: childHostID,
             childThreadID: childThreadID,
+            childFolderPath: childFolderPath,
             method: effectiveMethod,
             createdAt: createdAt
         )
@@ -107,6 +114,7 @@ public enum WorkflowHookEventParser {
             childHostID: childHostID,
             childThreadID: childThreadID,
             childCWD: childCWD,
+            childFolderPath: childFolderPath,
             childTitle: childTitle,
             childThreadKind: childThreadKind
         )
@@ -117,7 +125,8 @@ public enum WorkflowHookEventParser {
             guard let value = object[key]?.stringValue?.nilIfBlank else {
                 continue
             }
-            if workflowEventKind(from: value) == .threadCreated {
+            if let kind = workflowEventKind(from: value),
+               kind == .threadCreated || kind == .folderCreated {
                 return value
             }
         }
@@ -167,6 +176,20 @@ public enum WorkflowHookEventParser {
             || normalized.contains("thread-create") {
             return .threadCreated
         }
+        if normalized == "folder-created"
+            || normalized == "folder-create"
+            || normalized == "workspace-created"
+            || normalized == "workspace-create"
+            || normalized == "project-created"
+            || normalized == "project-create"
+            || normalized.contains("folder-created")
+            || normalized.contains("folder-create")
+            || normalized.contains("workspace-created")
+            || normalized.contains("workspace-create")
+            || normalized.contains("project-created")
+            || normalized.contains("project-create") {
+            return .folderCreated
+        }
         return nil
     }
 
@@ -178,6 +201,7 @@ public enum WorkflowHookEventParser {
         turnID: String?,
         childHostID: HostID?,
         childThreadID: String?,
+        childFolderPath: String?,
         method: String,
         createdAt: Date
     ) -> String? {
@@ -191,6 +215,15 @@ public enum WorkflowHookEventParser {
                 sourceThreadID: threadID,
                 childHostID: childHostID,
                 childThreadID: childThreadID
+            )
+            return "hook-\(stableID)"
+        }
+        if kind == .folderCreated, let childHostID, let childFolderPath {
+            let stableID = WorkflowEvent.folderCreatedID(
+                sourceHostID: hostID,
+                sourceThreadID: threadID,
+                childHostID: childHostID,
+                childFolderPath: childFolderPath
             )
             return "hook-\(stableID)"
         }
@@ -235,6 +268,22 @@ public enum WorkflowHookEventParser {
         return nil
     }
 
+    private static func creationSummary(
+        for kind: WorkflowEventKind,
+        title: String?,
+        threadID: String?,
+        folderPath: String?
+    ) -> String? {
+        switch kind {
+        case .threadCreated:
+            return threadCreatedSummary(title: title, threadID: threadID)
+        case .folderCreated:
+            return folderCreatedSummary(title: title, folderPath: folderPath)
+        case .turnStarted, .turnCompleted, .needsInput, .failed:
+            return nil
+        }
+    }
+
     private static func threadCreatedSummary(title: String?, threadID: String?) -> String {
         if let title = title?.nilIfBlank {
             return "Created \(title)"
@@ -243,6 +292,25 @@ public enum WorkflowHookEventParser {
             return "Created thread \(threadID)"
         }
         return "Created thread"
+    }
+
+    private static func folderCreatedSummary(title: String?, folderPath: String?) -> String {
+        if let title = title?.nilIfBlank {
+            return "Created folder \(title)"
+        }
+        if let folderName = folderPath?.nilIfBlank.map(folderName(for:)) {
+            return "Created folder \(folderName)"
+        }
+        return "Created folder"
+    }
+
+    private static func folderName(for path: String) -> String {
+        let separators = CharacterSet(charactersIn: "/\\")
+        let components = path
+            .trimmingCharacters(in: separators)
+            .components(separatedBy: separators)
+            .filter { !$0.isEmpty }
+        return components.last ?? path
     }
 
     private static func date(in object: [String: JSONValue], keys: [String], fallback: Date) -> Date {
@@ -284,6 +352,8 @@ public enum WorkflowHookEventParser {
             return "turn/completed"
         case .threadCreated:
             return "thread/created"
+        case .folderCreated:
+            return "folder/created"
         case .needsInput:
             return "hook/needsInput"
         case .failed:
@@ -299,6 +369,8 @@ public enum WorkflowHookEventParser {
             return "Turn completed"
         case .threadCreated:
             return "Created thread"
+        case .folderCreated:
+            return "Created folder"
         case .needsInput:
             return method ?? "Needs input"
         case .failed:

@@ -44,6 +44,8 @@ enum WorkflowUserNotifier {
             content.title = "\(threadTitle) finished"
         case .threadCreated:
             return nil
+        case .folderCreated:
+            return nil
         case .needsInput:
             content.title = "\(threadTitle) needs input"
         case .failed:

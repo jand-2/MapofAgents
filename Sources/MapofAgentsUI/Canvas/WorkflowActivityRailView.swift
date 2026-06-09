@@ -116,6 +116,11 @@ struct WorkflowActivityRailView: View {
                 return "\(name) created \(title)"
             }
             return "\(name) created a thread"
+        case .folderCreated:
+            if let title = event.childTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "\(name) created \(title)"
+            }
+            return "\(name) created a folder"
         case .needsInput:
             return "\(name) needs input"
         case .failed:
@@ -131,7 +136,7 @@ struct WorkflowActivityRailView: View {
                 return "\(event.createdAt.formatted(date: .omitted, time: .shortened)) - Started by \(origin)"
             case .turnCompleted:
                 return "\(event.createdAt.formatted(date: .omitted, time: .shortened)) - Triggered by \(origin)"
-            case .threadCreated, .needsInput, .failed:
+            case .threadCreated, .folderCreated, .needsInput, .failed:
                 break
             }
         }
@@ -146,6 +151,8 @@ struct WorkflowActivityRailView: View {
             return "checkmark.circle"
         case .threadCreated:
             return "plus.circle"
+        case .folderCreated:
+            return "folder.badge.plus"
         case .needsInput:
             return "exclamationmark.bubble"
         case .failed:
@@ -161,6 +168,8 @@ struct WorkflowActivityRailView: View {
             return .green
         case .threadCreated:
             return .orange
+        case .folderCreated:
+            return .yellow
         case .needsInput:
             return .orange
         case .failed:

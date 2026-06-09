@@ -1832,6 +1832,8 @@ private struct IPhoneActivitySheet: View {
             return "checkmark.circle.fill"
         case .threadCreated:
             return "plus.circle.fill"
+        case .folderCreated:
+            return "folder.badge.plus"
         case .needsInput:
             return "exclamationmark.bubble.fill"
         case .failed:
@@ -1847,6 +1849,8 @@ private struct IPhoneActivitySheet: View {
             return .green
         case .threadCreated:
             return .orange
+        case .folderCreated:
+            return .yellow
         case .needsInput:
             return .orange
         case .failed:
@@ -1862,6 +1866,8 @@ private struct IPhoneActivitySheet: View {
             return "finished"
         case .threadCreated:
             return "created"
+        case .folderCreated:
+            return "created folder"
         case .needsInput:
             return "needs input"
         case .failed:

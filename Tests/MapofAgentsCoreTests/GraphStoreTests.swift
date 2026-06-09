@@ -845,6 +845,82 @@ func workflowEventDoesNotMarkUnreadUnlessRequested() async throws {
 
 @Test
 @MainActor
+func materializeWorkflowFolderRootCreatesFolderUnderMachine() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-folder-created-root-tests-\(UUID().uuidString)", isDirectory: true)
+    let store = LocalControlRoomStore(paths: ApplicationPaths(applicationSupportDirectory: directory))
+    let graphStore = GraphStore(repository: store)
+
+    let hostID = HostID(rawValue: "remote-windows")
+    await graphStore.applySupervisorMachine(
+        SupervisorMachine(
+            id: hostID,
+            name: "Windows Desktop",
+            endpointDescription: "example-host.local",
+            status: .connected,
+            platform: .windows
+        )
+    )
+
+    let folderID = try #require(
+        await graphStore.materializeWorkflowFolderRoot(
+            path: #"C:\Users\User\Desktop"#,
+            hostID: hostID,
+            title: "Desktop"
+        )
+    )
+    let folder = try #require(graphStore.graph.nodes[folderID])
+
+    #expect(folder.kind == .folder)
+    #expect(folder.title == "Desktop")
+    #expect(folder.subtitle == #"C:\Users\User\Desktop"#)
+    #expect(folder.metadata.hostID == hostID)
+    #expect(folder.metadata.platform == .windows)
+    #expect(folder.metadata.folderPath == #"C:\Users\User\Desktop"#)
+    #expect(graphStore.semanticEdges.contains { edge in
+        edge.kind == .machineFolder
+            && edge.target == folderID
+            && graphStore.graph.nodes[edge.source]?.metadata.hostID == hostID
+    })
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+@MainActor
+func materializeWorkflowFolderRootIgnoresDescendantFolders() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-folder-created-descendant-tests-\(UUID().uuidString)", isDirectory: true)
+    let store = LocalControlRoomStore(paths: ApplicationPaths(applicationSupportDirectory: directory))
+    let graphStore = GraphStore(repository: store)
+
+    let hostID = HostID(rawValue: "local")
+    let rootID = try #require(
+        await graphStore.materializeWorkflowFolderRoot(
+            path: "/Users/example/projects/root",
+            hostID: hostID,
+            title: "root"
+        )
+    )
+    let descendantID = await graphStore.materializeWorkflowFolderRoot(
+        path: "/Users/example/projects/root/subproject",
+        hostID: hostID,
+        title: "subproject"
+    )
+
+    let folders = graphStore.graph.nodes.values.filter {
+        $0.kind == .folder && $0.metadata.hostID == hostID
+    }
+    #expect(descendantID == nil)
+    #expect(folders.count == 1)
+    #expect(folders.first?.id == rootID)
+    #expect(folders.first?.metadata.folderPath == "/Users/example/projects/root")
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+@MainActor
 func autoArrangePlacesProjectThreadsAfterFoldersAndScratchThreadsAfterMachine() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("mapofagents-arrange-tests-\(UUID().uuidString)", isDirectory: true)

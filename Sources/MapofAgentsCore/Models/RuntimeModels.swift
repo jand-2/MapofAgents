@@ -524,6 +524,7 @@ public enum WorkflowEventKind: String, Codable, CaseIterable, Sendable {
     case turnStarted
     case turnCompleted
     case threadCreated
+    case folderCreated
     case needsInput
     case failed
 }
@@ -540,6 +541,7 @@ public struct WorkflowEvent: Codable, Identifiable, Hashable, Sendable {
     public var childHostID: HostID?
     public var childThreadID: String?
     public var childCWD: String?
+    public var childFolderPath: String?
     public var childTitle: String?
     public var childThreadKind: CodexThreadNodeKind?
 
@@ -555,6 +557,7 @@ public struct WorkflowEvent: Codable, Identifiable, Hashable, Sendable {
         childHostID: HostID? = nil,
         childThreadID: String? = nil,
         childCWD: String? = nil,
+        childFolderPath: String? = nil,
         childTitle: String? = nil,
         childThreadKind: CodexThreadNodeKind? = nil
     ) {
@@ -568,6 +571,7 @@ public struct WorkflowEvent: Codable, Identifiable, Hashable, Sendable {
         self.childHostID = childHostID
         self.childThreadID = childThreadID
         self.childCWD = childCWD
+        self.childFolderPath = childFolderPath
         self.childTitle = childTitle
         self.childThreadKind = childThreadKind
         if let id {
@@ -578,6 +582,13 @@ public struct WorkflowEvent: Codable, Identifiable, Hashable, Sendable {
                 sourceThreadID: threadID,
                 childHostID: childHostID,
                 childThreadID: childThreadID
+            )
+        } else if kind == .folderCreated, let childHostID, let childFolderPath {
+            self.id = Self.folderCreatedID(
+                sourceHostID: hostID,
+                sourceThreadID: threadID,
+                childHostID: childHostID,
+                childFolderPath: childFolderPath
             )
         } else {
             self.id = Self.stableID(
@@ -621,6 +632,14 @@ public struct WorkflowEvent: Codable, Identifiable, Hashable, Sendable {
                 sourceThreadID: threadID,
                 childHostID: childHostID,
                 childThreadID: childThreadID
+            )
+        }
+        if kind == .folderCreated, let childHostID, let childFolderPath {
+            return Self.folderCreatedID(
+                sourceHostID: hostID,
+                sourceThreadID: threadID,
+                childHostID: childHostID,
+                childFolderPath: childFolderPath
             )
         }
         let stable = Self.stableID(
@@ -673,6 +692,24 @@ public struct WorkflowEvent: Codable, Identifiable, Hashable, Sendable {
             sourceThreadID ?? "unknown-source-thread",
             childHostID.rawValue,
             childThreadID,
+        ]
+            .map(Self.safeIDComponent)
+            .joined(separator: "-")
+    }
+
+    public static func folderCreatedID(
+        sourceHostID: HostID?,
+        sourceThreadID: String?,
+        childHostID: HostID,
+        childFolderPath: String
+    ) -> String {
+        [
+            "workflow-event",
+            WorkflowEventKind.folderCreated.rawValue,
+            sourceHostID?.rawValue ?? "unknown-source-host",
+            sourceThreadID ?? "unknown-source-thread",
+            childHostID.rawValue,
+            childFolderPath,
         ]
             .map(Self.safeIDComponent)
             .joined(separator: "-")
