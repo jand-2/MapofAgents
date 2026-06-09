@@ -498,4 +498,320 @@ public sealed class AgentGraph
             }
         };
     }
+
+    public string? MaterializeWorkflowFolderRoot(
+        string path,
+        string hostID,
+        string? title = null)
+    {
+        var folderPath = path.Trim();
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return null;
+        }
+
+        var resolvedHostID = string.IsNullOrWhiteSpace(hostID)
+            ? LocalHostIdentity.CanonicalHostID
+            : hostID.Trim();
+        if (MatchingFolderNodeID(resolvedHostID, folderPath) is { } existingID)
+        {
+            UpdateExistingWorkflowFolder(existingID, folderPath, title);
+            return existingID;
+        }
+
+        if (IsDescendantOfExistingFolderRoot(folderPath, resolvedHostID))
+        {
+            return null;
+        }
+
+        var platform =
+            Nodes.Values.FirstOrDefault(node =>
+                node.Kind == NodeKinds.Machine &&
+                string.Equals(node.Metadata.HostID, resolvedHostID, StringComparison.Ordinal))?.Metadata.Platform ??
+            Nodes.Values.FirstOrDefault(node =>
+                string.Equals(node.Metadata.HostID, resolvedHostID, StringComparison.Ordinal) &&
+                !string.IsNullOrWhiteSpace(node.Metadata.Platform))?.Metadata.Platform ??
+            HostPlatforms.MacOS;
+        var displayTitle = PreferredDisplayName(title, FolderTitleForPath(folderPath)) ??
+            FolderTitleForPath(folderPath);
+        var node = new CanvasNode
+        {
+            Kind = NodeKinds.Folder,
+            Title = displayTitle,
+            Subtitle = folderPath,
+            Position = NextFolderPosition(resolvedHostID),
+            Size = CanvasSize.Folder,
+            Metadata = new NodeMetadata
+            {
+                HostID = resolvedHostID,
+                Platform = platform,
+                FolderPath = folderPath,
+                HasManualPosition = false
+            },
+            ZIndex = NextZIndex()
+        };
+
+        Nodes[node.Id] = node;
+        UpdatedAt = DateTimeOffset.UtcNow;
+        return node.Id;
+    }
+
+    private string? MatchingFolderNodeID(string hostID, string path)
+    {
+        var normalizedPath = StandardizePath(path);
+        return Nodes.Values.FirstOrDefault(node =>
+            node.Kind == NodeKinds.Folder &&
+            string.Equals(node.Metadata.HostID, hostID, StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(node.Metadata.FolderPath) &&
+            string.Equals(StandardizePath(node.Metadata.FolderPath), normalizedPath, StringComparison.Ordinal))?.Id;
+    }
+
+    private void UpdateExistingWorkflowFolder(string id, string path, string? title)
+    {
+        if (!Nodes.TryGetValue(id, out var node))
+        {
+            return;
+        }
+
+        var changed = false;
+        var preferredTitle = PreferredDisplayName(node.Title, title);
+        if (preferredTitle is not null &&
+            !string.Equals(preferredTitle, node.Title, StringComparison.Ordinal))
+        {
+            node.Title = preferredTitle;
+            changed = true;
+        }
+
+        if (!string.Equals(node.Metadata.FolderPath, path, StringComparison.Ordinal))
+        {
+            node.Metadata.FolderPath = path;
+            node.Subtitle = path;
+            changed = true;
+        }
+
+        if (changed)
+        {
+            UpdatedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    private bool IsDescendantOfExistingFolderRoot(string path, string hostID)
+    {
+        var normalizedPath = StandardizePath(path);
+        return Nodes.Values.Any(node =>
+            node.Kind == NodeKinds.Folder &&
+            string.Equals(node.Metadata.HostID, hostID, StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(node.Metadata.FolderPath) &&
+            !string.Equals(StandardizePath(node.Metadata.FolderPath), normalizedPath, StringComparison.Ordinal) &&
+            PathIsInsideOrEqualTo(path, node.Metadata.FolderPath));
+    }
+
+    private CanvasPoint NextFolderPosition(string hostID)
+    {
+        var machine = Nodes.Values.FirstOrDefault(node =>
+            node.Kind == NodeKinds.Machine &&
+            string.Equals(node.Metadata.HostID, hostID, StringComparison.Ordinal));
+        var existingFolderCount = Nodes.Values.Count(node =>
+            node.Kind == NodeKinds.Folder &&
+            string.Equals(node.Metadata.HostID, hostID, StringComparison.Ordinal));
+        var origin = new CanvasPoint(
+            (machine?.Position.X ?? 180) + 220 + existingFolderCount * 300,
+            Math.Max(330, (machine?.Position.Y ?? 130) + 200));
+        return AvoidCollisions(origin);
+    }
+
+    private CanvasPoint AvoidCollisions(CanvasPoint point)
+    {
+        var candidate = point;
+        var attempts = 0;
+        while (attempts < 80 && Nodes.Values.Any(node => Overlaps(candidate, node)))
+        {
+            attempts += 1;
+            var column = attempts % 5;
+            var row = attempts / 5;
+            candidate = new CanvasPoint(
+                point.X + column * 240 + (row % 2) * 72,
+                point.Y + row * 150);
+        }
+
+        return candidate;
+    }
+
+    private static bool Overlaps(CanvasPoint point, CanvasNode node)
+    {
+        var horizontalDistance = Math.Abs(point.X - node.Position.X);
+        var verticalDistance = Math.Abs(point.Y - node.Position.Y);
+        return horizontalDistance < node.Size.Width / 2 + CanvasSize.Thread.Width / 2 + 24 &&
+            verticalDistance < node.Size.Height / 2 + CanvasSize.Thread.Height / 2 + 24;
+    }
+
+    private int NextZIndex()
+    {
+        return (Nodes.Values.Select(node => node.ZIndex).DefaultIfEmpty(0).Max()) + 1;
+    }
+
+    private static bool PathIsInsideOrEqualTo(string path, string root)
+    {
+        var normalizedRoot = StandardizePath(root);
+        var normalizedPath = StandardizePath(path);
+
+        if (string.Equals(normalizedPath, normalizedRoot, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var rootWithSlash = normalizedRoot.EndsWith("/", StringComparison.Ordinal)
+            ? normalizedRoot
+            : $"{normalizedRoot}/";
+        return normalizedPath.StartsWith(rootWithSlash, StringComparison.Ordinal);
+    }
+
+    private static string FolderTitleForPath(string path)
+    {
+        var trimmed = path.Trim();
+        var components = trimmed
+            .Trim('/', '\\')
+            .Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries);
+        return components.LastOrDefault() ?? trimmed;
+    }
+
+    private static string StandardizePath(string path)
+    {
+        var slashNormalized = path.Replace('\\', '/');
+        if (IsWindowsStylePath(slashNormalized))
+        {
+            return slashNormalized.ToLowerInvariant().Trim('/');
+        }
+
+        return NormalizePosixPath(slashNormalized);
+    }
+
+    private static string NormalizePosixPath(string path)
+    {
+        var collapsed = CollapseSlashes(path);
+        var hasRoot = collapsed.StartsWith("/", StringComparison.Ordinal);
+        var segments = new List<string>();
+        foreach (var segment in collapsed.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment == ".")
+            {
+                continue;
+            }
+
+            if (segment == ".." && segments.Count > 0 && segments[^1] != "..")
+            {
+                segments.RemoveAt(segments.Count - 1);
+                continue;
+            }
+
+            if (segment != ".." || !hasRoot)
+            {
+                segments.Add(segment);
+            }
+        }
+
+        var normalized = string.Join("/", segments);
+        if (!hasRoot)
+        {
+            return normalized;
+        }
+
+        return string.IsNullOrEmpty(normalized) ? "/" : $"/{normalized}";
+    }
+
+    private static bool IsWindowsStylePath(string path)
+    {
+        return (path.Length >= 2 && char.IsAsciiLetter(path[0]) && path[1] == ':') ||
+            path.StartsWith("//", StringComparison.Ordinal);
+    }
+
+    private static string CollapseSlashes(string path)
+    {
+        while (path.Contains("//", StringComparison.Ordinal))
+        {
+            path = path.Replace("//", "/", StringComparison.Ordinal);
+        }
+
+        return path;
+    }
+
+    private static string? PreferredDisplayName(string? current, string? incoming)
+    {
+        var normalizedCurrent = NormalizedDisplayName(current);
+        var normalizedIncoming = NormalizedDisplayName(incoming);
+        if (normalizedCurrent is null)
+        {
+            return normalizedIncoming;
+        }
+
+        if (normalizedIncoming is null)
+        {
+            return normalizedCurrent;
+        }
+
+        return DisplayNameScore(normalizedIncoming) > DisplayNameScore(normalizedCurrent)
+            ? normalizedIncoming
+            : normalizedCurrent;
+    }
+
+    private static string? NormalizedDisplayName(string? value)
+    {
+        var trimmed = value?.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return null;
+        }
+
+        var firstLine = trimmed
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault()?
+            .Trim();
+        if (string.IsNullOrEmpty(firstLine))
+        {
+            return trimmed;
+        }
+
+        if (firstLine.Contains("thread name:", StringComparison.OrdinalIgnoreCase))
+        {
+            var pieces = firstLine.Split(':', 2, StringSplitOptions.None);
+            if (pieces.Length == 2)
+            {
+                var named = pieces[1].Trim();
+                if (!string.IsNullOrEmpty(named))
+                {
+                    return named;
+                }
+            }
+        }
+
+        return trimmed;
+    }
+
+    private static int DisplayNameScore(string value)
+    {
+        var trimmed = value.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+        {
+            return 0;
+        }
+
+        if (trimmed is "Created thread" or "Codex thread")
+        {
+            return 1;
+        }
+
+        if (trimmed.Contains("thread name:", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains('\n') ||
+            trimmed.Length > 80)
+        {
+            return 2;
+        }
+
+        if (trimmed.StartsWith("worker ", StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        return 4;
+    }
 }

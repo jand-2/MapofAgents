@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mapofagents.dev/schema/workflow-event.schema.json",
+  "title": "MapofAgents workflow event",
+  "description": "Canonical cross-platform event envelope emitted by workflow hooks and relays.",
+  "oneOf": [
+    { "$ref": "#/$defs/turnStarted" },
+    { "$ref": "#/$defs/turnCompleted" },
+    { "$ref": "#/$defs/threadCreated" },
+    { "$ref": "#/$defs/folderCreated" },
+    { "$ref": "#/$defs/needsInput" },
+    { "$ref": "#/$defs/failed" }
+  ],
+  "$defs": {
+    "baseEvent": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Optional producer event id. Consumers may prefix or wrap it for local storage."
+        },
+        "type": { "type": "string" },
+        "sourceHostID": { "type": "string" },
+        "sourceThreadID": { "type": "string" },
+        "sourceTurnID": { "type": "string" },
+        "hostID": { "type": "string" },
+        "threadID": { "type": "string" },
+        "turnID": { "type": "string" },
+        "summary": { "type": "string" },
+        "createdAt": {
+          "oneOf": [
+            { "type": "string", "format": "date-time" },
+            {
+              "type": "number",
+              "description": "Unix epoch seconds, or milliseconds when greater than 10000000000."
+            }
+          ]
+        }
+      }
+    },
+    "turnStarted": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEvent" },
+        {
+          "type": "object",
+          "required": ["type", "hostID", "threadID"],
+          "properties": {
+            "type": { "const": "turn.started" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "turnCompleted": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEvent" },
+        {
+          "type": "object",
+          "required": ["type", "hostID", "threadID"],
+          "properties": {
+            "type": { "const": "turn.completed" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "threadCreated": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEvent" },
+        {
+          "type": "object",
+          "required": ["type", "sourceHostID", "sourceThreadID", "childHostID", "childThreadID", "cwd"],
+          "properties": {
+            "type": { "const": "thread.created" },
+            "childHostID": { "type": "string" },
+            "childThreadID": { "type": "string" },
+            "cwd": { "type": "string" },
+            "title": { "type": "string" },
+            "kind": {
+              "enum": ["thread", "subagent"]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "folderCreated": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEvent" },
+        {
+          "type": "object",
+          "required": ["type", "sourceHostID", "sourceThreadID", "childHostID", "folderPath"],
+          "properties": {
+            "type": { "const": "folder.created" },
+            "childHostID": { "type": "string" },
+            "folderPath": { "type": "string" },
+            "title": { "type": "string" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "needsInput": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEvent" },
+        {
+          "type": "object",
+          "required": ["type", "hostID", "threadID"],
+          "properties": {
+            "type": { "const": "needs.input" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "failed": {
+      "allOf": [
+        { "$ref": "#/$defs/baseEvent" },
+        {
+          "type": "object",
+          "required": ["type", "hostID", "threadID"],
+          "properties": {
+            "type": { "const": "failed" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

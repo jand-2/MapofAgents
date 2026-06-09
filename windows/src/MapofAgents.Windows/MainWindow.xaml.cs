@@ -57,6 +57,8 @@ public sealed partial class MainWindow : Window
     private readonly ControlRoomStore _store = new();
     private readonly AppPreferencesStore _preferencesStore = new();
     private readonly MapofAgentsPairingHostService _pairingHostService = new();
+    private readonly WorkflowHookEventFileBridge _workflowHookEventFileBridge = new(
+        defaultHostID: LocalHostIdentity.CanonicalHostID);
     private readonly ObservableCollection<ActivityEntry> _activity = [];
     private readonly ObservableCollection<NodeChoice> _folderChoices = [];
     private readonly ObservableCollection<NodeChoice> _machineChoices = [];
@@ -113,6 +115,7 @@ public sealed partial class MainWindow : Window
     private readonly HashSet<string> _stoppingThreadKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _codexRemoteOperationIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _mentionCatalogRefreshesInFlight = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _ingestedWorkflowHookEventKeys = new(StringComparer.Ordinal);
     private AgentGraph _graph = new();
     private AppPreferences _preferences = new();
     private bool _webViewReady;
@@ -188,6 +191,8 @@ public sealed partial class MainWindow : Window
     private IntPtr _originalWindowProc;
     private WndProcDelegate? _minimumSizeWindowProc;
     private CancellationTokenSource? _newThreadModelRefreshCancellation;
+    private CancellationTokenSource? _workflowHookEventBridgeCancellation;
+    private Task? _workflowHookEventBridgeTask;
 
     public ObservableCollection<ReaderThreadItem> ReaderThreads => _readerThreads;
 
@@ -1936,8 +1941,94 @@ public sealed partial class MainWindow : Window
         UninstallWindowMinimumSizeHook();
         _newThreadModelRefreshCancellation?.Cancel();
         _newThreadModelRefreshCancellation?.Dispose();
+        StopWorkflowHookEventBridge();
         _pairingHostService.StopPairingSession();
         StopAllCodexRemoteTunnels();
+    }
+
+    private void StartWorkflowHookEventBridge()
+    {
+        StopWorkflowHookEventBridge();
+        _workflowHookEventBridgeCancellation = new CancellationTokenSource();
+        var cancellationToken = _workflowHookEventBridgeCancellation.Token;
+        _workflowHookEventBridgeTask = _workflowHookEventFileBridge.RunAsync(
+            (events, eventCancellationToken) =>
+            {
+                if (!eventCancellationToken.IsCancellationRequested)
+                {
+                    _ = DispatcherQueue.TryEnqueue(async () =>
+                    {
+                        await ApplyWorkflowHookEventsSafelyAsync(events);
+                    });
+                }
+
+                return Task.CompletedTask;
+            },
+            replayExistingEvents: false,
+            cancellationToken: cancellationToken);
+    }
+
+    private void StopWorkflowHookEventBridge()
+    {
+        _workflowHookEventBridgeCancellation?.Cancel();
+        _workflowHookEventBridgeCancellation?.Dispose();
+        _workflowHookEventBridgeCancellation = null;
+        _workflowHookEventBridgeTask = null;
+    }
+
+    private async Task ApplyWorkflowHookEventsSafelyAsync(IReadOnlyList<WorkflowEvent> events)
+    {
+        try
+        {
+            await ApplyWorkflowHookEventsAsync(events);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            AddActivity(
+                $"Workflow hook event failed: {exception.Message}",
+                showTopNotification: true,
+                notificationKind: ActivityNotificationKindFailed);
+            UpdateChrome();
+        }
+    }
+
+    private async Task ApplyWorkflowHookEventsAsync(IReadOnlyList<WorkflowEvent> events)
+    {
+        var appliedNodeIDs = new List<string>();
+        foreach (var workflowEvent in events)
+        {
+            if (!_ingestedWorkflowHookEventKeys.Add(workflowEvent.DedupeKey))
+            {
+                continue;
+            }
+
+            var result = WorkflowEventIngestor.Apply(_graph, workflowEvent);
+            if (result.Applied && !string.IsNullOrWhiteSpace(result.NodeID))
+            {
+                appliedNodeIDs.Add(result.NodeID);
+            }
+        }
+
+        if (appliedNodeIDs.Count == 0)
+        {
+            return;
+        }
+
+        await SaveGraphAsync();
+        AddActivity(WorkflowHookEventActivityMessage(appliedNodeIDs));
+        UpdateChrome();
+        await RenderGraphAsync();
+    }
+
+    private string WorkflowHookEventActivityMessage(IReadOnlyList<string> appliedNodeIDs)
+    {
+        if (appliedNodeIDs.Count == 1 &&
+            _graph.Nodes.TryGetValue(appliedNodeIDs[0], out var node))
+        {
+            return $"Materialized workflow folder {node.Title}.";
+        }
+
+        return $"Materialized {appliedNodeIDs.Count} workflow folder events.";
     }
 
     private void ConfigureOperationalRailPlacement()
@@ -2159,6 +2250,7 @@ public sealed partial class MainWindow : Window
             await RefreshWorkflowMenuAsync();
             await RefreshWorkflowMembershipsAsync();
             RebuildAppServerEndpointsFromGraph();
+            StartWorkflowHookEventBridge();
             SetStatus(HostStatuses.Disconnected, "Not connected", "Loaded local control-room graph.");
             AddActivity("Loaded local control-room graph.");
             UpdateChrome();

@@ -1,0 +1,83 @@
+# Changelog
+
+This changelog documents every commit in the public `MapofAgents` history.
+Entries are ordered from oldest to newest.
+
+## d170134 - Initial public release
+
+Date: 2026-05-31
+
+- Published the initial macOS/iOS Swift package and application sources.
+- Added the graph canvas, node and edge models, workflow persistence, runtime stores, supervisor services, and Codex App Server client integration.
+- Added thread reading, thread creation, workflow activity, machine panels, pairing, iPhone companion views, and remote tunnel foundations.
+- Added Apache-2.0 licensing, NOTICE attribution, README documentation, examples, scripts, tests, and public demo media.
+
+## 2399221 - Add remote runtime diagnostics popout
+
+Date: 2026-06-02
+
+- Added a diagnostics popout for remote Codex runtime setup and recovery.
+- Improved remote tunnel checks, endpoint verification, identity handling, and supervisor status reporting.
+- Added tests for app-server verification and remote route diagnostics.
+
+## b024d3b - Add remote folder picker
+
+Date: 2026-06-02
+
+- Added a remote folder picker UI for browsing project folders on connected machines.
+- Extended remote tunnel services to list folders on supported remote hosts.
+- Wired folder selection into the canvas and machine panel flows.
+- Added route and folder-browser tests.
+
+## 805e1c7 - Refine canvas side panels
+
+Date: 2026-06-02
+
+- Refined the operational rails and side-panel layout on the graph canvas.
+- Adjusted thread inbox and panel presentation details for a cleaner workspace UI.
+
+## 8510a61 - Add Windows preview app
+
+Date: 2026-06-09
+
+- Added a native Windows preview app under `windows/` using C#/.NET and WinUI 3.
+- Added shared graph and app-server protocol schemas and sample fixtures.
+- Added Windows graph models, App Server client code, pairing support, remote tunnel helpers, presentation models, and the main WinUI shell.
+- Added Windows tests for graph behavior, pairing, routing, transcript presentation, diagnostics, folder actions, and UI presentation logic.
+- Documented the Windows port status and added repository contributor guidance in `AGENTS.md`.
+
+## cf5808d - Document future app installer plan
+
+Date: 2026-06-09
+
+- Added `future_app_installer.md`.
+- Captured packaging, signing, update, release, and cross-platform installer considerations for future distribution work.
+
+## efd7769 - Recover Codex remote routes after drops
+
+Date: 2026-06-09
+
+- Improved recovery behavior for Codex remote routes after relay or connection drops.
+- Added supervisor logic for staged endpoint attempts and safer route restoration.
+- Added tests for route recovery and endpoint replacement behavior.
+
+## c67f655 - Add folder-created workflow materialization
+
+Date: 2026-06-09
+
+- Added `folder.created` workflow events for materializing newly created workspace roots on the canvas.
+- Added Codex `PostToolUse` hook support for detecting successful root-folder creation from shell commands.
+- Added hook installation scripts and event emission through `script/mapofagents-hook-event.sh`.
+- Added graph materialization rules that create folder nodes under the correct machine and ignore descendant/cache folders.
+- Updated the Swift app, iPhone surface, activity rail, visibility model, and notifications to understand folder-created events.
+- Added tests for hook parsing, event parsing, folder materialization, and descendant-folder filtering.
+
+## 3eefc68 - Add Windows workflow event delivery
+
+Date: 2026-06-09
+
+- Added shared workflow-event schema and a `folder-created` fixture.
+- Added Windows workflow event parsing, event-file watching, and folder materialization support.
+- Wired Windows workflow events into the WinUI application shell.
+- Added Windows tests for workflow events and folder materialization.
+- Added shared Swift tests for the shared workflow event fixture.

@@ -409,6 +409,38 @@ func workflowHookEventParserMapsFolderCreatedBridgeEvent() async throws {
 }
 
 @Test
+func workflowHookEventParserMapsSharedFolderCreatedFixture() async throws {
+    let line = try String(
+        contentsOf: sharedWorkflowEventFixtureURL("folder-created.json"),
+        encoding: .utf8
+    )
+
+    let event = try #require(
+        WorkflowHookEventParser.workflowEvent(
+            from: line,
+            defaultHostID: HostID(rawValue: "fallback")
+        )
+    )
+
+    #expect(event.kind == .folderCreated)
+    #expect(event.hostID == HostID(rawValue: "local"))
+    #expect(event.threadID == "source-thread")
+    #expect(event.turnID == "turn-1")
+    #expect(event.childHostID == HostID(rawValue: "remote-windows"))
+    #expect(event.childFolderPath == #"C:\Users\Example\Desktop"#)
+    #expect(event.childTitle == "Desktop")
+    #expect(event.method == "folder/created")
+    #expect(event.summary == "Created folder Desktop")
+    #expect(event.createdAt == ISO8601DateFormatter().date(from: "2026-05-28T10:17:30Z"))
+    #expect(event.dedupeKey == WorkflowEvent.folderCreatedID(
+        sourceHostID: HostID(rawValue: "local"),
+        sourceThreadID: "source-thread",
+        childHostID: HostID(rawValue: "remote-windows"),
+        childFolderPath: #"C:\Users\Example\Desktop"#
+    ))
+}
+
+@Test
 func workflowHookEventParserIgnoresUnknownLines() async throws {
     #expect(WorkflowHookEventParser.workflowEvent(from: "not json", defaultHostID: HostID(rawValue: "local")) == nil)
     #expect(WorkflowHookEventParser.workflowEvent(from: "{\"event\":\"noise\"}", defaultHostID: HostID(rawValue: "local")) == nil)
@@ -430,6 +462,17 @@ func workflowEventIDsAreStableForTheSameServerEvent() async throws {
 
     #expect(first.id == second.id)
     #expect(first.dedupeKey == second.dedupeKey)
+}
+
+private func sharedWorkflowEventFixtureURL(_ fileName: String) -> URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("shared", isDirectory: true)
+        .appendingPathComponent("workflow-events", isDirectory: true)
+        .appendingPathComponent("fixtures", isDirectory: true)
+        .appendingPathComponent(fileName, isDirectory: false)
 }
 
 @Test

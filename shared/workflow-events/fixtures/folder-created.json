@@ -1,0 +1,10 @@
+{
+  "type": "folder.created",
+  "sourceHostID": "local",
+  "sourceThreadID": "source-thread",
+  "sourceTurnID": "turn-1",
+  "childHostID": "remote-windows",
+  "folderPath": "C:\\Users\\Example\\Desktop",
+  "title": "Desktop",
+  "createdAt": "2026-05-28T10:17:30Z"
+}
