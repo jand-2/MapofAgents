@@ -1173,6 +1173,15 @@ function formatThreadRelativeTime(signedValue, unit) {
 	    items.push({ separator: true });
 	  }
 
+	  if (node.kind === "folder") {
+	    items.push({
+	      command: "showContents",
+	      icon: "&#xE8E5;",
+	      text: "Show Contents"
+	    });
+	    items.push({ separator: true });
+	  }
+
 	  if (node.kind === "codexThread") {
 	    const isUnread = Boolean(node.metadata?.isUnread);
 	    const isArchived = Boolean(node.metadata?.isArchived);

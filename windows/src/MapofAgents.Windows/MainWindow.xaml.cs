@@ -54,6 +54,13 @@ public sealed partial class MainWindow : Window
     private const uint WmGetMinMaxInfo = 0x0024;
     private const double ChromeMargin = 14;
     private const int MachineHealthRefreshMinimumChromeMilliseconds = 800;
+
+    private enum RemoteFolderPickerMode
+    {
+        ChooseProject,
+        ShowContents
+    }
+
     private readonly ControlRoomStore _store = new();
     private readonly AppPreferencesStore _preferencesStore = new();
     private readonly MapofAgentsPairingHostService _pairingHostService = new();
@@ -4468,7 +4475,10 @@ public sealed partial class MainWindow : Window
         return path;
     }
 
-    private async Task<string?> ShowRemoteFolderPickerAsync(CodexDesktopRemote remote, string initialPath)
+    private async Task<string?> ShowRemoteFolderPickerAsync(
+        CodexDesktopRemote remote,
+        string initialPath,
+        RemoteFolderPickerMode mode = RemoteFolderPickerMode.ChooseProject)
     {
         var startPath = string.IsNullOrWhiteSpace(initialPath) ? "~" : initialPath.Trim();
         var selectedPath = "";
@@ -4479,7 +4489,7 @@ public sealed partial class MainWindow : Window
 
         var titleBlock = new TextBlock
         {
-            Text = "Choose Project Folder",
+            Text = mode == RemoteFolderPickerMode.ShowContents ? "Folder Contents" : "Choose Project Folder",
             FontSize = 18,
             Foreground = BrushFromHex("#F2F5F9")
         };
@@ -4577,8 +4587,13 @@ public sealed partial class MainWindow : Window
             IsActive = false,
             Visibility = Visibility.Collapsed
         };
-        var cancelButton = RemoteFolderFooterButton("Cancel", prominent: false);
+        var cancelButton = RemoteFolderFooterButton(
+            mode == RemoteFolderPickerMode.ShowContents ? "Close" : "Cancel",
+            prominent: false);
         var addCurrentButton = RemoteFolderCurrentFolderButton();
+        addCurrentButton.Visibility = mode == RemoteFolderPickerMode.ChooseProject
+            ? Visibility.Visible
+            : Visibility.Collapsed;
 
         var folderSurface = new Border
         {
@@ -4741,6 +4756,9 @@ public sealed partial class MainWindow : Window
                 };
 
                 var addButton = RemoteFolderIconButton("\uE73E", "Add this folder");
+                addButton.Visibility = mode == RemoteFolderPickerMode.ChooseProject
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
                 addButton.Tag = entry;
                 addButton.Click += (_, _) =>
                 {
@@ -8592,6 +8610,9 @@ public sealed partial class MainWindow : Window
             case "addFolder":
                 await AddFolderFromGraphNodeAsync(node);
                 break;
+            case "showContents":
+                await ShowFolderContentsFromGraphAsync(node);
+                break;
             case "openChat":
                 await OpenThreadChatFromGraphAsync(node);
                 break;
@@ -8660,6 +8681,71 @@ public sealed partial class MainWindow : Window
         }
 
         await AddFolderNodeAsync(node, folderPath);
+    }
+
+    private async Task ShowFolderContentsFromGraphAsync(CanvasNode node)
+    {
+        if (node.Kind != NodeKinds.Folder)
+        {
+            return;
+        }
+
+        var folderPath = (node.Metadata.FolderPath ?? node.Subtitle).Trim();
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            AddActivity("This folder node does not have a folder path.", showTopNotification: true, notificationKind: ActivityNotificationKindFailed);
+            ShowCommandFeedback("This folder node does not have a folder path.");
+            return;
+        }
+
+        if (IsLocalHostId(node.Metadata.HostID))
+        {
+            OpenLocalFolderContents(folderPath, node.Title);
+            return;
+        }
+
+        var owner = MachineForHost(node.Metadata.HostID);
+        if (owner is not null && TryFindCodexRemoteForMachine(owner, out var remote))
+        {
+            _ = await ShowRemoteFolderPickerAsync(
+                remote,
+                folderPath,
+                RemoteFolderPickerMode.ShowContents);
+            return;
+        }
+
+        var message = $"Reconnect {MachineTitleFor(node)} before showing folder contents.";
+        AddActivity(message, showTopNotification: true, notificationKind: ActivityNotificationKindFailed);
+        ShowCommandFeedback(message);
+    }
+
+    private void OpenLocalFolderContents(string folderPath, string folderTitle)
+    {
+        var expandedPath = Environment.ExpandEnvironmentVariables(folderPath.Trim());
+        try
+        {
+            if (!Directory.Exists(expandedPath))
+            {
+                var message = $"Folder does not exist: {folderTitle}.";
+                AddActivity(message, showTopNotification: true, notificationKind: ActivityNotificationKindFailed);
+                ShowCommandFeedback(message);
+                return;
+            }
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = expandedPath,
+                UseShellExecute = true
+            });
+            AddActivity($"Opened {folderTitle} contents.");
+        }
+        catch (Exception exception) when (
+            exception is Win32Exception or IOException or InvalidOperationException or UnauthorizedAccessException)
+        {
+            var message = $"Could not open {folderTitle}: {exception.Message}";
+            AddActivity(message, showTopNotification: true, notificationKind: ActivityNotificationKindFailed);
+            ShowCommandFeedback(message);
+        }
     }
 
     private List<string> BrowsableMachineIds()
@@ -13082,6 +13168,18 @@ public sealed partial class MainWindow : Window
     {
         return MachineNodes.FirstOrDefault(machine => SameIdentifier(machine.Metadata.HostID, hostID))?.Metadata.Platform
             ?? HostPlatforms.Windows;
+    }
+
+    private CanvasNode? MachineForHost(string? hostID)
+    {
+        if (string.IsNullOrWhiteSpace(hostID))
+        {
+            return null;
+        }
+
+        return MachineNodes.FirstOrDefault(machine =>
+            SameIdentifier(machine.Id, hostID) ||
+            SameIdentifier(machine.Metadata.HostID, hostID));
     }
 
     private string UniqueNodeId(string preferredId)

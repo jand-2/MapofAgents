@@ -2,8 +2,14 @@ import MapofAgentsCore
 import SwiftUI
 
 struct RemoteFolderPickerView: View {
+    enum Mode: Hashable {
+        case chooseProject
+        case showContents
+    }
+
     var remote: CodexDesktopRemote
     var initialPath: String
+    var mode: Mode
     var onCancel: () -> Void
     var onSelect: (String) -> Void
 
@@ -16,6 +22,7 @@ struct RemoteFolderPickerView: View {
     init(
         remote: CodexDesktopRemote,
         initialPath: String,
+        mode: Mode = .chooseProject,
         onCancel: @escaping () -> Void,
         onSelect: @escaping (String) -> Void
     ) {
@@ -23,6 +30,7 @@ struct RemoteFolderPickerView: View {
         let startPath = trimmedPath.isEmpty ? "~" : trimmedPath
         self.remote = remote
         self.initialPath = startPath
+        self.mode = mode
         self.onCancel = onCancel
         self.onSelect = onSelect
         _currentPath = State(initialValue: startPath)
@@ -59,7 +67,7 @@ struct RemoteFolderPickerView: View {
                 .foregroundStyle(.yellow)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Choose Project Folder")
+                Text(mode == .showContents ? "Folder Contents" : "Choose Project Folder")
                     .font(.headline)
                 Text(remote.displayName)
                     .font(.caption)
@@ -174,21 +182,23 @@ struct RemoteFolderPickerView: View {
 
             Spacer()
 
-            Button("Cancel") {
+            Button(mode == .showContents ? "Close" : "Cancel") {
                 onCancel()
             }
             .keyboardShortcut(.cancelAction)
 
-            FeedbackButton(
-                unavailableReason: selectedCurrentPath.isEmpty ? "Choose a folder before adding it." : nil,
-                action: {
-                    onSelect(selectedCurrentPath)
+            if mode == .chooseProject {
+                FeedbackButton(
+                    unavailableReason: selectedCurrentPath.isEmpty ? "Choose a folder before adding it." : nil,
+                    action: {
+                        onSelect(selectedCurrentPath)
+                    }
+                ) {
+                    Label("Add", systemImage: "checkmark")
                 }
-            ) {
-                Label("Add", systemImage: "checkmark")
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
             }
-            .buttonStyle(.borderedProminent)
-            .keyboardShortcut(.defaultAction)
         }
     }
 
@@ -217,15 +227,17 @@ struct RemoteFolderPickerView: View {
             }
             .buttonStyle(.plain)
 
-            Button {
-                onSelect(entry.path)
-            } label: {
-                Image(systemName: "checkmark")
-                    .frame(width: 24, height: 24)
+            if mode == .chooseProject {
+                Button {
+                    onSelect(entry.path)
+                } label: {
+                    Image(systemName: "checkmark")
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Add this folder")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Add this folder")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)

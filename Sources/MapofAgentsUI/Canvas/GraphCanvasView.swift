@@ -70,6 +70,7 @@ public struct GraphCanvasView: View {
         var hostID: HostID
         var platform: HostPlatform
         var initialPath: String
+        var mode: RemoteFolderPickerView.Mode = .chooseProject
     }
 
     private static let userTurnMarkerLeadWindow: TimeInterval = 5
@@ -334,6 +335,7 @@ public struct GraphCanvasView: View {
                 RemoteFolderPickerView(
                     remote: request.remote,
                     initialPath: request.initialPath,
+                    mode: request.mode,
                     onCancel: {
                         remoteFolderPickerRequest = nil
                     },
@@ -2300,6 +2302,16 @@ public struct GraphCanvasView: View {
 
     @ViewBuilder
     private func nodeContextMenu(for node: CanvasNode) -> some View {
+        if node.kind == .folder {
+            Button {
+                showFolderContents(node)
+            } label: {
+                Label("Show Contents", systemImage: "folder")
+            }
+
+            Divider()
+        }
+
         if let pickMachineFolder = pickMachineFolderAction(for: node) {
             Button {
                 pickMachineFolder()
@@ -2609,6 +2621,61 @@ public struct GraphCanvasView: View {
                 )
             }
         }
+    }
+
+    private func showFolderContents(_ node: CanvasNode) {
+        guard node.kind == .folder else { return }
+
+        let folderPath = (node.metadata.folderPath ?? node.subtitle)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !folderPath.isEmpty else {
+            showUnavailableControl("This folder node does not have a folder path.")
+            return
+        }
+
+        guard let hostID = node.metadata.hostID else {
+            openLocalFolderContents(path: folderPath)
+            return
+        }
+
+        if hostID == runtimeStore.localHost.id {
+            openLocalFolderContents(path: folderPath)
+            return
+        }
+
+        guard
+            let remote = supervisorStore.codexRemote(for: hostID),
+            CodexRemoteTunnelService.canBrowseRemoteFolders(for: remote)
+        else {
+            showUnavailableControl("Reconnect this folder's machine before showing remote contents.")
+            return
+        }
+
+        remoteFolderPickerRequest = RemoteFolderPickerRequest(
+            remote: remote,
+            hostID: hostID,
+            platform: node.metadata.platform ?? remote.platform,
+            initialPath: folderPath,
+            mode: .showContents
+        )
+    }
+
+    private func openLocalFolderContents(path: String) {
+        let expandedPath = NSString(string: path).expandingTildeInPath
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            showUnavailableControl("The folder does not exist on this machine.")
+            return
+        }
+
+        #if os(macOS)
+        let url = URL(fileURLWithPath: expandedPath, isDirectory: true)
+        if !NSWorkspace.shared.open(url) {
+            showUnavailableControl("Could not open the folder in Finder.")
+        }
+        #else
+        showUnavailableControl("Showing local folder contents is only available on macOS.")
+        #endif
     }
 
     private func pickMachineFolderAction(for node: CanvasNode) -> (() -> Void)? {
