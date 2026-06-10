@@ -101,3 +101,12 @@ Date: 2026-06-09
 - Added automatic local App Server reconnect when creating local Windows threads.
 - Increased local App Server initialize patience and improved initialize failure messages.
 - Added Windows tests for thread creation, turn start, and best-effort initialize socket shutdown.
+
+## f96bd5a - Show folder contents from canvas nodes
+
+Date: 2026-06-10
+
+- Added a folder-node context-menu action for showing folder contents.
+- Opened local folder nodes in Finder on macOS and Explorer on Windows.
+- Reused the remote folder browser in a read-only contents mode for remote folder nodes.
+- Kept the existing remote project picker behavior for adding folders.
