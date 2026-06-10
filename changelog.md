@@ -72,7 +72,7 @@ Date: 2026-06-09
 - Updated the Swift app, iPhone surface, activity rail, visibility model, and notifications to understand folder-created events.
 - Added tests for hook parsing, event parsing, folder materialization, and descendant-folder filtering.
 
-## 3eefc68 - Add Windows workflow event delivery
+## 8e5f6db - Add Windows workflow event delivery
 
 Date: 2026-06-09
 
@@ -81,3 +81,23 @@ Date: 2026-06-09
 - Wired Windows workflow events into the WinUI application shell.
 - Added Windows tests for workflow events and folder materialization.
 - Added shared Swift tests for the shared workflow event fixture.
+
+## 40d6a35 - Add machine dropdown and shared app-server setup
+
+Date: 2026-06-09
+
+- Moved Machines into a toolbar dropdown next to the workflow selector.
+- Added local machine setup from the Machines menu so new installs can start or reuse a local Codex App Server.
+- Taught remote recovery to reuse authenticated Windows app-data app-server sessions.
+- Cleaned PowerShell CLIXML output so Windows recovery errors show readable port/auth details.
+- Added Swift and Windows tests for shared app-server token reuse and CLIXML cleanup.
+
+## 5670701 - Start Windows threads through app-server
+
+Date: 2026-06-09
+
+- Added Windows App Server client calls for `thread/start`, `thread/name/set`, and `turn/start`.
+- Wired Windows thread creation to create real Codex threads and optionally start the first turn.
+- Added automatic local App Server reconnect when creating local Windows threads.
+- Increased local App Server initialize patience and improved initialize failure messages.
+- Added Windows tests for thread creation, turn start, and best-effort initialize socket shutdown.
