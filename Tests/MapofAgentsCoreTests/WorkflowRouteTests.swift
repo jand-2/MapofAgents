@@ -222,8 +222,12 @@ func remoteStartCommandRequiresAuthenticatedAppServerToken() throws {
         #expect(command.contains("capability-token"))
         #expect(command.contains("--ws-token-file"))
         #expect(command.contains("token:"))
-        #expect(command.contains("unauthenticated App Server"))
     }
+
+    #expect(linuxCommand.contains("unauthenticated App Server"))
+    #expect(windowsCommand.contains("Find-MapofAgentsTrackedAppServerToken"))
+    #expect(windowsCommand.contains("MapofAgents\\local-app-server"))
+    #expect(windowsCommand.contains("Port $port is already in use by an app-server without a readable MapofAgents token."))
 }
 
 @Test
@@ -242,6 +246,48 @@ func remoteAuthenticatedTokenProbeRequiresTrackedAuthenticatedProcess() throws {
     #expect(command.contains("--ws-auth"))
     #expect(command.contains("capability-token"))
     #expect(command.contains("token:"))
+}
+
+@Test
+func remoteAuthenticatedTokenProbeAcceptsWindowsAppDataLocalServer() throws {
+    let remote = CodexDesktopRemote(
+        id: HostID(rawValue: "windows"),
+        displayName: "Windows",
+        hostID: "windows",
+        hostname: "User@windows.example.test",
+        source: "test"
+    )
+
+    let command = try decodedPowerShellScript(
+        from: CodexRemoteTunnelService.remoteAuthenticatedAppServerTokenCommand(remote: remote, remotePort: 14_500)
+    )
+
+    #expect(command.contains("Find-MapofAgentsTrackedAppServerToken"))
+    #expect(command.contains("$roots += $env:TEMP"))
+    #expect(command.contains("MapofAgents\\local-app-server"))
+    #expect(command.contains("[regex]::Escape($tokenPath)"))
+    #expect(command.contains("Write-Output \"token:$token\""))
+}
+
+@Test
+func powershellCLIXMLOutputIsCleanedForDisplay() {
+    let progressOnly = """
+    #< CLIXML
+    ready
+    <Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><MS><PR N="Record"><AV>Preparing modules for first use.</AV></PR></MS></Obj></Objs>
+    """
+
+    #expect(CodexRemoteTunnelService.cleanedSSHOutputForDisplay(progressOnly) == "ready")
+
+    let error = """
+    #< CLIXML
+    <Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Port 14500 is already in use_x000D__x000A_Restart MapofAgents on Windows</S></Objs>
+    """
+
+    #expect(
+        CodexRemoteTunnelService.cleanedSSHOutputForDisplay(error)
+            == "Port 14500 is already in use\nRestart MapofAgents on Windows"
+    )
 }
 
 @Test

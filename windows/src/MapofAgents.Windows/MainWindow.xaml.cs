@@ -187,6 +187,10 @@ public sealed partial class MainWindow : Window
     private Point _threadPopoverDragStart;
     private Thickness _threadPopoverDragStartMargin;
     private bool _isUpdatingNewThreadModelChoices;
+    private Flyout? _machinesFlyout;
+    private bool _isMachinesFlyoutOpen;
+    private bool _isSettingUpLocalMachine;
+    private string? _lastLocalSetupDetail;
     private IntPtr _windowHandle;
     private IntPtr _originalWindowProc;
     private WndProcDelegate? _minimumSizeWindowProc;
@@ -306,6 +310,76 @@ public sealed partial class MainWindow : Window
         RootGrid.SizeChanged += RootGrid_SizeChanged;
         Closed += MainWindow_Closed;
         ConfigureWindow();
+    }
+
+    private void ConfigureMachinesFlyout()
+    {
+        if (_machinesFlyout is not null)
+        {
+            return;
+        }
+
+        if (RootGrid.XamlRoot is null)
+        {
+            return;
+        }
+
+        if (MachinesRail.Parent is Panel parent)
+        {
+            parent.Children.Remove(MachinesRail);
+        }
+
+        MachinesRail.Width = 344;
+        MachinesRail.MaxHeight = 680;
+        MachinesRail.Visibility = Visibility.Collapsed;
+        _machinesFlyout = new Flyout
+        {
+            Content = MachinesRail
+        };
+        _machinesFlyout.Opened += (_, _) =>
+        {
+            _isMachinesFlyoutOpen = true;
+            _isMachinesRailVisible = true;
+            _isMachinesRailCollapsed = false;
+            UpdateChrome();
+        };
+        _machinesFlyout.Closed += (_, _) =>
+        {
+            _isMachinesFlyoutOpen = false;
+            _isMachinesRailVisible = false;
+            UpdateChrome();
+        };
+    }
+
+    private void ShowMachinesFlyout()
+    {
+        ConfigureMachinesFlyout();
+        if (_machinesFlyout is null)
+        {
+            return;
+        }
+
+        if (_isReadingModePresented)
+        {
+            return;
+        }
+
+        WorkflowPopover.Visibility = Visibility.Collapsed;
+        WorkflowNamePopover.Visibility = Visibility.Collapsed;
+        NewThreadPopover.Visibility = Visibility.Collapsed;
+        HealthPopover.Visibility = Visibility.Collapsed;
+        PairingPopover.Visibility = Visibility.Collapsed;
+        _isMachinesRailVisible = true;
+        _isMachinesRailCollapsed = false;
+        MachinesRail.Visibility = Visibility.Visible;
+        MachinesRailContent.Visibility = Visibility.Visible;
+        _machinesFlyout?.ShowAt(MachinesButton);
+    }
+
+    private void HideMachinesFlyout()
+    {
+        _isMachinesRailVisible = false;
+        _machinesFlyout?.Hide();
     }
 
     private void ApplyNewThreadHeaderPresentation()
@@ -920,6 +994,7 @@ public sealed partial class MainWindow : Window
     {
         var presentation = ToolbarButtonChromePresentation.Resolve();
         ApplyToolbarButtonChrome(WorkflowButton, presentation.Plain);
+        ApplyToolbarButtonChrome(MachinesButton, presentation.Bordered);
         ApplyToolbarButtonChrome(AddFolderButton, presentation.Bordered);
         ApplyToolbarButtonChrome(AddThreadButton, presentation.Primary);
         ApplyToolbarButtonChrome(ReadingModeButton, presentation.Bordered);
@@ -2576,7 +2651,7 @@ public sealed partial class MainWindow : Window
         if (!MachineDiscoveryAutoRefreshPolicy.ShouldStartInitialDiscovery(
                 _hasRequestedInitialMachineDiscovery,
                 _isReadingModePresented,
-                MachinesRail.Visibility == Visibility.Visible,
+                _isMachinesFlyoutOpen,
                 _isMachinesRailCollapsed,
                 _isDiscoveringCodexRemotes,
                 _isDiscoveringTailnet))
@@ -3877,6 +3952,80 @@ public sealed partial class MainWindow : Window
         _ = SearchAppServerThreadCatalogWithDelayAsync();
     }
 
+    private void MachinesButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isMachinesFlyoutOpen)
+        {
+            HideMachinesFlyout();
+            return;
+        }
+
+        ShowMachinesFlyout();
+        AddActivity("Machines menu opened.");
+    }
+
+    private async void SetupLocalMachineButton_Click(object sender, RoutedEventArgs e)
+    {
+        await SetupLocalMachineAsync();
+    }
+
+    private async Task SetupLocalMachineAsync()
+    {
+        if (_isSettingUpLocalMachine)
+        {
+            ShowCommandFeedback("Local Codex setup is already running.", MachinesButton);
+            return;
+        }
+
+        _isSettingUpLocalMachine = true;
+        _lastLocalSetupDetail = "Starting local Codex App Server...";
+        _isMachinesRailVisible = true;
+        _isMachinesRailCollapsed = false;
+        SetStatus(HostStatuses.Connecting, "Starting local Codex", _lastLocalSetupDetail);
+        UpsertLocalMachine(HostStatuses.Connecting, null, "Starting local Codex App Server...");
+        AddActivity("Starting local Codex App Server.");
+        UpdateChrome();
+        if (!_isMachinesFlyoutOpen)
+        {
+            ShowMachinesFlyout();
+        }
+
+        try
+        {
+            var result = await LocalAppServerService.StartOrConnectAsync(_store.ApplicationDataDirectory);
+            UpsertLocalMachine(
+                HostStatuses.Connected,
+                result,
+                $"Connected via {result.Endpoint.Url}");
+            RegisterLocalAppServerEndpoint(result.Endpoint);
+            await SaveGraphAsync();
+            await RefreshNewThreadModelOptionsForHostAsync(LocalHostIdentity.LocalMachineNodeID, result.Endpoint, CancellationToken.None);
+            await RefreshAppServerThreadCatalogAsync(search: false);
+            SetStatus(HostStatuses.Connected, "Connected", result.Endpoint.Url.ToString());
+            _lastLocalSetupDetail = $"Local Codex App Server is running on {result.Endpoint.Url}.";
+            AddActivity("Local Codex App Server connected.");
+            await RenderGraphAsync();
+        }
+        catch (Exception exception)
+        {
+            var message = CodexRemoteTunnelService.RedactSensitiveDiagnosticText(exception.Message);
+            _lastLocalSetupDetail = message;
+            UpsertLocalMachine(HostStatuses.Unavailable, null, message);
+            SetStatus(HostStatuses.Unavailable, "Local setup failed", message);
+            AddActivity(
+                $"Local Codex setup failed: {message}",
+                showTopNotification: true,
+                notificationKind: ActivityNotificationKindFailed);
+            await SaveGraphAsync();
+            await RenderGraphAsync();
+        }
+        finally
+        {
+            _isSettingUpLocalMachine = false;
+            UpdateChrome();
+        }
+    }
+
     private async void HealthButton_Click(SplitButton sender, SplitButtonClickEventArgs e)
     {
         await CheckMachineHealthFromToolbarAsync();
@@ -3916,14 +4065,8 @@ public sealed partial class MainWindow : Window
 
     private void CloseMachinesRailButton_Click(object sender, RoutedEventArgs e)
     {
-        _isMachinesRailCollapsed = !_isMachinesRailCollapsed;
-        if (_isMachinesRailCollapsed)
-        {
-            _isMachineConnectFormVisible = false;
-        }
-
-        AddActivity(_isMachinesRailCollapsed ? "Machines panel minimized." : "Machines panel expanded.");
-        UpdateChrome();
+        HideMachinesFlyout();
+        AddActivity("Machines menu closed.");
     }
 
     private async void RefreshHealthButton_Click(object sender, RoutedEventArgs e)
@@ -6773,6 +6916,7 @@ public sealed partial class MainWindow : Window
                 string.Equals(candidate.Id, hostID, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(candidate.Metadata.HostID, hostID, StringComparison.OrdinalIgnoreCase));
         if (machine is not null &&
+            !IsLocalHostId(machine.Metadata.HostID) &&
             machine.Metadata.HostStatus == HostStatuses.Connected &&
             !string.IsNullOrWhiteSpace(machine.Metadata.AppServerEndpointUrl) &&
             Uri.TryCreate(machine.Metadata.AppServerEndpointUrl, UriKind.Absolute, out var url) &&
@@ -8187,6 +8331,60 @@ public sealed partial class MainWindow : Window
             }
         };
         return id;
+    }
+
+    private void UpsertLocalMachine(
+        string status,
+        LocalAppServerStartResult? appServer,
+        string detail)
+    {
+        var existingMachine = LocalMachineNode();
+        var id = existingMachine?.Id ?? LocalHostIdentity.LocalMachineNodeID;
+        var title = appServer?.InitializeResult.HostName;
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            title = string.IsNullOrWhiteSpace(existingMachine?.Title)
+                ? Environment.MachineName
+                : existingMachine.Title;
+        }
+
+        var platform = appServer?.InitializeResult.Platform
+            ?? existingMachine?.Metadata.Platform
+            ?? HostPlatforms.Windows;
+        var endpointUrl = appServer?.Endpoint.Url.ToString()
+            ?? existingMachine?.Metadata.AppServerEndpointUrl;
+        var subtitleDetail = status == HostStatuses.Connected && !string.IsNullOrWhiteSpace(endpointUrl)
+            ? endpointUrl
+            : "local";
+
+        _graph.Nodes[id] = new CanvasNode
+        {
+            Id = id,
+            Kind = NodeKinds.Machine,
+            Title = title,
+            Subtitle = $"{platform} - {subtitleDetail}",
+            Position = existingMachine?.Position ?? NextMachinePosition(),
+            Size = existingMachine?.Size ?? CanvasSize.Machine,
+            Metadata = new NodeMetadata
+            {
+                HostID = LocalHostIdentity.CanonicalHostID,
+                Platform = platform,
+                HostStatus = status,
+                HostLastError = status == HostStatuses.Unavailable ? detail : null,
+                CodexHome = appServer?.InitializeResult.CodexHome ?? existingMachine?.Metadata.CodexHome,
+                AppServerEndpointUrl = endpointUrl
+            }
+        };
+    }
+
+    private void RegisterLocalAppServerEndpoint(AppServerEndpoint endpoint)
+    {
+        _connectedAppServerEndpointsByHostId[LocalHostIdentity.CanonicalHostID] = endpoint;
+        _connectedAppServerEndpointsByHostId[LocalHostIdentity.LocalMachineNodeID] = endpoint;
+        if (LocalMachineNode() is { } machine)
+        {
+            _connectedAppServerEndpointsByHostId[machine.Id] = endpoint;
+        }
     }
 
     private static string ConnectedMachineID(Uri endpointUri, string hostName)
@@ -9864,6 +10062,7 @@ public sealed partial class MainWindow : Window
         SearchHandleLine.StrokeThickness = searchPresentation.StrokeThickness;
         ToolTipService.SetToolTip(SearchButton, searchPresentation.ToolTip);
         ApplyToolbarButtonChromePresentation();
+        UpdateMachinesButtonPresentation();
 
         UpdateCommandBarAvailability();
         UpdateChoices();
@@ -9878,16 +10077,23 @@ public sealed partial class MainWindow : Window
         UpdateTopNotificationsChrome();
         UpdateStatusStripError();
 
-        MachinesRail.Visibility = _isMachinesRailVisible || hasMachineIssue ? Visibility.Visible : Visibility.Collapsed;
+        MachinesRail.Visibility = _isMachinesRailVisible && _isMachinesFlyoutOpen
+            ? Visibility.Visible
+            : Visibility.Collapsed;
         MachinesRailContent.Visibility = _isMachinesRailCollapsed ? Visibility.Collapsed : Visibility.Visible;
         MaybeStartInitialMachineDiscovery();
+        if (_isReadingModePresented && _isMachinesFlyoutOpen)
+        {
+            _machinesFlyout?.Hide();
+        }
+
         MachineConnectForm.Visibility = !_isMachinesRailCollapsed && _isMachineConnectFormVisible
             ? Visibility.Visible
             : Visibility.Collapsed;
         MachineConnectFormToggleIcon.Glyph = _isMachineConnectFormVisible ? "\uE711" : "\uE710";
         ToolTipService.SetToolTip(AddMachineButton, _isMachineConnectFormVisible ? "Close add remote form" : "Add remote");
-        CloseMachinesRailIcon.Glyph = _isMachinesRailCollapsed ? "\uE70D" : "\uE70E";
-        ToolTipService.SetToolTip(CloseMachinesRailButton, _isMachinesRailCollapsed ? "Expand" : "Minimize");
+        CloseMachinesRailIcon.Glyph = "\uE711";
+        ToolTipService.SetToolTip(CloseMachinesRailButton, "Close");
         MachineRecoveryRail.Visibility = MachineRecoveryPresentation.ShouldShowRail(
             _isMachineRecoveryVisible,
             _machineRecoveryItems.Count)
@@ -9929,7 +10135,6 @@ public sealed partial class MainWindow : Window
         ThreadInboxRail.Visibility = _isReadingModePresented ? Visibility.Collapsed : Visibility.Visible;
         StatusStripSurface.Visibility = _isReadingModePresented ? Visibility.Collapsed : Visibility.Visible;
         var hasOperationalRailContent =
-            MachinesRail.Visibility == Visibility.Visible ||
             MachineRecoveryRail.Visibility == Visibility.Visible ||
             ActivityRail.Visibility == Visibility.Visible ||
             AttentionRail.Visibility == Visibility.Visible ||
@@ -10054,6 +10259,41 @@ public sealed partial class MainWindow : Window
         return MachineNodes.FirstOrDefault(node => IsLocalHostId(node.Metadata.HostID));
     }
 
+    private void UpdateMachinesButtonPresentation()
+    {
+        var isBusy = _isSettingUpLocalMachine || IsMachineHealthRefreshRunning;
+        var needsSetup = ShouldShowLocalMachineSetupRow();
+        var needsAttention = needsSetup || MachinesNeedingRecovery().Any() || HasRemoteDiagnosticsAttention();
+        var iconHex = isBusy
+            ? "#6AB7FF"
+            : needsAttention
+                ? "#FF9F0A"
+                : "#D7DCE5";
+        var iconBrush = BrushFromHex(iconHex);
+        MachinesButtonUnitTop.Stroke = iconBrush;
+        MachinesButtonUnitMiddle.Stroke = iconBrush;
+        MachinesButtonUnitBottom.Stroke = iconBrush;
+        MachinesButtonIndicatorTop.Fill = iconBrush;
+        MachinesButtonIndicatorMiddle.Fill = iconBrush;
+        MachinesButtonIndicatorBottom.Fill = iconBrush;
+        MachinesButtonStatusGlyph.Visibility = isBusy || needsAttention ? Visibility.Visible : Visibility.Collapsed;
+        MachinesButtonStatusGlyph.Glyph = isBusy ? "\uE895" : "\uE7BA";
+        MachinesButtonStatusGlyph.Foreground = iconBrush;
+        MachinesButton.BorderBrush = needsAttention
+            ? BrushFromHex("#66FF9F0A")
+            : BrushFromHex(ToolbarButtonChromePresentation.BorderedBorderHex);
+        MachinesButton.Foreground = needsAttention
+            ? iconBrush
+            : BrushFromHex(ToolbarButtonChromePresentation.BorderedForegroundHex);
+        ToolTipService.SetToolTip(
+            MachinesButton,
+            needsSetup
+                ? "Set up local Codex and machine connections"
+                : needsAttention
+                    ? "Open machine setup and recovery"
+                    : "Open machine setup and connections");
+    }
+
     private void UpdateCommandBarAvailability()
     {
         var folderUnavailableReason = CreateFolderUnavailableReason;
@@ -10075,6 +10315,30 @@ public sealed partial class MainWindow : Window
         ToolTipService.SetToolTip(AddThreadButton, threadAvailability.ToolTip);
         AutomationProperties.SetHelpText(AddThreadButton, threadAvailability.AccessibilityHint);
         AutomationProperties.SetItemStatus(AddThreadButton, threadAvailability.AccessibilityValue);
+    }
+
+    private bool ShouldShowLocalMachineSetupRow()
+    {
+        var localMachine = LocalMachineNode();
+        return localMachine is null ||
+            localMachine.Metadata.HostStatus != HostStatuses.Connected ||
+            !HasUsableLocalAppServerEndpoint(localMachine);
+    }
+
+    private bool HasUsableLocalAppServerEndpoint(CanvasNode localMachine)
+    {
+        return _connectedAppServerEndpointsByHostId.ContainsKey(localMachine.Id) ||
+            _connectedAppServerEndpointsByHostId.ContainsKey(LocalHostIdentity.CanonicalHostID) ||
+            _connectedAppServerEndpointsByHostId.ContainsKey(LocalHostIdentity.LocalMachineNodeID);
+    }
+
+    private bool HasRemoteDiagnosticsAttention()
+    {
+        return _codexRemoteDiagnostics.Values.Any(steps =>
+            steps.Any(step =>
+                step.Status == RuntimeDiagnosticStatuses.Failed ||
+                step.Status == RuntimeDiagnosticStatuses.Warning ||
+                step.Status == RuntimeDiagnosticStatuses.Running));
     }
 
     private string AddFolderToolTip()
@@ -10180,12 +10444,71 @@ public sealed partial class MainWindow : Window
         HealthPopoverSubtitle.Text = $"{machines.Count} machine{(machines.Count == 1 ? "" : "s")} - {connected} connected";
         HealthSummaryText.Text = _lastDiagnosticsSummary;
         HealthDetailText.Text = _lastDiagnosticsDetail;
+        UpdateLocalMachineSetupRow();
         MachineRecoveryToggleText.Text = _isMachineRecoveryVisible ? "Hide Machine Recovery" : "Show Machine Recovery";
         MachineRecoveryMenuItem.Text = _isMachineRecoveryVisible ? "Hide Machine Recovery" : "Show Machine Recovery";
         RecoveryActionCountText.Text = $"{recoveryTargets.Count} action{(recoveryTargets.Count == 1 ? "" : "s")}";
         RecoveryEmptyText.Visibility = MachineRecoveryPresentation.Rail().ShowsEmptyState && recoveryTargets.Count == 0
             ? Visibility.Visible
             : Visibility.Collapsed;
+    }
+
+    private void UpdateLocalMachineSetupRow()
+    {
+        var localMachine = LocalMachineNode();
+        var shouldShow = ShouldShowLocalMachineSetupRow();
+        LocalMachineSetupRow.Visibility = shouldShow ? Visibility.Visible : Visibility.Collapsed;
+        SetupLocalMachineButton.IsEnabled = !_isSettingUpLocalMachine;
+        SetupLocalMachineButton.Opacity = _isSettingUpLocalMachine ? 0.64 : 1.0;
+
+        if (_isSettingUpLocalMachine)
+        {
+            LocalMachineSetupIcon.Glyph = "\uE895";
+            LocalMachineSetupIcon.Foreground = BrushFromHex("#6AB7FF");
+            SetupLocalMachineButtonIcon.Glyph = "\uE895";
+            SetupLocalMachineButtonText.Text = "Starting Local Codex";
+            LocalMachineSetupStatusText.Text = _lastLocalSetupDetail ?? "Starting local Codex App Server...";
+            return;
+        }
+
+        if (localMachine is null)
+        {
+            LocalMachineSetupIcon.Glyph = "\uE977";
+            LocalMachineSetupIcon.Foreground = BrushFromHex("#FF9F0A");
+            SetupLocalMachineButtonIcon.Glyph = "\uE768";
+            SetupLocalMachineButtonText.Text = "Add Local Machine";
+            LocalMachineSetupStatusText.Text = "Add this PC to the workflow and start local Codex App Server.";
+            return;
+        }
+
+        if (localMachine.Metadata.HostStatus == HostStatuses.Unavailable)
+        {
+            LocalMachineSetupIcon.Glyph = "\uE7BA";
+            LocalMachineSetupIcon.Foreground = BrushFromHex("#FF9F0A");
+            SetupLocalMachineButtonIcon.Glyph = "\uE72C";
+            SetupLocalMachineButtonText.Text = "Retry Local Codex";
+            LocalMachineSetupStatusText.Text = _lastLocalSetupDetail
+                ?? localMachine.Metadata.HostLastError
+                ?? "Local Codex setup needs attention.";
+            return;
+        }
+
+        if (localMachine.Metadata.HostStatus == HostStatuses.Connected)
+        {
+            LocalMachineSetupIcon.Glyph = "\uE7BA";
+            LocalMachineSetupIcon.Foreground = BrushFromHex("#FF9F0A");
+            SetupLocalMachineButtonIcon.Glyph = "\uE768";
+            SetupLocalMachineButtonText.Text = "Finish Local Setup";
+            LocalMachineSetupStatusText.Text = "Connected machine node found; start the local App Server route.";
+            return;
+        }
+
+        LocalMachineSetupIcon.Glyph = "\uE977";
+        LocalMachineSetupIcon.Foreground = BrushFromHex("#FF9F0A");
+        SetupLocalMachineButtonIcon.Glyph = "\uE768";
+        SetupLocalMachineButtonText.Text = "Start Local Codex";
+        LocalMachineSetupStatusText.Text = _lastLocalSetupDetail
+            ?? "Start the local Codex App Server and register this PC.";
     }
 
     private void UpdateMachineDiscoverySections()
@@ -11210,6 +11533,7 @@ public sealed partial class MainWindow : Window
 
         var machine = NewThreadTargetMachine(targetNode);
         if (machine is not null &&
+            !IsLocalHostId(machine.Metadata.HostID) &&
             machine.Metadata.HostStatus == HostStatuses.Connected &&
             !string.IsNullOrWhiteSpace(machine.Metadata.AppServerEndpointUrl) &&
             Uri.TryCreate(machine.Metadata.AppServerEndpointUrl, UriKind.Absolute, out var url) &&
@@ -12339,6 +12663,7 @@ public sealed partial class MainWindow : Window
         foreach (var machine in MachineNodes)
         {
             if (machine.Metadata.HostStatus != HostStatuses.Connected ||
+                IsLocalHostId(machine.Metadata.HostID) ||
                 string.IsNullOrWhiteSpace(machine.Metadata.AppServerEndpointUrl) ||
                 !Uri.TryCreate(machine.Metadata.AppServerEndpointUrl, UriKind.Absolute, out var url) ||
                 !AppServerEndpointValidator.IsLoopback(url))
@@ -12441,9 +12766,18 @@ public sealed partial class MainWindow : Window
     {
         foreach (var machine in MachineNodes.Where(machine => machine.Metadata.HostStatus == HostStatuses.Connected))
         {
-            if (_connectedAppServerEndpointsByHostId.TryGetValue(machine.Id, out var endpoint))
+            var hostID = IsLocalHostId(machine.Metadata.HostID)
+                ? LocalHostIdentity.CanonicalHostID
+                : machine.Id;
+            if (_connectedAppServerEndpointsByHostId.TryGetValue(hostID, out var endpoint) ||
+                _connectedAppServerEndpointsByHostId.TryGetValue(machine.Id, out endpoint))
             {
-                yield return (machine.Id, endpoint);
+                yield return (hostID, endpoint);
+                continue;
+            }
+
+            if (IsLocalHostId(machine.Metadata.HostID))
+            {
                 continue;
             }
 

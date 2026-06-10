@@ -4,6 +4,8 @@ import SwiftUI
 public struct CanvasCommandBar: View {
     @Bindable var graphStore: GraphStore
     @Bindable var runtimeStore: CodexRuntimeStore
+    @Bindable var supervisorStore: WorkflowSupervisorStore
+    @Binding private var isMachinesMenuPresented: Bool
     var workflows: [WorkflowRecord]
     var activeWorkflowID: String?
     var onSelectWorkflow: (String) -> Void
@@ -25,6 +27,10 @@ public struct CanvasCommandBar: View {
     var onResetView: () -> Void
     var onRefreshConnections: () -> Void
     var onShowPairing: () -> Void
+    var onConnectRemote: (String, String) -> Void
+    var onAddMachineFolder: (SupervisorMachine, String) -> Void
+    var onDisconnectMachine: (HostID) -> Void
+    var onSetupLocalMachine: () -> Void
     var onToggleReadingMode: () -> Void
     var onToggleSubagents: () -> Void
     var isRefreshingConnections: Bool
@@ -39,6 +45,8 @@ public struct CanvasCommandBar: View {
     public init(
         graphStore: GraphStore,
         runtimeStore: CodexRuntimeStore,
+        supervisorStore: WorkflowSupervisorStore,
+        isMachinesMenuPresented: Binding<Bool> = .constant(false),
         workflows: [WorkflowRecord] = [],
         activeWorkflowID: String? = nil,
         onSelectWorkflow: @escaping (String) -> Void = { _ in },
@@ -60,6 +68,10 @@ public struct CanvasCommandBar: View {
         onResetView: @escaping () -> Void,
         onRefreshConnections: @escaping () -> Void,
         onShowPairing: @escaping () -> Void = {},
+        onConnectRemote: @escaping (String, String) -> Void = { _, _ in },
+        onAddMachineFolder: @escaping (SupervisorMachine, String) -> Void = { _, _ in },
+        onDisconnectMachine: @escaping (HostID) -> Void = { _ in },
+        onSetupLocalMachine: @escaping () -> Void = {},
         onToggleReadingMode: @escaping () -> Void = {},
         onToggleSubagents: @escaping () -> Void = {},
         isRefreshingConnections: Bool,
@@ -70,6 +82,8 @@ public struct CanvasCommandBar: View {
     ) {
         self.graphStore = graphStore
         self.runtimeStore = runtimeStore
+        self.supervisorStore = supervisorStore
+        self._isMachinesMenuPresented = isMachinesMenuPresented
         self.workflows = workflows
         self.activeWorkflowID = activeWorkflowID
         self.onSelectWorkflow = onSelectWorkflow
@@ -91,6 +105,10 @@ public struct CanvasCommandBar: View {
         self.onResetView = onResetView
         self.onRefreshConnections = onRefreshConnections
         self.onShowPairing = onShowPairing
+        self.onConnectRemote = onConnectRemote
+        self.onAddMachineFolder = onAddMachineFolder
+        self.onDisconnectMachine = onDisconnectMachine
+        self.onSetupLocalMachine = onSetupLocalMachine
         self.onToggleReadingMode = onToggleReadingMode
         self.onToggleSubagents = onToggleSubagents
         self.isRefreshingConnections = isRefreshingConnections
@@ -106,6 +124,8 @@ public struct CanvasCommandBar: View {
 
             Divider()
                 .frame(height: 20)
+
+            machinesControl
 
             FeedbackButton(
                 unavailableReason: createFolderUnavailableReason,
@@ -243,6 +263,78 @@ public struct CanvasCommandBar: View {
         .help("Workflow")
     }
 
+    private var machinesControl: some View {
+        Button {
+            withAnimation(.snappy) {
+                isMachinesMenuPresented.toggle()
+            }
+        } label: {
+            Label("Machines", systemImage: machinesButtonIcon)
+        }
+        .buttonStyle(.bordered)
+        .tint(machinesNeedAttention ? .orange : .secondary)
+        .help("Open machine setup and connections")
+        .popover(isPresented: $isMachinesMenuPresented, arrowEdge: .top) {
+            machinesPopover
+        }
+    }
+
+    private var machinesPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if shouldShowLocalSetup {
+                localMachineSetupRow
+            }
+
+            MachinesPanelView(
+                supervisorStore: supervisorStore,
+                localHostID: runtimeStore.localHost.id,
+                onConnectRemote: onConnectRemote,
+                onAddMachineFolder: onAddMachineFolder,
+                onDisconnect: onDisconnectMachine
+            )
+        }
+        .padding(8)
+        .frame(width: 344, alignment: .topLeading)
+    }
+
+    private var localMachineSetupRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "desktopcomputer.and.arrow.down")
+                    .foregroundStyle(localSetupTint)
+                    .frame(width: 18)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Local Machine")
+                        .font(.callout.weight(.semibold))
+                    Text(localSetupStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer()
+            }
+
+            Button {
+                onSetupLocalMachine()
+            } label: {
+                Label(localSetupButtonTitle, systemImage: localSetupButtonIcon)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(runtimeStore.connectionState == .connecting)
+            .help("Start the local Codex app-server and add this machine to the map")
+        }
+        .padding(10)
+        .frame(width: 320, alignment: .leading)
+        .background(.background.opacity(0.36), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(.quaternary, lineWidth: 1)
+        }
+    }
+
     private var healthControl: some View {
         Menu {
             Button(action: onRefreshConnections) {
@@ -286,6 +378,92 @@ public struct CanvasCommandBar: View {
 
     private var hasMachineTarget: Bool {
         graphStore.graph.sortedNodes.contains { $0.kind == .machine }
+    }
+
+    private var hasLocalMachineNode: Bool {
+        graphStore.graph.sortedNodes.contains { node in
+            node.kind == .machine && node.metadata.hostID == runtimeStore.localHost.id
+        }
+    }
+
+    private var shouldShowLocalSetup: Bool {
+        runtimeStore.connectionState != .connected || !hasLocalMachineNode
+    }
+
+    private var machinesNeedAttention: Bool {
+        runtimeStore.connectionState != .connected
+            || !hasLocalMachineNode
+            || supervisorStore.machines.contains { machine in
+                machine.status == .failed
+                    || machine.status == .connecting
+                    || machine.lastError != nil
+            }
+            || supervisorStore.codexRemotes.contains { remote in
+                CodexRemoteIdentityStore.requiresPreparation(for: remote)
+                    || supervisorStore.codexRemoteDiagnostics[remote.id]?.contains { step in
+                        step.status == .failed || step.status == .warning || step.status == .running
+                    } == true
+            }
+    }
+
+    private var machinesButtonIcon: String {
+        if runtimeStore.connectionState == .connecting
+            || supervisorStore.machines.contains(where: { $0.status == .connecting })
+            || supervisorStore.codexRemoteDiagnostics.values.contains(where: { steps in
+                steps.contains { $0.status == .running }
+            }) {
+            return "arrow.triangle.2.circlepath"
+        }
+
+        if machinesNeedAttention {
+            return "exclamationmark.triangle.fill"
+        }
+
+        return "server.rack"
+    }
+
+    private var localSetupButtonTitle: String {
+        if runtimeStore.connectionState == .connected {
+            return hasLocalMachineNode ? "Refresh Local Machine" : "Add Local Machine"
+        }
+
+        if runtimeStore.connectionState == .connecting {
+            return "Starting Local Codex"
+        }
+
+        return "Start Local Codex"
+    }
+
+    private var localSetupButtonIcon: String {
+        runtimeStore.connectionState == .connecting ? "arrow.triangle.2.circlepath" : "play.circle"
+    }
+
+    private var localSetupTint: Color {
+        switch runtimeStore.connectionState {
+        case .connected:
+            return .green
+        case .connecting:
+            return .blue
+        case .disconnected:
+            return .orange
+        case .unavailable:
+            return .red
+        }
+    }
+
+    private var localSetupStatus: String {
+        switch runtimeStore.connectionState {
+        case .connected where !hasLocalMachineNode:
+            return "Connected; add it to this workflow."
+        case .connected:
+            return runtimeStore.localHost.endpointDescription
+        case .connecting:
+            return runtimeStore.statusMessage
+        case .disconnected:
+            return "Codex is ready but not connected."
+        case .unavailable:
+            return runtimeStore.statusMessage
+        }
     }
 
     private var readingModeTitle: String {

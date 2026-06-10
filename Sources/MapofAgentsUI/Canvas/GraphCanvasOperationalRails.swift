@@ -11,8 +11,6 @@ struct GraphCanvasOperationalRails: View {
     var threadTitle: (WorkflowEvent) -> String
     var turnOriginTitle: (WorkflowEvent) -> String?
     var onSelectEvent: (WorkflowEvent) -> Void
-    var onConnectRemote: (String, String) -> Void
-    var onAddMachineFolder: (SupervisorMachine, String) -> Void
     var onDisconnect: (HostID) -> Void
     var onRefreshThreadInbox: () -> Void
     var onSearchThreadInbox: () -> Void
@@ -26,42 +24,16 @@ struct GraphCanvasOperationalRails: View {
     var onRespondToAttentionWithText: (RuntimeAttentionRequest, String) -> Void
     var onDeclineTypedAttention: (RuntimeAttentionRequest) -> Void
     var showsThreadInbox: Bool = true
-    @Binding var isMachinesPanelPresented: Bool
     @Binding var isMachineRecoveryPresented: Bool
 
     var body: some View {
         let attentionRequests = runtimeStore.pendingAttentionRequests + supervisorStore.pendingAttentionRequests
-        let hasMachineIssue = supervisorStore.machines.contains { machine in
-            machine.status == .failed
-                || machine.status == .connecting
-                || machine.lastError != nil
-                || (
-                    machine.status == .disconnected
-                        && supervisorStore.relayEndpoints.contains { $0.id == machine.id }
-                )
-        } || supervisorStore.codexRemotes.contains { remote in
-            CodexRemoteIdentityStore.requiresPreparation(for: remote)
-                || supervisorStore.codexRemoteDiagnostics[remote.id]?.contains {
-                    $0.status == .failed || $0.status == .warning || $0.status == .running
-                } == true
-        }
         ScrollView {
             VStack(alignment: .trailing, spacing: 10) {
                 if isMachineRecoveryPresented {
                     MachineRecoveryChecklistRailView(
                         supervisorStore: supervisorStore,
                         localHostID: runtimeStore.localHost.id,
-                        onDisconnect: onDisconnect
-                    )
-                    .transition(.opacity.combined(with: .move(edge: .trailing)))
-                }
-
-                if isMachinesPanelPresented || hasMachineIssue {
-                    MachinesPanelView(
-                        supervisorStore: supervisorStore,
-                        localHostID: runtimeStore.localHost.id,
-                        onConnectRemote: onConnectRemote,
-                        onAddMachineFolder: onAddMachineFolder,
                         onDisconnect: onDisconnect
                     )
                     .transition(.opacity.combined(with: .move(edge: .trailing)))

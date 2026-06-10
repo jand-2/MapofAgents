@@ -22,7 +22,7 @@ struct RootView: View {
     @State private var isShowingNewThread = false
     @State private var isReadingModePresented = false
     @State private var readingThreadCount = 0
-    @State private var isMachinesPanelPresented = false
+    @State private var isMachinesMenuPresented = false
     @State private var isMachineRecoveryPresented = false
     @State private var isShowingPairing = false
     @State private var canvasSize: CGSize = .zero
@@ -79,7 +79,6 @@ struct RootView: View {
             showsSubagents: showsSubagents,
             isReadingModePresented: $isReadingModePresented,
             readingThreadCount: $readingThreadCount,
-            isMachinesPanelPresented: $isMachinesPanelPresented,
             isMachineRecoveryPresented: $isMachineRecoveryPresented,
             onCanvasSizeChange: { canvasSize = $0 }
         )
@@ -88,6 +87,8 @@ struct RootView: View {
                     CanvasCommandBar(
                         graphStore: graphStore,
                         runtimeStore: runtimeStore,
+                        supervisorStore: supervisorStore,
+                        isMachinesMenuPresented: $isMachinesMenuPresented,
                         workflows: workflowLibrary.workflows,
                         activeWorkflowID: workflowLibrary.activeWorkflowID,
                         onSelectWorkflow: selectWorkflow,
@@ -115,6 +116,10 @@ struct RootView: View {
                         onResetView: { Task { await graphStore.resetViewport() } },
                         onRefreshConnections: { refreshWorkflowConnections() },
                         onShowPairing: showPairing,
+                        onConnectRemote: connectRemoteMachine,
+                        onAddMachineFolder: addRemoteMachineFolder,
+                        onDisconnectMachine: disconnectMachine,
+                        onSetupLocalMachine: setupLocalMachine,
                         onToggleReadingMode: { isReadingModePresented.toggle() },
                         onToggleSubagents: { showsSubagents.toggle() },
                         isRefreshingConnections: isRefreshingWorkflowConnections,
@@ -394,7 +399,7 @@ struct RootView: View {
         }
 
         guard machine.metadata.hostID == runtimeStore.localHost.id else {
-            isMachinesPanelPresented = true
+            isMachinesMenuPresented = true
             recordTopErrorNotification(
                 "Use the folder button on the remote machine row so mapofagents can use that machine's project picker.",
                 source: nil,
@@ -408,7 +413,7 @@ struct RootView: View {
 
     private func showThreadSearch() {
         threadCatalogStore.selectedMode = .search
-        isMachinesPanelPresented = false
+        isMachinesMenuPresented = false
         isShowingNotificationHistory = false
     }
 
@@ -419,7 +424,7 @@ struct RootView: View {
     private func runDiagnostics() {
         Task {
             await runtimeStore.runDiagnostics()
-            isMachinesPanelPresented = true
+            isMachinesMenuPresented = true
         }
     }
 
@@ -431,6 +436,40 @@ struct RootView: View {
             } catch {
                 recordPersistenceError(error, action: "Open app logs")
             }
+        }
+    }
+
+    private func connectRemoteMachine(name: String, endpoint: String) {
+        Task {
+            await supervisorStore.connectRemote(name: name, endpoint: endpoint)
+            await graphStore.applySupervisorMachines(supervisorStore.machines)
+        }
+    }
+
+    private func addRemoteMachineFolder(machine: SupervisorMachine, path: String) {
+        Task {
+            await graphStore.addFolder(
+                path: path,
+                hostID: machine.id,
+                platform: machine.platform
+            )
+        }
+    }
+
+    private func disconnectMachine(_ machineID: HostID) {
+        Task {
+            await supervisorStore.disconnect(machineID)
+            await graphStore.applySupervisorMachines(supervisorStore.machines)
+        }
+    }
+
+    private func setupLocalMachine() {
+        isMachinesMenuPresented = true
+        Task {
+            await runtimeStore.connect()
+            await supervisorStore.registerLocalHost(runtimeStore.localHost)
+            await graphStore.applyHost(runtimeStore.localHost)
+            await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
         }
     }
 
@@ -816,7 +855,7 @@ struct RootView: View {
             isRefreshingWorkflowConnections = false
 
             if showProblemsAutomatically, hasHealthProblems {
-                isMachinesPanelPresented = true
+                isMachinesMenuPresented = true
                 await runtimeStore.runDiagnostics()
             }
         }

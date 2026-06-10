@@ -202,6 +202,86 @@
                 <Rectangle x:Name="CommandBarWorkflowDivider" Width="1" Height="20" Fill="#24FFFFFF" />
 
                 <Button
+                    x:Name="MachinesButton"
+                    AutomationProperties.AutomationId="MachinesButton"
+                    AutomationProperties.Name="Machines"
+                    Click="MachinesButton_Click"
+                    Style="{StaticResource ToolbarButtonStyle}"
+                    ToolTipService.ToolTip="Open machine setup and connections">
+                    <StackPanel Orientation="Horizontal" Spacing="7">
+                        <Canvas
+                            x:Name="MachinesButtonServerIcon"
+                            Width="17"
+                            Height="16"
+                            VerticalAlignment="Center">
+                            <Rectangle
+                                x:Name="MachinesButtonUnitTop"
+                                Canvas.Left="2.5"
+                                Canvas.Top="1.7"
+                                Width="12"
+                                Height="3.6"
+                                RadiusX="1.2"
+                                RadiusY="1.2"
+                                Fill="#00FFFFFF"
+                                Stroke="#D7DCE5"
+                                StrokeThickness="1.2" />
+                            <Rectangle
+                                x:Name="MachinesButtonUnitMiddle"
+                                Canvas.Left="2.5"
+                                Canvas.Top="6.5"
+                                Width="12"
+                                Height="3.6"
+                                RadiusX="1.2"
+                                RadiusY="1.2"
+                                Fill="#00FFFFFF"
+                                Stroke="#D7DCE5"
+                                StrokeThickness="1.2" />
+                            <Rectangle
+                                x:Name="MachinesButtonUnitBottom"
+                                Canvas.Left="2.5"
+                                Canvas.Top="11.3"
+                                Width="12"
+                                Height="3.6"
+                                RadiusX="1.2"
+                                RadiusY="1.2"
+                                Fill="#00FFFFFF"
+                                Stroke="#D7DCE5"
+                                StrokeThickness="1.2" />
+                            <Ellipse
+                                x:Name="MachinesButtonIndicatorTop"
+                                Canvas.Left="4.25"
+                                Canvas.Top="2.95"
+                                Width="1.15"
+                                Height="1.15"
+                                Fill="#D7DCE5" />
+                            <Ellipse
+                                x:Name="MachinesButtonIndicatorMiddle"
+                                Canvas.Left="4.25"
+                                Canvas.Top="7.75"
+                                Width="1.15"
+                                Height="1.15"
+                                Fill="#D7DCE5" />
+                            <Ellipse
+                                x:Name="MachinesButtonIndicatorBottom"
+                                Canvas.Left="4.25"
+                                Canvas.Top="12.55"
+                                Width="1.15"
+                                Height="1.15"
+                                Fill="#D7DCE5" />
+                            <FontIcon
+                                x:Name="MachinesButtonStatusGlyph"
+                                Canvas.Left="10"
+                                Canvas.Top="-1"
+                                Glyph="&#xE7BA;"
+                                FontSize="8"
+                                Foreground="#FF9F0A"
+                                Visibility="Collapsed" />
+                        </Canvas>
+                        <TextBlock Text="Machines" />
+                    </StackPanel>
+                </Button>
+
+                <Button
                     x:Name="AddFolderButton"
                     AutomationProperties.Name="Add folder"
                     Click="AddFolderButton_Click"
@@ -4077,10 +4157,10 @@
                         <Button
                             x:Name="CloseMachinesRailButton"
                             Grid.Column="1"
-                            AutomationProperties.AutomationId="MachinesRailCollapseButton"
-                            AutomationProperties.Name="Minimize machines"
+                            AutomationProperties.AutomationId="MachinesMenuCloseButton"
+                            AutomationProperties.Name="Close machines"
                             Click="CloseMachinesRailButton_Click"
-                            ToolTipService.ToolTip="Minimize"
+                            ToolTipService.ToolTip="Close"
                             Width="24"
                             Height="24"
                             Padding="0"
@@ -4131,6 +4211,65 @@
                     <StackPanel
                         x:Name="MachinesRailContent"
                         Spacing="10">
+                    <Border
+                        x:Name="LocalMachineSetupRow"
+                        Padding="10"
+                        Background="#662A2C30"
+                        BorderBrush="#24FFFFFF"
+                        BorderThickness="1"
+                        CornerRadius="8"
+                        Visibility="Collapsed">
+                        <StackPanel Spacing="8">
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <FontIcon
+                                    x:Name="LocalMachineSetupIcon"
+                                    Glyph="&#xE977;"
+                                    FontSize="16"
+                                    Width="18"
+                                    Foreground="#FF9F0A"
+                                    VerticalAlignment="Top" />
+                                <StackPanel Grid.Column="1" Spacing="2">
+                                    <TextBlock
+                                        Text="Local Machine"
+                                        FontSize="12"
+                                        FontWeight="SemiBold"
+                                        Foreground="#F2F4F7" />
+                                    <TextBlock
+                                        x:Name="LocalMachineSetupStatusText"
+                                        Text="Start the local Codex App Server and register this PC."
+                                        FontSize="11"
+                                        Foreground="#A7B0BF"
+                                        TextWrapping="Wrap"
+                                        MaxLines="2" />
+                                </StackPanel>
+                            </Grid>
+                            <Button
+                                x:Name="SetupLocalMachineButton"
+                                Click="SetupLocalMachineButton_Click"
+                                AutomationProperties.Name="Set up local Codex"
+                                Style="{StaticResource ToolbarPrimaryButtonStyle}"
+                                HorizontalAlignment="Stretch"
+                                ToolTipService.ToolTip="Start the local Codex App Server and add this machine to the map">
+                                <StackPanel
+                                    HorizontalAlignment="Center"
+                                    Orientation="Horizontal"
+                                    Spacing="7">
+                                    <FontIcon
+                                        x:Name="SetupLocalMachineButtonIcon"
+                                        Glyph="&#xE768;"
+                                        FontSize="14" />
+                                    <TextBlock
+                                        x:Name="SetupLocalMachineButtonText"
+                                        Text="Start Local Codex" />
+                                </StackPanel>
+                            </Button>
+                        </StackPanel>
+                    </Border>
+
                     <Border
                         x:Name="MachineConnectForm"
                         Padding="10"
@@ -6927,7 +7066,7 @@
                                 BorderThickness="{Binding ShellBorderThickness}"
                                 CornerRadius="{Binding ShellCornerRadius}"
                                 Shadow="{StaticResource RailPanelShadow}"
-                                Translation="{Binding ShellTranslation}">
+                                Translation="0,0,18">
                                 <Grid>
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
@@ -8107,7 +8246,7 @@
 	                                BorderThickness="{Binding CardBorderThickness}"
 	                                CornerRadius="{Binding CardCornerRadius}"
 	                                Shadow="{StaticResource RailPanelShadow}"
-	                                Translation="{Binding CardTranslation}">
+	                                Translation="0,0,18">
                                 <Grid ColumnSpacing="{Binding CardColumnSpacing}">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="18" />

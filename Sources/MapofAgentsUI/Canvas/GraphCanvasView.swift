@@ -93,7 +93,6 @@ public struct GraphCanvasView: View {
     private var showsSubagents: Bool
     @Binding private var isReadingModePresented: Bool
     @Binding private var readingThreadCount: Int
-    @Binding private var isMachinesPanelPresented: Bool
     @Binding private var isMachineRecoveryPresented: Bool
     private var onCanvasSizeChange: (CGSize) -> Void
     @State private var dragOffsets: [NodeID: CGSize] = [:]
@@ -147,7 +146,6 @@ public struct GraphCanvasView: View {
         showsSubagents: Bool = true,
         isReadingModePresented: Binding<Bool> = .constant(false),
         readingThreadCount: Binding<Int> = .constant(0),
-        isMachinesPanelPresented: Binding<Bool> = .constant(false),
         isMachineRecoveryPresented: Binding<Bool> = .constant(false),
         onCanvasSizeChange: @escaping (CGSize) -> Void = { _ in }
     ) {
@@ -168,7 +166,6 @@ public struct GraphCanvasView: View {
         self.showsSubagents = showsSubagents
         self._isReadingModePresented = isReadingModePresented
         self._readingThreadCount = readingThreadCount
-        self._isMachinesPanelPresented = isMachinesPanelPresented
         self._isMachineRecoveryPresented = isMachineRecoveryPresented
         self.onCanvasSizeChange = onCanvasSizeChange
     }
@@ -631,18 +628,6 @@ public struct GraphCanvasView: View {
             threadTitle: threadTitle(for:),
             turnOriginTitle: turnOriginTitle(for:),
             onSelectEvent: focusThread(for:),
-            onConnectRemote: { name, endpoint in
-                Task { await supervisorStore.connectRemote(name: name, endpoint: endpoint) }
-            },
-            onAddMachineFolder: { machine, path in
-                Task {
-                    await graphStore.addFolder(
-                        path: path,
-                        hostID: machine.id,
-                        platform: machine.platform
-                    )
-                }
-            },
             onDisconnect: { machineID in
                 Task { await supervisorStore.disconnect(machineID) }
             },
@@ -680,7 +665,6 @@ public struct GraphCanvasView: View {
                 Task { await declineTypedAttentionRequest(request) }
             },
             showsThreadInbox: false,
-            isMachinesPanelPresented: $isMachinesPanelPresented,
             isMachineRecoveryPresented: $isMachineRecoveryPresented
         )
         .padding(14)

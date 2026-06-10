@@ -128,6 +128,27 @@ public sealed class CodexRemoteTunnelServiceTests
     }
 
     [TestMethod]
+    public void CleansPowerShellClixmlFromSshOutput()
+    {
+        var progressOnly = """
+            #< CLIXML
+            ready
+            <Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress" RefId="0"><MS><PR N="Record"><AV>Preparing modules for first use.</AV></PR></MS></Obj></Objs>
+            """;
+
+        Assert.AreEqual("ready", CodexRemoteTunnelService.CleanedSshOutputForDisplay(progressOnly));
+
+        var error = """
+            #< CLIXML
+            <Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Port 14500 is already in use_x000D__x000A_Restart MapofAgents on Windows</S></Objs>
+            """;
+
+        Assert.AreEqual(
+            "Port 14500 is already in use\nRestart MapofAgents on Windows",
+            CodexRemoteTunnelService.CleanedSshOutputForDisplay(error));
+    }
+
+    [TestMethod]
     public void BrowseRemoteFoldersRequiresConnectableDesktopPlatform()
     {
         Assert.IsTrue(CodexRemoteTunnelService.CanBrowseRemoteFolders(new CodexDesktopRemote

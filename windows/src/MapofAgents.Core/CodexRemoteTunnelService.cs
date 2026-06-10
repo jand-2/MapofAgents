@@ -527,6 +527,12 @@ public static class CodexRemoteTunnelService
     public static async Task<int> RestartAppServerAsync(CodexDesktopRemote remote, CancellationToken cancellationToken = default)
     {
         var hostname = SshHostname(remote);
+        var readySession = await FirstAuthenticatedRemoteSessionAsync(remote, hostname, cancellationToken).ConfigureAwait(false);
+        if (readySession is not null)
+        {
+            return readySession.Port;
+        }
+
         await StopRemoteAppServerAsync(remote, hostname, cancellationToken).ConfigureAwait(false);
         var port = RemoteAppServerPortCandidates(remote).FirstOrDefault();
         if (port == 0)
@@ -885,11 +891,16 @@ public static class CodexRemoteTunnelService
             throw new CodexRemoteTunnelException("Timed out waiting for the remote SSH command.");
         }
 
-        var stdout = TruncateOutput(await stdoutTask.ConfigureAwait(false));
-        var stderr = TruncateOutput(await stderrTask.ConfigureAwait(false));
+        var stdout = CleanedSshOutputForDisplay(TruncateOutput(await stdoutTask.ConfigureAwait(false)));
+        var stderr = CleanedSshOutputForDisplay(TruncateOutput(await stderrTask.ConfigureAwait(false)));
         if (process.ExitCode != 0)
         {
-            throw new CodexRemoteTunnelException(RedactSensitiveDiagnosticText(string.IsNullOrWhiteSpace(stderr) ? stdout : stderr));
+            var detail = !string.IsNullOrWhiteSpace(stderr)
+                ? stderr
+                : !string.IsNullOrWhiteSpace(stdout)
+                    ? stdout
+                    : $"Remote SSH command failed with exit code {process.ExitCode}.";
+            throw new CodexRemoteTunnelException(RedactSensitiveDiagnosticText(detail));
         }
 
         return stdout;
@@ -946,28 +957,15 @@ public static class CodexRemoteTunnelService
                 $tokenPath = Join-Path $env:TEMP "mapofagents-codex-app-server-$port.token"
                 $stdoutPath = Join-Path $env:TEMP "codex-app-server-$port.out.log"
                 $stderrPath = Join-Path $env:TEMP "codex-app-server-$port.err.log"
+                {{WindowsTrackedAppServerTokenFunction()}}
                 $existing = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $port -State Listen -ErrorAction SilentlyContinue
                 if ($existing) {
-                    if ((Test-Path $pidPath) -and (Test-Path $tokenPath)) {
-                        $trackedPid = (Get-Content $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
-                        if ($trackedPid -match '^\d+$') {
-                            $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $trackedPid" -ErrorAction SilentlyContinue
-                            if ($processInfo -and
-                                $processInfo.CommandLine -match 'codex' -and
-                                $processInfo.CommandLine -match 'app-server' -and
-                                $processInfo.CommandLine -match [regex]::Escape("127.0.0.1:$port") -and
-                                $processInfo.CommandLine -match '--ws-auth' -and
-                                $processInfo.CommandLine -match 'capability-token' -and
-                                $processInfo.CommandLine -match [regex]::Escape($tokenPath)) {
-                                $existingToken = (Get-Content $tokenPath -ErrorAction Stop | Select-Object -First 1).Trim()
-                                if ($existingToken) {
-                                    Write-Output "token:$existingToken"
-                                    exit 0
-                                }
-                            }
-                        }
+                    $existingToken = Find-MapofAgentsTrackedAppServerToken -Port $port
+                    if (-not [string]::IsNullOrWhiteSpace($existingToken)) {
+                        Write-Output "token:$existingToken"
+                        exit 0
                     }
-                    throw "Port $port is already in use by an untracked or unauthenticated App Server."
+                    throw "Port $port is already in use by an app-server without a readable MapofAgents token. Restart MapofAgents on Windows or free the port."
                 }
 
                 $bytes = New-Object 'Byte[]' 32
@@ -1178,29 +1176,9 @@ public static class CodexRemoteTunnelService
                 $$"""
                 $ErrorActionPreference = 'Stop'
                 $port = {{remotePort}}
-                $pidPath = Join-Path $env:TEMP "mapofagents-codex-app-server-$port.pid"
-                $tokenPath = Join-Path $env:TEMP "mapofagents-codex-app-server-$port.token"
-                if (-not ((Test-Path $pidPath) -and (Test-Path $tokenPath))) {
-                    exit 7
-                }
-                $trackedPid = (Get-Content $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
-                if ($trackedPid -notmatch '^\d+$') {
-                    exit 7
-                }
-                $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $trackedPid" -ErrorAction SilentlyContinue
-                if (-not $processInfo) {
-                    exit 7
-                }
-                if ($processInfo.CommandLine -notmatch 'codex' -or
-                    $processInfo.CommandLine -notmatch 'app-server' -or
-                    $processInfo.CommandLine -notmatch [regex]::Escape("127.0.0.1:$port") -or
-                    $processInfo.CommandLine -notmatch '--ws-auth' -or
-                    $processInfo.CommandLine -notmatch 'capability-token' -or
-                    $processInfo.CommandLine -notmatch [regex]::Escape($tokenPath)) {
-                    exit 7
-                }
-                $token = (Get-Content $tokenPath -ErrorAction Stop | Select-Object -First 1).Trim()
-                if (-not $token) {
+                {{WindowsTrackedAppServerTokenFunction()}}
+                $token = Find-MapofAgentsTrackedAppServerToken -Port $port
+                if ([string]::IsNullOrWhiteSpace($token)) {
                     exit 7
                 }
                 Write-Output "token:$token"
@@ -1252,6 +1230,147 @@ public static class CodexRemoteTunnelService
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    public static string CleanedSshOutputForDisplay(string value)
+    {
+        var output = value
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n');
+        output = string.Join(
+            '\n',
+            output
+                .Split('\n')
+                .Where(line => !line.TrimStart().StartsWith("#< CLIXML", StringComparison.Ordinal)));
+
+        var clixmlMessages = new List<string>();
+        while (true)
+        {
+            var start = output.IndexOf("<Objs", StringComparison.Ordinal);
+            if (start < 0)
+            {
+                break;
+            }
+
+            var end = output.IndexOf("</Objs>", start, StringComparison.Ordinal);
+            if (end < 0)
+            {
+                break;
+            }
+
+            end += "</Objs>".Length;
+            var block = output[start..end];
+            clixmlMessages.AddRange(HumanMessagesFromClixml(block));
+            output = output.Remove(start, end - start);
+        }
+
+        var humanOutput = string.Join(
+                '\n',
+                output
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Where(line => !string.IsNullOrWhiteSpace(line)))
+            .Trim();
+        var decodedMessages = clixmlMessages
+            .Select(message => message.Trim())
+            .Where(message => !string.IsNullOrWhiteSpace(message))
+            .ToArray();
+
+        if (string.IsNullOrWhiteSpace(humanOutput))
+        {
+            return string.Join('\n', decodedMessages);
+        }
+
+        return decodedMessages.Length == 0
+            ? humanOutput
+            : string.Join('\n', new[] { humanOutput }.Concat(decodedMessages));
+    }
+
+    private static IEnumerable<string> HumanMessagesFromClixml(string block)
+    {
+        foreach (var pattern in new[]
+        {
+            """<S S="(?:Error|Warning)">([\s\S]*?)</S>""",
+            """<S N="Message">([\s\S]*?)</S>"""
+        })
+        {
+            foreach (Match match in Regex.Matches(block, pattern))
+            {
+                if (match.Groups.Count > 1)
+                {
+                    yield return DecodePowerShellSerializedText(match.Groups[1].Value);
+                }
+            }
+        }
+    }
+
+    private static string DecodePowerShellSerializedText(string value)
+    {
+        var decoded = WebUtility.HtmlDecode(value);
+        decoded = Regex.Replace(
+            decoded,
+            "_x([0-9A-Fa-f]{4})_",
+            match =>
+            {
+                var hex = match.Groups[1].Value;
+                return int.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var scalar)
+                    ? char.ConvertFromUtf32(scalar)
+                    : match.Value;
+            });
+        return decoded
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n');
+    }
+
+    private static string WindowsTrackedAppServerTokenFunction()
+    {
+        return """
+        function Find-MapofAgentsTrackedAppServerToken {
+            param([int]$Port)
+            $roots = @()
+            if (-not [string]::IsNullOrWhiteSpace($env:TEMP)) {
+                $roots += $env:TEMP
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+                $roots += (Join-Path $env:APPDATA 'MapofAgents\local-app-server')
+            }
+
+            foreach ($root in $roots) {
+                $pidPath = Join-Path $root "mapofagents-codex-app-server-$Port.pid"
+                $tokenPath = Join-Path $root "mapofagents-codex-app-server-$Port.token"
+                if (-not ((Test-Path -LiteralPath $pidPath -PathType Leaf) -and (Test-Path -LiteralPath $tokenPath -PathType Leaf))) {
+                    continue
+                }
+
+                $trackedPid = (Get-Content -LiteralPath $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+                if ($trackedPid -notmatch '^\d+$') {
+                    continue
+                }
+
+                $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $trackedPid" -ErrorAction SilentlyContinue
+                if (-not $processInfo) {
+                    continue
+                }
+
+                $commandLine = [string]$processInfo.CommandLine
+                $matchesLoopbackPort = $commandLine -match [regex]::Escape("127.0.0.1:$Port") -or
+                    $commandLine -match [regex]::Escape("ws://127.0.0.1:$Port")
+                if ($commandLine -notmatch 'codex' -or
+                    $commandLine -notmatch 'app-server' -or
+                    -not $matchesLoopbackPort -or
+                    $commandLine -notmatch '--ws-auth' -or
+                    $commandLine -notmatch 'capability-token' -or
+                    $commandLine -notmatch [regex]::Escape($tokenPath)) {
+                    continue
+                }
+
+                $token = (Get-Content -LiteralPath $tokenPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($token)) {
+                    return $token
+                }
+            }
+            return $null
+        }
+        """;
     }
 
     private static string WindowsPowerShellCommand(string script)

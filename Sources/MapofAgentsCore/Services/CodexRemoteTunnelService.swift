@@ -604,6 +604,10 @@ public enum CodexRemoteTunnelService {
     public static func restartAppServer(on remote: CodexDesktopRemote) async throws -> Int {
         #if os(macOS)
         let hostname = try sshHostname(for: remote)
+        if let readySession = await firstAuthenticatedRemoteSession(remote: remote, hostname: hostname) {
+            return readySession.port
+        }
+
         try await stopRemoteAppServer(remote: remote, hostname: hostname)
         guard let preferredPort = remotePortCandidates(for: remote).first else {
             throw CodexRemoteTunnelError.tunnelFailed("No remote App Server port candidates are configured.")
@@ -723,28 +727,15 @@ public enum CodexRemoteTunnelService {
                 $tokenPath = Join-Path $env:TEMP "mapofagents-codex-app-server-$port.token"
                 $stdoutPath = Join-Path $env:TEMP "codex-app-server-$port.out.log"
                 $stderrPath = Join-Path $env:TEMP "codex-app-server-$port.err.log"
+                \(windowsTrackedAppServerTokenFunction())
                 $existing = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $port -State Listen -ErrorAction SilentlyContinue
                 if ($existing) {
-                    if ((Test-Path $pidPath) -and (Test-Path $tokenPath)) {
-                        $trackedPid = (Get-Content $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
-                        if ($trackedPid -match '^\\d+$') {
-                            $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $trackedPid" -ErrorAction SilentlyContinue
-                            if ($processInfo -and
-                                $processInfo.CommandLine -match 'codex' -and
-                                $processInfo.CommandLine -match 'app-server' -and
-                                $processInfo.CommandLine -match [regex]::Escape("127.0.0.1:$port") -and
-                                $processInfo.CommandLine -match '--ws-auth' -and
-                                $processInfo.CommandLine -match 'capability-token' -and
-                                $processInfo.CommandLine -match [regex]::Escape($tokenPath)) {
-                                $existingToken = (Get-Content $tokenPath -ErrorAction Stop | Select-Object -First 1).Trim()
-                                if ($existingToken) {
-                                    Write-Output "token:$existingToken"
-                                    exit 0
-                                }
-                            }
-                        }
+                    $existingToken = Find-MapofAgentsTrackedAppServerToken -Port $port
+                    if (-not [string]::IsNullOrWhiteSpace($existingToken)) {
+                        Write-Output "token:$existingToken"
+                        exit 0
                     }
-                    throw "Port $port is already in use by an untracked or unauthenticated App Server."
+                    throw "Port $port is already in use by an app-server without a readable MapofAgents token. Restart MapofAgents on Windows or free the port."
                 }
 
                 $bytes = New-Object 'Byte[]' 32
@@ -915,29 +906,9 @@ public enum CodexRemoteTunnelService {
                 """
                 $ErrorActionPreference = 'Stop'
                 $port = \(remotePort)
-                $pidPath = Join-Path $env:TEMP "mapofagents-codex-app-server-$port.pid"
-                $tokenPath = Join-Path $env:TEMP "mapofagents-codex-app-server-$port.token"
-                if (-not ((Test-Path $pidPath) -and (Test-Path $tokenPath))) {
-                    exit 7
-                }
-                $trackedPid = (Get-Content $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
-                if ($trackedPid -notmatch '^\\d+$') {
-                    exit 7
-                }
-                $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $trackedPid" -ErrorAction SilentlyContinue
-                if (-not $processInfo) {
-                    exit 7
-                }
-                if ($processInfo.CommandLine -notmatch 'codex' -or
-                    $processInfo.CommandLine -notmatch 'app-server' -or
-                    $processInfo.CommandLine -notmatch [regex]::Escape("127.0.0.1:$port") -or
-                    $processInfo.CommandLine -notmatch '--ws-auth' -or
-                    $processInfo.CommandLine -notmatch 'capability-token' -or
-                    $processInfo.CommandLine -notmatch [regex]::Escape($tokenPath)) {
-                    exit 7
-                }
-                $token = (Get-Content $tokenPath -ErrorAction Stop | Select-Object -First 1).Trim()
-                if (-not $token) {
+                \(windowsTrackedAppServerTokenFunction())
+                $token = Find-MapofAgentsTrackedAppServerToken -Port $port
+                if ([string]::IsNullOrWhiteSpace($token)) {
                     exit 7
                 }
                 Write-Output "token:$token"
@@ -1195,18 +1166,23 @@ public enum CodexRemoteTunnelService {
             timeout: timeout,
             maxOutputBytes: maxOutputBytes
         )
+        let stdout = cleanedSSHOutputForDisplay(result.stdout.stringValue)
+        let stderr = cleanedSSHOutputForDisplay(result.stderr.stringValue)
 
         if result.terminationStatus == -1 {
             throw CodexRemoteTunnelError.tunnelFailed("Timed out waiting for the remote SSH command.")
         }
 
         guard result.terminationStatus == 0 else {
+            let detail = stderr.nilIfBlank
+                ?? stdout.nilIfBlank
+                ?? "Remote SSH command failed with exit code \(result.terminationStatus)."
             throw CodexRemoteTunnelError.tunnelFailed(
-                result.stderr.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                detail
             )
         }
 
-        return result.stdout.stringValue
+        return stdout
     }
 
     private static func sshBaseArguments(for remote: CodexDesktopRemote, hostname: String) throws -> [String] {
@@ -1388,6 +1364,144 @@ public enum CodexRemoteTunnelService {
         "'\(value.replacingOccurrences(of: "'", with: "''"))'"
     }
 
+    static func cleanedSSHOutputForDisplay(_ value: String) -> String {
+        var output = value
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        output = output
+            .components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#< CLIXML") }
+            .joined(separator: "\n")
+
+        var clixmlMessages: [String] = []
+        while let start = output.range(of: "<Objs"),
+              let end = output.range(of: "</Objs>", range: start.lowerBound..<output.endIndex) {
+            let block = String(output[start.lowerBound..<end.upperBound])
+            clixmlMessages.append(contentsOf: humanMessages(fromCLIXML: block))
+            output.removeSubrange(start.lowerBound..<end.upperBound)
+        }
+
+        let humanOutput = output
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let decodedMessages = clixmlMessages
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if humanOutput.isEmpty {
+            return decodedMessages.joined(separator: "\n")
+        }
+        if decodedMessages.isEmpty {
+            return humanOutput
+        }
+        return ([humanOutput] + decodedMessages).joined(separator: "\n")
+    }
+
+    private static func humanMessages(fromCLIXML block: String) -> [String] {
+        let patterns = [
+            #"<S S=\"(?:Error|Warning)\">([\s\S]*?)</S>"#,
+            #"<S N=\"Message\">([\s\S]*?)</S>"#,
+        ]
+
+        return patterns.flatMap { pattern -> [String] in
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+            let range = NSRange(block.startIndex..<block.endIndex, in: block)
+            return regex.matches(in: block, range: range).compactMap { match -> String? in
+                guard let messageRange = Range(match.range(at: 1), in: block) else { return nil }
+                return decodePowerShellSerializedText(String(block[messageRange])).nilIfBlank
+            }
+        }
+    }
+
+    private static func decodePowerShellSerializedText(_ value: String) -> String {
+        var decoded = value
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&amp;", with: "&")
+
+        guard let regex = try? NSRegularExpression(pattern: #"_x([0-9A-Fa-f]{4})_"#) else {
+            return decoded
+        }
+
+        let matches = regex.matches(
+            in: decoded,
+            range: NSRange(decoded.startIndex..<decoded.endIndex, in: decoded)
+        )
+        for match in matches.reversed() {
+            guard
+                let fullRange = Range(match.range(at: 0), in: decoded),
+                let hexRange = Range(match.range(at: 1), in: decoded),
+                let scalarValue = UInt32(decoded[hexRange], radix: 16),
+                let scalar = UnicodeScalar(scalarValue)
+            else {
+                continue
+            }
+            decoded.replaceSubrange(fullRange, with: String(Character(scalar)))
+        }
+
+        return decoded
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+    }
+
+    private static func windowsTrackedAppServerTokenFunction() -> String {
+        """
+        function Find-MapofAgentsTrackedAppServerToken {
+            param([int]$Port)
+            $roots = @()
+            if (-not [string]::IsNullOrWhiteSpace($env:TEMP)) {
+                $roots += $env:TEMP
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+                $roots += (Join-Path $env:APPDATA 'MapofAgents\\local-app-server')
+            }
+
+            foreach ($root in $roots) {
+                $pidPath = Join-Path $root "mapofagents-codex-app-server-$Port.pid"
+                $tokenPath = Join-Path $root "mapofagents-codex-app-server-$Port.token"
+                if (-not ((Test-Path -LiteralPath $pidPath -PathType Leaf) -and (Test-Path -LiteralPath $tokenPath -PathType Leaf))) {
+                    continue
+                }
+
+                $trackedPid = (Get-Content -LiteralPath $pidPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+                if ($trackedPid -notmatch '^\\d+$') {
+                    continue
+                }
+
+                $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $trackedPid" -ErrorAction SilentlyContinue
+                if (-not $processInfo) {
+                    continue
+                }
+
+                $commandLine = [string]$processInfo.CommandLine
+                $matchesLoopbackPort = $commandLine -match [regex]::Escape("127.0.0.1:$Port") -or
+                    $commandLine -match [regex]::Escape("ws://127.0.0.1:$Port")
+                if ($commandLine -notmatch 'codex' -or
+                    $commandLine -notmatch 'app-server' -or
+                    -not $matchesLoopbackPort -or
+                    $commandLine -notmatch '--ws-auth' -or
+                    $commandLine -notmatch 'capability-token' -or
+                    $commandLine -notmatch [regex]::Escape($tokenPath)) {
+                    continue
+                }
+
+                $token = (Get-Content -LiteralPath $tokenPath -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($token)) {
+                    return $token
+                }
+            }
+            return $null
+        }
+        """
+    }
+
     private static func windowsPowerShellCommand(_ script: String) -> String {
         let data = script.data(using: .utf16LittleEndian) ?? Data()
         return "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand \(data.base64EncodedString())"
@@ -1476,6 +1590,11 @@ public enum CodexRemoteTunnelService {
 }
 
 private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     var trimmedForDisplay: String {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count > 90 else { return trimmed }
