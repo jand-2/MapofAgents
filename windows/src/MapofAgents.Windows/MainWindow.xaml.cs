@@ -6903,6 +6903,11 @@ public sealed partial class MainWindow : Window
     private bool TryGetAppServerEndpointForThread(CanvasNode node, out AppServerEndpoint endpoint)
     {
         var hostID = node.Metadata.ThreadRef?.HostID ?? node.Metadata.HostID;
+        return TryGetAppServerEndpointForHost(hostID, out endpoint);
+    }
+
+    private bool TryGetAppServerEndpointForHost(string? hostID, out AppServerEndpoint endpoint)
+    {
         if (!string.IsNullOrWhiteSpace(hostID) &&
             _connectedAppServerEndpointsByHostId.TryGetValue(hostID, out var connectedEndpoint))
         {
@@ -10954,7 +10959,6 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        var id = $"thread-{Guid.NewGuid():N}";
         var title = NewThreadNameBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(title))
         {
@@ -10983,20 +10987,61 @@ public sealed partial class MainWindow : Window
                 ? targetNode.Metadata.FolderPath ?? targetNode.Subtitle
                 : DefaultMachineThreadCwd(targetNode);
             var prompt = NewThreadPromptBox.Text.Trim();
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            var endpoint = await ResolveNewThreadTargetEndpointAsync(targetNode, cancellation.Token);
+            if (endpoint is null)
+            {
+                var message = $"Reconnect {targetNode.Title} before creating a thread.";
+                AddActivity(message, showTopNotification: true, notificationKind: ActivityNotificationKindFailed);
+                ShowCommandFeedback(message, CreateThreadButton);
+                return;
+            }
+
+            var appServerClient = new AppServerClient();
+            var threadRef = await appServerClient.StartThreadAsync(
+                endpoint,
+                hostID,
+                cwd,
+                model: model,
+                name: title,
+                approvalPolicy: approvalPolicy,
+                sandboxMode: sandboxMode,
+                cancellationToken: cancellation.Token);
+            threadRef.HostID = string.IsNullOrWhiteSpace(threadRef.HostID) ? hostID : threadRef.HostID;
+            threadRef.Cwd = string.IsNullOrWhiteSpace(threadRef.Cwd) ? cwd : threadRef.Cwd;
+            threadRef.Name = string.IsNullOrWhiteSpace(threadRef.Name) ? title : threadRef.Name;
+
+            AppServerTurnStartResult? startedTurn = null;
+            if (!string.IsNullOrWhiteSpace(prompt))
+            {
+                startedTurn = await appServerClient.StartTurnAsync(
+                    endpoint,
+                    threadRef,
+                    prompt,
+                    model: model,
+                    reasoningEffort: effort,
+                    approvalPolicy: approvalPolicy,
+                    sandboxMode: sandboxMode,
+                    cancellationToken: cancellation.Token);
+            }
+
+            var id = UniqueNodeId(PreferredThreadNodeId(threadRef));
 
             _graph.Nodes[id] = new CanvasNode
             {
                 Id = id,
                 Kind = NodeKinds.CodexThread,
-                Title = title,
-                Subtitle = targetNode.Kind == NodeKinds.Folder ? targetNode.Title : $"Machine chat - {targetNode.Title}",
+                Title = threadRef.Name ?? title,
+                Subtitle = targetNode.Kind == NodeKinds.Folder
+                    ? threadRef.Cwd
+                    : $"Machine chat - {targetNode.Title}",
                 Position = NextThreadPosition(targetNode),
                 Size = CanvasSize.Thread,
                 Metadata = new NodeMetadata
                 {
-                    HostID = hostID,
+                    HostID = threadRef.HostID,
                     Platform = targetNode.Metadata.Platform ?? HostPlatforms.Windows,
-                    RunStatus = ThreadRunStatuses.Idle,
+                    RunStatus = startedTurn is null ? ThreadRunStatuses.Idle : ThreadRunStatuses.Running,
                     Model = model,
                     ReasoningEffort = effort,
                     ThreadKind = ThreadKinds.Thread,
@@ -11014,13 +11059,7 @@ public sealed partial class MainWindow : Window
                                 CreatedAt = DateTimeOffset.UtcNow
                             }
                         },
-                    ThreadRef = new ThreadRef
-                    {
-                        HostID = hostID,
-                        ThreadID = id,
-                        Cwd = cwd,
-                        Name = title
-                    }
+                    ThreadRef = threadRef
                 },
                 ZIndex = _graph.Nodes.Count
             };
@@ -11046,12 +11085,56 @@ public sealed partial class MainWindow : Window
 
             NewThreadPopover.Visibility = Visibility.Collapsed;
             AddActivity($"Created {title}.");
+            if (startedTurn is not null)
+            {
+                AddActivity($"Started initial turn for {title}.");
+            }
+
             await RenderGraphAsync();
+        }
+        catch (Exception exception)
+        {
+            var message = CodexRemoteTunnelService.RedactSensitiveDiagnosticText(exception.Message);
+            AddActivity($"Create thread failed: {message}", showTopNotification: true, notificationKind: ActivityNotificationKindFailed);
+            ShowCommandFeedback($"Create thread failed: {message}", CreateThreadButton);
         }
         finally
         {
             SetNewThreadCreatingState(false);
         }
+    }
+
+    private async Task<AppServerEndpoint?> ResolveNewThreadTargetEndpointAsync(
+        CanvasNode targetNode,
+        CancellationToken cancellationToken)
+    {
+        if (TryGetNewThreadTargetEndpoint(targetNode, out _, out var endpoint))
+        {
+            return endpoint;
+        }
+
+        if (NewThreadTargetIsRemote(targetNode))
+        {
+            return null;
+        }
+
+        AddActivity("Reconnecting local Codex App Server.");
+        var result = await LocalAppServerService.StartOrConnectAsync(
+            _store.ApplicationDataDirectory,
+            cancellationToken);
+        UpsertLocalMachine(
+            HostStatuses.Connected,
+            result,
+            $"Connected via {result.Endpoint.Url}");
+        RegisterLocalAppServerEndpoint(result.Endpoint);
+        SetStatus(HostStatuses.Connected, "Connected", result.Endpoint.Url.ToString());
+        _lastLocalSetupDetail = $"Local Codex App Server is running on {result.Endpoint.Url}.";
+        await SaveGraphAsync();
+        await RefreshNewThreadModelOptionsForHostAsync(
+            LocalHostIdentity.LocalMachineNodeID,
+            result.Endpoint,
+            cancellationToken);
+        return result.Endpoint;
     }
 
     private static string ComboBoxText(ComboBox comboBox, string fallback)

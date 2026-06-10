@@ -204,6 +204,75 @@ public sealed class AppServerEndpointValidatorTests
     }
 
     [TestMethod]
+    public async Task StartThreadAsyncCreatesAndNamesLoopbackAppServerThread()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var server = new FakeCatalogAppServer();
+        var client = new AppServerClient();
+
+        var threadRef = await client.StartThreadAsync(
+            new AppServerEndpoint("Fake App Server", server.Url, null),
+            "fake-host",
+            "C:\\Users\\example\\workspace",
+            model: "gpt-live",
+            name: "Windows Created Thread",
+            approvalPolicy: "never",
+            sandboxMode: "read-only",
+            cancellationToken: cancellation.Token);
+
+        Assert.AreEqual("fake-host", threadRef.HostID);
+        Assert.AreEqual("thread-started-1", threadRef.ThreadID);
+        Assert.AreEqual("C:\\Users\\example\\workspace", threadRef.Cwd);
+        Assert.AreEqual("Windows Created Thread", threadRef.Name);
+        CollectionAssert.Contains(server.ReceivedMethods.ToArray(), "thread/start");
+        CollectionAssert.Contains(server.ReceivedMethods.ToArray(), "thread/name/set");
+    }
+
+    [TestMethod]
+    public async Task StartTurnAsyncLaunchesLoopbackAppServerTurn()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var server = new FakeCatalogAppServer();
+        var client = new AppServerClient();
+
+        var turn = await client.StartTurnAsync(
+            new AppServerEndpoint("Fake App Server", server.Url, null),
+            new ThreadRef
+            {
+                HostID = "fake-host",
+                ThreadID = "thread-started-1",
+                Cwd = "C:\\Users\\example\\workspace",
+                Name = "Windows Created Thread"
+            },
+            "ping",
+            model: "gpt-live",
+            reasoningEffort: "high",
+            approvalPolicy: "never",
+            sandboxMode: "read-only",
+            cancellationToken: cancellation.Token);
+
+        Assert.AreEqual("turn-started-1", turn.TurnId);
+        CollectionAssert.Contains(server.ReceivedMethods.ToArray(), "turn/start");
+    }
+
+    [TestMethod]
+    public async Task InitializeAsyncAllowsServerToDropSocketAfterInitialized()
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var server = new FakeCatalogAppServer(closeAfterInitializedNotification: true);
+        var client = new AppServerClient();
+
+        var result = await client.InitializeAsync(
+            new AppServerEndpoint("Fake App Server", server.Url, null),
+            cancellation.Token);
+
+        Assert.AreEqual("Fake App Server", result.HostName);
+        Assert.AreEqual(HostPlatforms.Windows, result.Platform);
+        CollectionAssert.Contains(server.ReceivedMethods.ToArray(), "initialize");
+        CollectionAssert.Contains(server.ReceivedMethods.ToArray(), "initialized");
+    }
+
+    [TestMethod]
     public async Task ListModelsAsyncReadsLoopbackWebSocketModels()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -251,9 +320,11 @@ public sealed class AppServerEndpointValidatorTests
         private readonly TcpListener _listener;
         private readonly Task _serverTask;
         private readonly CancellationTokenSource _cancellation = new();
+        private readonly bool _closeAfterInitializedNotification;
 
-        public FakeCatalogAppServer()
+        public FakeCatalogAppServer(bool closeAfterInitializedNotification = false)
         {
+            _closeAfterInitializedNotification = closeAfterInitializedNotification;
             _listener = new TcpListener(IPAddress.Loopback, 0);
             _listener.Start();
             var port = ((IPEndPoint)_listener.LocalEndpoint).Port;
@@ -346,6 +417,12 @@ public sealed class AppServerEndpointValidatorTests
                 if (!root.TryGetProperty("id", out var idElement) ||
                     idElement.ValueKind != JsonValueKind.Number)
                 {
+                    if (_closeAfterInitializedNotification &&
+                        string.Equals(method, "initialized", StringComparison.Ordinal))
+                    {
+                        break;
+                    }
+
                     continue;
                 }
 
@@ -354,6 +431,9 @@ public sealed class AppServerEndpointValidatorTests
                 {
                     "initialize" => "{\"id\":" + id + ",\"result\":{\"displayName\":\"Fake App Server\",\"platformOs\":\"windows\",\"codexHome\":\"C:\\\\Users\\\\example\\\\.codex\"}}",
                     "thread/list" => "{\"id\":" + id + ",\"result\":{\"data\":[{\"id\":\"thread-live-catalog-1\",\"cwd\":\"C:\\\\Users\\\\example\\\\workspace\",\"name\":\"Live Catalog Thread\",\"preview\":\"Returned by fake app-server thread/list.\",\"status\":\"running\",\"updatedAt\":\"2026-06-03T21:00:00Z\",\"model\":\"gpt-5\",\"reasoningEffort\":\"high\"}]}}",
+                    "thread/start" => "{\"id\":" + id + ",\"result\":{\"thread\":{\"id\":\"thread-started-1\",\"cwd\":\"C:\\\\Users\\\\example\\\\workspace\"}}}",
+                    "thread/name/set" => "{\"id\":" + id + ",\"result\":{}}",
+                    "turn/start" => "{\"id\":" + id + ",\"result\":{\"turn\":{\"id\":\"turn-started-1\"}}}",
                     "model/list" => "{\"id\":" + id + ",\"result\":{\"data\":[{\"id\":\"gpt-live\",\"displayName\":\"GPT Live\",\"defaultReasoningEffort\":\"medium\",\"supportedReasoningEfforts\":[\"medium\",\"high\"],\"isDefault\":true}]}}",
                     "skills/list" => "{\"id\":" + id + ",\"result\":{\"skills\":[{\"name\":\"taildesk-start-app\",\"path\":\"file:///skills/taildesk-start-app/SKILL.md\",\"interface\":{\"displayName\":\"TailDesk\",\"shortDescription\":\"Start the viewer.\"}}]}}",
                     "plugin/list" => "{\"id\":" + id + ",\"result\":{\"marketplaces\":[{\"name\":\"local\",\"plugins\":[{\"id\":\"browser@local\",\"name\":\"browser\",\"installed\":true,\"interface\":{\"displayName\":\"Browser\",\"shortDescription\":\"Control browser.\"}}]}]}}",

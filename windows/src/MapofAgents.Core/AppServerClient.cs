@@ -43,6 +43,8 @@ public sealed record AppServerThreadTranscript(
     string? NextCursor,
     string RawJson);
 
+public sealed record AppServerTurnStartResult(string? TurnId, string RawJson);
+
 public static class AppServerEndpointValidator
 {
     public static EndpointValidationResult Validate(
@@ -142,7 +144,7 @@ public sealed class AppServerClient
             @params = new { }
         }, cancellationToken).ConfigureAwait(false);
 
-        await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "initialized", cancellationToken).ConfigureAwait(false);
+        await CloseBestEffortAsync(webSocket, "initialized").ConfigureAwait(false);
         return ParseInitializeResult(endpoint.Name, initializeJson);
     }
 
@@ -238,6 +240,137 @@ public sealed class AppServerClient
             cancellationToken).ConfigureAwait(false);
 
         return MentionCatalog.CatalogMentionCandidates(skillsJson, pluginsJson, fileCandidates);
+    }
+
+    public async Task<ThreadRef> StartThreadAsync(
+        AppServerEndpoint endpoint,
+        string hostId,
+        string cwd,
+        string? model = null,
+        string? name = null,
+        string? approvalPolicy = null,
+        string? sandboxMode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(cwd))
+        {
+            throw new InvalidOperationException("A working directory is required to create a Codex thread.");
+        }
+
+        var parameters = new Dictionary<string, object?>
+        {
+            ["cwd"] = cwd.Trim(),
+            ["experimentalRawEvents"] = false
+        };
+        if (!string.IsNullOrWhiteSpace(model))
+        {
+            parameters["model"] = model.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(approvalPolicy))
+        {
+            parameters["approvalPolicy"] = approvalPolicy.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(sandboxMode))
+        {
+            parameters["sandbox"] = sandboxMode.Trim();
+        }
+
+        var result = await RequestAsync(
+            endpoint,
+            "thread/start",
+            parameters,
+            cancellationToken).ConfigureAwait(false);
+
+        var threadRef = ParseThreadRef(
+            result,
+            new ThreadRef
+            {
+                HostID = hostId,
+                Cwd = cwd.Trim(),
+                Name = string.IsNullOrWhiteSpace(name) ? null : name.Trim()
+            },
+            "started");
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            await RequestAsync(
+                endpoint,
+                "thread/name/set",
+                new Dictionary<string, object?>
+                {
+                    ["threadId"] = threadRef.ThreadID,
+                    ["name"] = name.Trim()
+                },
+                cancellationToken).ConfigureAwait(false);
+            threadRef.Name = name.Trim();
+        }
+
+        return threadRef;
+    }
+
+    public async Task<AppServerTurnStartResult> StartTurnAsync(
+        AppServerEndpoint endpoint,
+        ThreadRef threadRef,
+        string message,
+        string? model = null,
+        string? reasoningEffort = null,
+        string? approvalPolicy = null,
+        string? sandboxMode = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(threadRef.ThreadID))
+        {
+            throw new InvalidOperationException("Thread ID is required to start a turn.");
+        }
+
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            throw new InvalidOperationException("A message is required to start a turn.");
+        }
+
+        var parameters = new Dictionary<string, object?>
+        {
+            ["threadId"] = threadRef.ThreadID.Trim(),
+            ["cwd"] = threadRef.Cwd,
+            ["input"] = new object[]
+            {
+                new
+                {
+                    type = "text",
+                    text = message.Trim(),
+                    text_elements = Array.Empty<object>()
+                }
+            }
+        };
+        if (!string.IsNullOrWhiteSpace(model))
+        {
+            parameters["model"] = model.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(reasoningEffort))
+        {
+            parameters["effort"] = reasoningEffort.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(approvalPolicy))
+        {
+            parameters["approvalPolicy"] = approvalPolicy.Trim();
+        }
+
+        var sandboxPolicy = SandboxPolicy(sandboxMode, threadRef.Cwd);
+        if (sandboxPolicy is not null)
+        {
+            parameters["sandboxPolicy"] = sandboxPolicy;
+        }
+
+        var result = await RequestAsync(
+            endpoint,
+            "turn/start",
+            parameters,
+            cancellationToken).ConfigureAwait(false);
+
+        return new AppServerTurnStartResult(ParseTurnId(result), result);
     }
 
     public async Task<AppServerThreadTranscript> LoadThreadTranscriptAsync(
@@ -412,6 +545,11 @@ public sealed class AppServerClient
 
     public static ThreadRef ParseForkedThread(string json, ThreadRef sourceThreadRef)
     {
+        return ParseThreadRef(json, sourceThreadRef, "forked");
+    }
+
+    private static ThreadRef ParseThreadRef(string json, ThreadRef sourceThreadRef, string operation)
+    {
         using var document = JsonDocument.Parse(json);
         var payload = document.RootElement.TryGetProperty("result", out var resultElement)
             ? resultElement
@@ -425,7 +563,7 @@ public sealed class AppServerClient
             TryReadString(thread, "threadID");
         if (string.IsNullOrWhiteSpace(threadID))
         {
-            throw new InvalidOperationException("Codex App Server did not return a forked thread ID.");
+            throw new InvalidOperationException($"Codex App Server did not return a {operation} thread ID.");
         }
 
         return new ThreadRef
@@ -434,6 +572,45 @@ public sealed class AppServerClient
             ThreadID = threadID,
             Cwd = TryReadString(thread, "cwd") ?? TryReadString(payload, "cwd") ?? sourceThreadRef.Cwd,
             Name = TryReadString(thread, "name") ?? TryReadString(thread, "title") ?? sourceThreadRef.Name
+        };
+    }
+
+    private static string? ParseTurnId(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        var payload = document.RootElement.TryGetProperty("result", out var resultElement)
+            ? resultElement
+            : document.RootElement;
+        var turn = payload.TryGetProperty("turn", out var turnElement) && turnElement.ValueKind == JsonValueKind.Object
+            ? turnElement
+            : payload;
+        return TryReadString(turn, "id") ??
+            TryReadString(turn, "turnId") ??
+            TryReadString(turn, "turnID");
+    }
+
+    private static object? SandboxPolicy(string? sandboxMode, string cwd)
+    {
+        return sandboxMode?.Trim() switch
+        {
+            "danger-full-access" => new Dictionary<string, object?>
+            {
+                ["type"] = "dangerFullAccess"
+            },
+            "read-only" => new Dictionary<string, object?>
+            {
+                ["type"] = "readOnly",
+                ["networkAccess"] = true
+            },
+            "workspace-write" => new Dictionary<string, object?>
+            {
+                ["type"] = "workspaceWrite",
+                ["writableRoots"] = new[] { cwd },
+                ["networkAccess"] = true,
+                ["excludeTmpdirEnvVar"] = false,
+                ["excludeSlashTmp"] = false
+            },
+            _ => null
         };
     }
 
@@ -662,8 +839,30 @@ public sealed class AppServerClient
         }, cancellationToken).ConfigureAwait(false);
 
         var response = await ReceiveResponseTextAsync(webSocket, expectedId: 2, cancellationToken).ConfigureAwait(false);
-        await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, method, cancellationToken).ConfigureAwait(false);
+        await CloseBestEffortAsync(webSocket, method).ConfigureAwait(false);
         return response;
+    }
+
+    private static async Task CloseBestEffortAsync(
+        ClientWebSocket webSocket,
+        string statusDescription)
+    {
+        if (webSocket.State is not (WebSocketState.Open or WebSocketState.CloseReceived))
+        {
+            return;
+        }
+
+        try
+        {
+            using var closeCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            await webSocket.CloseAsync(
+                WebSocketCloseStatus.NormalClosure,
+                statusDescription,
+                closeCancellation.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+        }
     }
 
     private static async Task<string> InitializeWebSocketAsync(

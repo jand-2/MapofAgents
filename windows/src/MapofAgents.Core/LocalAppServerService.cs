@@ -20,7 +20,7 @@ public static class LocalAppServerService
     public const int PreferredWindowsPort = 14_500;
     public const int FallbackPort = 18_945;
     private const string LocalAppServerDirectoryName = "local-app-server";
-    private static readonly TimeSpan InitializeTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan InitializeTimeout = TimeSpan.FromSeconds(25);
 
     public static IReadOnlyList<int> PortCandidates { get; } = [PreferredWindowsPort, FallbackPort];
 
@@ -42,6 +42,7 @@ public static class LocalAppServerService
         foreach (var port in PortCandidates)
         {
             var paths = LocalAppServerPaths.For(supportDirectory, port);
+            var launchedServer = false;
             try
             {
                 var hadTrackedServer = HasTrackedServer(paths);
@@ -65,6 +66,7 @@ public static class LocalAppServerService
                 var token = GenerateToken();
                 await File.WriteAllTextAsync(paths.TokenPath, token, cancellationToken).ConfigureAwait(false);
                 var process = StartCodexAppServer(port, paths);
+                launchedServer = true;
                 await File.WriteAllTextAsync(paths.PidPath, process.Id.ToString(), cancellationToken).ConfigureAwait(false);
 
                 var endpoint = EndpointFor(port, token);
@@ -74,6 +76,10 @@ public static class LocalAppServerService
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
                 lastError = exception;
+                if (launchedServer)
+                {
+                    break;
+                }
             }
         }
 
@@ -420,8 +426,8 @@ foreach ($line in $lines) {
 
         throw new LocalAppServerException(
             lastError is null
-                ? "Local Codex App Server did not answer initialize."
-                : $"Local Codex App Server did not answer initialize: {lastError.Message}",
+                ? $"Local Codex App Server did not answer initialize on {endpoint.Url}."
+                : $"Local Codex App Server did not answer initialize on {endpoint.Url}: {lastError.Message}",
             lastError);
     }
 
