@@ -120,3 +120,13 @@ Date: 2026-06-10
 - Added a machine-node context-menu action for opening Codex remote diagnostics.
 - Shortened the Windows remote app-server start command to avoid PowerShell SSH command-length parsing failures.
 - Made restart recovery skip untracked occupied app-server ports and continue through configured port candidates.
+
+## 546cfd0 - Refine Windows machine diagnostics UI
+
+Date: 2026-06-10
+
+- Removed the Windows Health toolbar presentation now that Machines owns connection recovery.
+- Added compact Codex remote diagnostics summaries that stay quiet when checks pass and expose Remote Diagnostics only for warning or failed states.
+- Added a conditional connection refresh row for local runtime, remote route, and diagnostics attention states.
+- Synced local App Server status from graph routes and cleared stale local endpoint registrations when routes are removed.
+- Added Windows presentation tests for diagnostics summaries and updated machine action tests.
