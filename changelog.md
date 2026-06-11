@@ -130,3 +130,21 @@ Date: 2026-06-10
 - Added a conditional connection refresh row for local runtime, remote route, and diagnostics attention states.
 - Synced local App Server status from graph routes and cleared stale local endpoint registrations when routes are removed.
 - Added Windows presentation tests for diagnostics summaries and updated machine action tests.
+
+## 4854d7c - Add thread automation controls
+
+Date: 2026-06-11
+
+- Added local Codex automation discovery for thread-linked automations.
+- Added alarm indicators on macOS thread nodes and open thread windows.
+- Added an in-canvas automation editor for name, prompt, status, and schedule changes with Daily, Weekly, and Custom RRULE controls.
+- Added next-run display and focused Swift tests for automation parsing, scheduling, and saving.
+
+## 4c5a238 - Add Windows thread automation controls
+
+Date: 2026-06-11
+
+- Added Windows Codex automation discovery, scheduling, and TOML update support.
+- Added alarm indicators to Windows graph nodes, node context menus, and thread popovers.
+- Added a Windows automation editing dialog with matching status, prompt, and schedule controls.
+- Added Windows presentation and automation store tests.
