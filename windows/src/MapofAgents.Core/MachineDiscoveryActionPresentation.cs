@@ -8,7 +8,6 @@ public readonly record struct MachineDiscoveryActionPresentationSnapshot(
 
 public static class MachineDiscoveryActionPresentation
 {
-    public const string DiagnoseToolTip = "Diagnose remote Codex over SSH";
     public const string ConnectToolTip = "Start remote App Server and connect through SSH";
     public const string SetupUnavailableReason = "This Codex remote needs SSH setup before it can connect.";
     public const string BusyUnavailableReason = "Remote diagnostics are already running.";
@@ -16,17 +15,6 @@ public static class MachineDiscoveryActionPresentation
     public const string FillEndpointUnavailableReason = "This tailnet entry does not expose a usable App Server endpoint.";
     public const double AvailableOpacity = 1.0;
     public const double UnavailableOpacity = 0.48;
-
-    public static MachineDiscoveryActionPresentationSnapshot DiagnoseCodexRemote(
-        bool isConnectable,
-        bool isBusy)
-    {
-        return CodexRemoteAction(
-            isConnectable,
-            isBusy,
-            DiagnoseToolTip,
-            "Diagnose remote");
-    }
 
     public static MachineDiscoveryActionPresentationSnapshot ConnectCodexRemote(
         bool isConnectable,

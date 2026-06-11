@@ -1010,30 +1010,11 @@ public sealed partial class MainWindow : Window
             SubagentsButton,
             _showsSubagents ? presentation.Purple : presentation.Bordered);
         ApplyToolbarButtonChrome(SearchButton, presentation.Plain);
-        ApplyToolbarSplitButtonChrome(
-            HealthButton,
-            ToolbarButtonChromePresentation.Plain(ToolbarButtonChromePresentation.PlainSplitStyleKey));
         ApplyToolbarButtonChrome(ActivityButton, presentation.Plain);
         ApplyToolbarButtonChrome(PairButton, presentation.Plain);
     }
 
     private static void ApplyToolbarButtonChrome(Button button, ToolbarButtonChromeRoleSnapshot role)
-    {
-        button.MinHeight = role.MinHeight;
-        button.Padding = new Thickness(
-            role.HorizontalPadding,
-            role.VerticalPadding,
-            role.HorizontalPadding,
-            role.VerticalPadding);
-        button.Background = BrushFromHex(role.BackgroundHex);
-        button.BorderBrush = BrushFromHex(role.BorderHex);
-        button.BorderThickness = new Thickness(role.BorderThickness);
-        button.CornerRadius = new CornerRadius(role.CornerRadius);
-        button.Foreground = BrushFromHex(role.ForegroundHex);
-        button.FontSize = role.FontSize;
-    }
-
-    private static void ApplyToolbarSplitButtonChrome(SplitButton button, ToolbarButtonChromeRoleSnapshot role)
     {
         button.MinHeight = role.MinHeight;
         button.Padding = new Thickness(
@@ -2333,7 +2314,7 @@ public sealed partial class MainWindow : Window
             await RefreshWorkflowMembershipsAsync();
             RebuildAppServerEndpointsFromGraph();
             StartWorkflowHookEventBridge();
-            SetStatus(HostStatuses.Disconnected, "Not connected", "Loaded local control-room graph.");
+            SyncLocalRuntimeStatusFromGraph();
             AddActivity("Loaded local control-room graph.");
             UpdateChrome();
             if (AppServerCatalogEndpoints().Any())
@@ -3241,44 +3222,6 @@ public sealed partial class MainWindow : Window
         return value.Length == 6 ? $"#1F{value}" : "#1AFFFFFF";
     }
 
-    private async void DiagnoseRemoteDiscoveryButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is not FrameworkElement { DataContext: RemoteDiscoveryItem item })
-        {
-            return;
-        }
-
-        if (item.IsCodexRemote)
-        {
-            if (!item.CanDiagnose)
-            {
-                AddActivity(item.DiagnoseTooltip);
-                ShowCommandFeedback(item.DiagnoseTooltip);
-                return;
-            }
-
-            await RunCodexRemoteOperationAsync(item.RemoteId, connect: false);
-            return;
-        }
-
-        _isMachinesRailVisible = true;
-        _isMachinesRailCollapsed = false;
-        _expandedMachineHealthItemId = string.IsNullOrWhiteSpace(item.SourceNodeId)
-            ? _expandedMachineHealthItemId
-            : item.SourceNodeId;
-        if (string.Equals(item.StatusKey, HostStatuses.Disconnected, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(item.StatusKey, HostStatuses.Unavailable, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(item.StatusKey, HostStatuses.Connecting, StringComparison.OrdinalIgnoreCase))
-        {
-            _isMachineRecoveryVisible = true;
-        }
-
-        RefreshMachineHealth(
-            showMachinesRail: true,
-            detail: $"Checked discovery details for {item.Title}.",
-            activityMessage: $"Checked {item.Title} remote details.");
-    }
-
     private async void ConnectCodexRemoteDiscoveryButton_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement { DataContext: RemoteDiscoveryItem item })
@@ -3294,17 +3237,6 @@ public sealed partial class MainWindow : Window
         }
 
         await RunCodexRemoteOperationAsync(item.RemoteId, connect: true);
-    }
-
-    private async void CodexRemoteDiagnosticActionButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is not FrameworkElement { DataContext: CodexRemoteDiagnosticItem item } ||
-            string.IsNullOrWhiteSpace(item.Action))
-        {
-            return;
-        }
-
-        await RunCodexRemoteActionAsync(item.RemoteId, item.Action);
     }
 
     private async Task RunCodexRemoteOperationAsync(string remoteId, bool connect)
@@ -4033,38 +3965,6 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void HealthButton_Click(SplitButton sender, SplitButtonClickEventArgs e)
-    {
-        await CheckMachineHealthFromToolbarAsync();
-    }
-
-    private async Task CheckMachineHealthFromToolbarAsync()
-    {
-        WorkflowPopover.Visibility = Visibility.Collapsed;
-        WorkflowNamePopover.Visibility = Visibility.Collapsed;
-        NewThreadPopover.Visibility = Visibility.Collapsed;
-        PairingPopover.Visibility = Visibility.Collapsed;
-        HealthPopover.Visibility = Visibility.Collapsed;
-        await RefreshMachineHealthAsync(
-            showMachinesRail: MachinesNeedingRecovery().Any(),
-            detail: "Machine health checked from the toolbar.",
-            activityMessage: "Checking machine health.",
-            discoverMachines: true);
-        HealthPopover.Visibility = Visibility.Visible;
-        UpdateChrome();
-    }
-
-    private void HealthMenuButton_Click(object sender, RoutedEventArgs e)
-    {
-        var shouldShowPopover = HealthPopover.Visibility != Visibility.Visible;
-        WorkflowPopover.Visibility = Visibility.Collapsed;
-        WorkflowNamePopover.Visibility = Visibility.Collapsed;
-        NewThreadPopover.Visibility = Visibility.Collapsed;
-        PairingPopover.Visibility = Visibility.Collapsed;
-        HealthPopover.Visibility = shouldShowPopover ? Visibility.Visible : Visibility.Collapsed;
-        UpdateChrome();
-    }
-
     private void CloseHealthPopoverButton_Click(object sender, RoutedEventArgs e)
     {
         HealthPopover.Visibility = Visibility.Collapsed;
@@ -4290,6 +4190,12 @@ public sealed partial class MainWindow : Window
         machine.Metadata.HostLastError = null;
         machine.Metadata.AppServerEndpointUrl = null;
         StopCodexRemoteTunnel(machine.Id);
+        if (IsLocalHostId(machine.Metadata.HostID))
+        {
+            UnregisterLocalAppServerEndpoint(machine);
+            SyncLocalRuntimeStatusFromGraph();
+        }
+
         await SaveGraphAsync();
         AddActivity($"Removed stale route for {machine.Title}.");
         UpdateChrome();
@@ -5025,6 +4931,12 @@ public sealed partial class MainWindow : Window
         machine.Metadata.HostStatus = HostStatuses.Disconnected;
         machine.Metadata.HostLastError = null;
         StopCodexRemoteTunnel(machine.Id);
+        if (IsLocalHostId(machine.Metadata.HostID))
+        {
+            UnregisterLocalAppServerEndpoint(machine);
+            SyncLocalRuntimeStatusFromGraph();
+        }
+
         await SaveGraphAsync();
         AddActivity($"Disconnected {machine.Title}.");
         UpdateChrome();
@@ -6939,14 +6851,21 @@ public sealed partial class MainWindow : Window
                 string.Equals(candidate.Id, hostID, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(candidate.Metadata.HostID, hostID, StringComparison.OrdinalIgnoreCase));
         if (machine is not null &&
-            !IsLocalHostId(machine.Metadata.HostID) &&
             machine.Metadata.HostStatus == HostStatuses.Connected &&
             !string.IsNullOrWhiteSpace(machine.Metadata.AppServerEndpointUrl) &&
             Uri.TryCreate(machine.Metadata.AppServerEndpointUrl, UriKind.Absolute, out var url) &&
             AppServerEndpointValidator.IsLoopback(url))
         {
             endpoint = new AppServerEndpoint(machine.Title, url, null);
-            _connectedAppServerEndpointsByHostId[machine.Id] = endpoint;
+            if (IsLocalHostId(machine.Metadata.HostID))
+            {
+                RegisterLocalAppServerEndpoint(endpoint);
+            }
+            else
+            {
+                _connectedAppServerEndpointsByHostId[machine.Id] = endpoint;
+            }
+
             return true;
         }
 
@@ -8398,6 +8317,11 @@ public sealed partial class MainWindow : Window
                 AppServerEndpointUrl = endpointUrl
             }
         };
+
+        if (status != HostStatuses.Connected)
+        {
+            UnregisterLocalAppServerEndpoint(_graph.Nodes[id]);
+        }
     }
 
     private void RegisterLocalAppServerEndpoint(AppServerEndpoint endpoint)
@@ -8407,6 +8331,16 @@ public sealed partial class MainWindow : Window
         if (LocalMachineNode() is { } machine)
         {
             _connectedAppServerEndpointsByHostId[machine.Id] = endpoint;
+        }
+    }
+
+    private void UnregisterLocalAppServerEndpoint(CanvasNode? localMachine = null)
+    {
+        _connectedAppServerEndpointsByHostId.Remove(LocalHostIdentity.CanonicalHostID);
+        _connectedAppServerEndpointsByHostId.Remove(LocalHostIdentity.LocalMachineNodeID);
+        if (localMachine is not null)
+        {
+            _connectedAppServerEndpointsByHostId.Remove(localMachine.Id);
         }
     }
 
@@ -10095,24 +10029,6 @@ public sealed partial class MainWindow : Window
         ArrangeRightRect.Stroke = arrangeStroke;
         ToolTipService.SetToolTip(ArrangeButton, arrangePresentation.ToolTip);
         AutomationProperties.SetName(ArrangeButton, arrangePresentation.AccessibilityName);
-        var healthPresentation = ToolbarHealthPresentation.Resolve(IsMachineHealthRefreshRunning);
-        var healthIconBrush = BrushFromHex(healthPresentation.IconHex);
-        HealthIcon.Width = healthPresentation.IconWidth;
-        HealthIcon.Height = healthPresentation.IconHeight;
-        HealthRefreshIcon.Width = healthPresentation.IconWidth;
-        HealthRefreshIcon.Height = healthPresentation.IconHeight;
-        HealthRefreshIcon.Visibility = healthPresentation.ShowsHeartTextSquareIcon ? Visibility.Collapsed : Visibility.Visible;
-        HealthRefreshArrowPath.Stroke = healthIconBrush;
-        HealthRefreshArrowPath.StrokeThickness = healthPresentation.StrokeThickness;
-        HealthHeartCardIcon.Width = healthPresentation.IconWidth;
-        HealthHeartCardIcon.Height = healthPresentation.IconHeight;
-        HealthHeartCardIcon.Visibility = healthPresentation.ShowsHeartTextSquareIcon ? Visibility.Visible : Visibility.Collapsed;
-        HealthHeartSquareOutline.BorderBrush = healthIconBrush;
-        HealthHeartPath.Fill = healthIconBrush;
-        HealthTextLineTop.Background = healthIconBrush;
-        HealthTextLineBottom.Background = healthIconBrush;
-        HealthButton.Opacity = healthPresentation.Opacity;
-        ToolTipService.SetToolTip(HealthButton, healthPresentation.ToolTip);
         var activityPresentation = ToolbarActivityPresentation.Resolve();
         var activityForeground = BrushFromHex(activityPresentation.StrokeHex);
         ActivityIcon.Width = activityPresentation.IconWidth;
@@ -10418,9 +10334,31 @@ public sealed partial class MainWindow : Window
 
     private bool HasUsableLocalAppServerEndpoint(CanvasNode localMachine)
     {
-        return _connectedAppServerEndpointsByHostId.ContainsKey(localMachine.Id) ||
-            _connectedAppServerEndpointsByHostId.ContainsKey(LocalHostIdentity.CanonicalHostID) ||
-            _connectedAppServerEndpointsByHostId.ContainsKey(LocalHostIdentity.LocalMachineNodeID);
+        return TryGetUsableLocalAppServerEndpoint(localMachine, out _);
+    }
+
+    private bool TryGetUsableLocalAppServerEndpoint(CanvasNode localMachine, out AppServerEndpoint endpoint)
+    {
+        if (_connectedAppServerEndpointsByHostId.TryGetValue(localMachine.Id, out var cachedEndpoint) ||
+            _connectedAppServerEndpointsByHostId.TryGetValue(LocalHostIdentity.CanonicalHostID, out cachedEndpoint) ||
+            _connectedAppServerEndpointsByHostId.TryGetValue(LocalHostIdentity.LocalMachineNodeID, out cachedEndpoint))
+        {
+            endpoint = cachedEndpoint;
+            return true;
+        }
+
+        if (localMachine.Metadata.HostStatus == HostStatuses.Connected &&
+            !string.IsNullOrWhiteSpace(localMachine.Metadata.AppServerEndpointUrl) &&
+            Uri.TryCreate(localMachine.Metadata.AppServerEndpointUrl, UriKind.Absolute, out var url) &&
+            AppServerEndpointValidator.IsLoopback(url))
+        {
+            endpoint = new AppServerEndpoint(localMachine.Title, url, null);
+            RegisterLocalAppServerEndpoint(endpoint);
+            return true;
+        }
+
+        endpoint = new AppServerEndpoint("", new Uri("ws://127.0.0.1"), null);
+        return false;
     }
 
     private bool HasRemoteDiagnosticsAttention()
@@ -10536,8 +10474,8 @@ public sealed partial class MainWindow : Window
         HealthSummaryText.Text = _lastDiagnosticsSummary;
         HealthDetailText.Text = _lastDiagnosticsDetail;
         UpdateLocalMachineSetupRow();
+        UpdateConnectionRefreshRow();
         MachineRecoveryToggleText.Text = _isMachineRecoveryVisible ? "Hide Machine Recovery" : "Show Machine Recovery";
-        MachineRecoveryMenuItem.Text = _isMachineRecoveryVisible ? "Hide Machine Recovery" : "Show Machine Recovery";
         RecoveryActionCountText.Text = $"{recoveryTargets.Count} action{(recoveryTargets.Count == 1 ? "" : "s")}";
         RecoveryEmptyText.Visibility = MachineRecoveryPresentation.Rail().ShowsEmptyState && recoveryTargets.Count == 0
             ? Visibility.Visible
@@ -10600,6 +10538,68 @@ public sealed partial class MainWindow : Window
         SetupLocalMachineButtonText.Text = "Start Local Codex";
         LocalMachineSetupStatusText.Text = _lastLocalSetupDetail
             ?? "Start the local Codex App Server and register this PC.";
+    }
+
+    private void UpdateConnectionRefreshRow()
+    {
+        var shouldShow = ShouldShowConnectionRefreshRow();
+        ConnectionRefreshRow.Visibility = shouldShow ? Visibility.Visible : Visibility.Collapsed;
+        var isRefreshing = IsMachineHealthRefreshRunning;
+        var foreground = isRefreshing
+            ? ThreadInboxPresentation.BlueHex
+            : shouldShow
+                ? ThreadInboxPresentation.OrangeHex
+                : ThreadInboxPresentation.SecondaryHex;
+        ConnectionRefreshIcon.Glyph = isRefreshing ? "\uE895" : "\uE72C";
+        ConnectionRefreshIcon.Foreground = BrushFromHex(foreground);
+        RefreshConnectionsButton.IsEnabled = !isRefreshing;
+        RefreshConnectionsButton.Opacity = isRefreshing ? 0.64 : 1.0;
+        RefreshConnectionsButtonIcon.Glyph = isRefreshing ? "\uE895" : "\uE72C";
+        RefreshConnectionsButtonText.Text = isRefreshing ? "Refreshing Connections" : "Refresh Connections";
+        var detail = ConnectionRefreshDetail();
+        ConnectionRefreshStatusText.Text = detail;
+        ToolTipService.SetToolTip(RefreshConnectionsButton, detail);
+        AutomationProperties.SetHelpText(RefreshConnectionsButton, detail);
+    }
+
+    private bool ShouldShowConnectionRefreshRow()
+    {
+        return IsMachineHealthRefreshRunning ||
+            _localRuntimeStatus != HostStatuses.Connected ||
+            MachineNodes.Any(MachineNeedsConnectionRefresh) ||
+            HasRemoteDiagnosticsAttention();
+    }
+
+    private string ConnectionRefreshDetail()
+    {
+        if (IsMachineHealthRefreshRunning)
+        {
+            return "Checking local runtime, saved routes, and discovered Codex remotes.";
+        }
+
+        if (_localRuntimeStatus != HostStatuses.Connected)
+        {
+            return "Local App Server is not connected.";
+        }
+
+        var recoveryCount = MachineNodes.Count(MachineNeedsConnectionRefresh);
+        if (recoveryCount > 0)
+        {
+            return $"{recoveryCount} machine route{(recoveryCount == 1 ? "" : "s")} need attention.";
+        }
+
+        if (HasRemoteDiagnosticsAttention())
+        {
+            return "Remote diagnostics need attention.";
+        }
+
+        return "Refresh local and remote machine routes.";
+    }
+
+    private static bool MachineNeedsConnectionRefresh(CanvasNode machine)
+    {
+        return machine.Metadata.HostStatus != HostStatuses.Connected ||
+            !string.IsNullOrWhiteSpace(machine.Metadata.HostLastError);
     }
 
     private void UpdateMachineDiscoverySections()
@@ -10783,14 +10783,10 @@ public sealed partial class MainWindow : Window
         item.IsBusy = _codexRemoteOperationIds.Contains(item.RemoteId);
         item.ApplyCodexRemoteActionPresentation();
 
-        item.Diagnostics.Clear();
-        if (_codexRemoteDiagnostics.TryGetValue(item.RemoteId, out var diagnostics))
-        {
-            foreach (var step in diagnostics)
-            {
-                item.Diagnostics.Add(CodexRemoteDiagnosticItem.FromStep(item.RemoteId, step, item.IsBusy));
-            }
-        }
+        var diagnostics = _codexRemoteDiagnostics.TryGetValue(item.RemoteId, out var steps)
+            ? steps
+            : [];
+        item.ApplyCodexRemoteDiagnosticsSummary(diagnostics);
     }
 
     private static string? DiscoveryKey(string? value)
@@ -12832,7 +12828,6 @@ public sealed partial class MainWindow : Window
         foreach (var machine in MachineNodes)
         {
             if (machine.Metadata.HostStatus != HostStatuses.Connected ||
-                IsLocalHostId(machine.Metadata.HostID) ||
                 string.IsNullOrWhiteSpace(machine.Metadata.AppServerEndpointUrl) ||
                 !Uri.TryCreate(machine.Metadata.AppServerEndpointUrl, UriKind.Absolute, out var url) ||
                 !AppServerEndpointValidator.IsLoopback(url))
@@ -12840,7 +12835,15 @@ public sealed partial class MainWindow : Window
                 continue;
             }
 
-            _connectedAppServerEndpointsByHostId[machine.Id] = new AppServerEndpoint(machine.Title, url, null);
+            var endpoint = new AppServerEndpoint(machine.Title, url, null);
+            if (IsLocalHostId(machine.Metadata.HostID))
+            {
+                RegisterLocalAppServerEndpoint(endpoint);
+            }
+            else
+            {
+                _connectedAppServerEndpointsByHostId[machine.Id] = endpoint;
+            }
         }
     }
 
@@ -13919,6 +13922,55 @@ public sealed partial class MainWindow : Window
     {
         var json = JsonSerializer.Serialize(node, MapofAgentsJson.Options);
         return JsonSerializer.Deserialize<CanvasNode>(json, MapofAgentsJson.Options) ?? new CanvasNode();
+    }
+
+    private void SyncLocalRuntimeStatusFromGraph()
+    {
+        var localMachine = LocalMachineNode();
+        if (localMachine is null)
+        {
+            UnregisterLocalAppServerEndpoint();
+            SetStatus(
+                HostStatuses.Disconnected,
+                "Not connected",
+                "No local machine node is registered.");
+            return;
+        }
+
+        var status = localMachine.Metadata.HostStatus ?? HostStatuses.Disconnected;
+        if (status == HostStatuses.Connected &&
+            TryGetUsableLocalAppServerEndpoint(localMachine, out var endpoint))
+        {
+            SetStatus(HostStatuses.Connected, "Connected", endpoint.Url.ToString());
+            return;
+        }
+
+        if (status == HostStatuses.Unavailable)
+        {
+            UnregisterLocalAppServerEndpoint(localMachine);
+            var detail = localMachine.Metadata.HostLastError
+                ?? _lastLocalSetupDetail
+                ?? "Local Codex setup needs attention.";
+            SetStatus(HostStatuses.Unavailable, "Local setup failed", detail);
+            return;
+        }
+
+        if (status == HostStatuses.Connecting)
+        {
+            SetStatus(
+                HostStatuses.Connecting,
+                "Connecting",
+                _lastLocalSetupDetail ?? "Starting local Codex App Server...");
+            return;
+        }
+
+        UnregisterLocalAppServerEndpoint(localMachine);
+        SetStatus(
+            HostStatuses.Disconnected,
+            "Not connected",
+            status == HostStatuses.Connected
+                ? "Connected machine node found; start the local App Server route."
+                : "Local Codex App Server is not connected.");
     }
 
     private void SetStatus(string status, string message, string detail)
@@ -15364,25 +15416,15 @@ public sealed class RemoteDiscoveryItem
 
     public bool IsBusy { get; set; }
 
-    public bool CanDiagnose { get; set; } = true;
-
     public bool CanConnect { get; set; }
-
-    public double DiagnoseOpacity { get; set; } = MachineDiscoveryActionPresentation.AvailableOpacity;
 
     public double ConnectOpacity { get; set; } = MachineDiscoveryActionPresentation.AvailableOpacity;
 
     public Visibility ConnectVisibility => IsCodexRemote ? Visibility.Visible : Visibility.Collapsed;
 
-    public Visibility DiagnosticsVisibility => IsCodexRemote ? Visibility.Visible : Visibility.Collapsed;
-
-    public string DiagnoseTooltip { get; set; } = "Diagnose remote";
-
     public string ConnectTooltip { get; set; } = "Start remote App Server and connect through SSH";
 
     public string DiagnosticsTooltip { get; set; } = "Open remote diagnostics";
-
-    public string DiagnoseAutomationName { get; set; } = "Diagnose remote";
 
     public string ConnectAutomationName { get; set; } = "Connect Codex remote";
 
@@ -15390,7 +15432,27 @@ public sealed class RemoteDiscoveryItem
 
     public bool ShowFillEndpointAction { get; set; }
 
-    public ObservableCollection<CodexRemoteDiagnosticItem> Diagnostics { get; } = [];
+    public string DiagnosticsSummaryGlyph { get; set; } = "";
+
+    public string DiagnosticsSummaryText { get; set; } = "";
+
+    public SolidColorBrush DiagnosticsSummaryBrush { get; set; } = Brush("#A7B0BF");
+
+    public bool ShowsDiagnosticsSummary { get; set; }
+
+    public bool ShowsDiagnosticsButton { get; set; }
+
+    public Visibility DiagnosticsSummaryVisibility =>
+        ShowsDiagnosticsSummary ? Visibility.Visible : Visibility.Collapsed;
+
+    public Visibility DiagnosticsSummaryButtonVisibility =>
+        ShowsDiagnosticsButton ? Visibility.Visible : Visibility.Collapsed;
+
+    public Thickness DiagnosticsSummaryMargin { get; set; } = new(
+        MachineDiscoverySectionPresentation.DiagnosticLeftPadding,
+        0,
+        0,
+        MachineDiscoverySectionPresentation.DiagnosticBottomGap);
 
     public SolidColorBrush StatusBrush { get; set; } = Brush("#A7B0BF");
 
@@ -15582,16 +15644,27 @@ public sealed class RemoteDiscoveryItem
 
     public void ApplyCodexRemoteActionPresentation()
     {
-        var diagnose = MachineDiscoveryActionPresentation.DiagnoseCodexRemote(IsConnectable, IsBusy);
         var connect = MachineDiscoveryActionPresentation.ConnectCodexRemote(IsConnectable, IsBusy);
-        CanDiagnose = diagnose.CanInvoke;
-        DiagnoseOpacity = diagnose.Opacity;
-        DiagnoseTooltip = diagnose.ToolTip;
-        DiagnoseAutomationName = diagnose.AutomationName;
         CanConnect = connect.CanInvoke;
         ConnectOpacity = connect.Opacity;
         ConnectTooltip = connect.ToolTip;
         ConnectAutomationName = connect.AutomationName;
+    }
+
+    public void ApplyCodexRemoteDiagnosticsSummary(IEnumerable<RuntimeDiagnosticStep> diagnostics)
+    {
+        var presentation = CodexRemoteDiagnosticsSummaryPresentation.Resolve(diagnostics, IsBusy);
+        ShowsDiagnosticsSummary = presentation.ShowsSummary;
+        ShowsDiagnosticsButton = presentation.ShowsDiagnosticsButton;
+        DiagnosticsSummaryGlyph = presentation.Glyph;
+        DiagnosticsSummaryText = presentation.Text;
+        DiagnosticsSummaryBrush = Brush(presentation.ForegroundHex);
+        DiagnosticsTooltip = presentation.ToolTip;
+        DiagnosticsAutomationName = presentation.AutomationName;
+        if (presentation.ShowsSummary)
+        {
+            StatusBrush = Brush(presentation.ForegroundHex);
+        }
     }
 
     private static SolidColorBrush Brush(string hex)

@@ -541,116 +541,6 @@
                     </StackPanel>
                 </Button>
 
-                <controls:SplitButton
-                    x:Name="HealthButton"
-                    Click="HealthButton_Click"
-                    Style="{StaticResource ToolbarPlainSplitButtonStyle}"
-                    AutomationProperties.AutomationId="HealthButton"
-                    AutomationProperties.Name="Health"
-                    ToolTipService.ToolTip="Refresh machine and runtime health">
-                    <controls:SplitButton.Flyout>
-                        <MenuFlyout>
-                            <MenuFlyoutItem
-                                Text="Refresh Now"
-                                Click="RefreshHealthButton_Click">
-                                <MenuFlyoutItem.Icon>
-                                    <PathIcon
-                                        Width="16"
-                                        Height="16"
-                                        Foreground="#D7DCE5"
-                                        Data="M 12.7 4.9 C 11.8 2.9 9.8 1.7 7.5 1.7 C 4.3 1.7 1.8 4.2 1.8 7.4 C 1.8 10.6 4.3 13.1 7.5 13.1 C 9.4 13.1 11 12.2 12.1 10.8 L 10.6 9.5 C 9.8 10.6 8.8 11.1 7.5 11.1 C 5.4 11.1 3.8 9.5 3.8 7.4 C 3.8 5.3 5.4 3.7 7.5 3.7 C 9 3.7 10.2 4.4 10.9 5.7 L 8.8 5.7 L 12.2 9.1 L 15.4 5.7 L 12.7 5.7 Z" />
-                                </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem
-                                Text="Run Diagnostics"
-                                Click="RunDiagnosticsButton_Click">
-                                <MenuFlyoutItem.Icon>
-                                    <PathIcon
-                                        Width="16"
-                                        Height="16"
-                                        Foreground="#D7DCE5"
-                                        Data="M 3.1 1.5 L 4.6 1.5 L 4.6 5.8 C 4.6 7.1 5.6 8.1 6.9 8.1 C 8.2 8.1 9.2 7.1 9.2 5.8 L 9.2 1.5 L 10.7 1.5 L 10.7 5.8 C 10.7 7.6 9.5 9.1 7.8 9.5 L 7.8 10.6 C 7.8 12.2 8.9 13.3 10.4 13.3 C 11.5 13.3 12.3 12.7 12.7 11.8 C 12 11.5 11.5 10.8 11.5 10 C 11.5 8.9 12.4 8 13.5 8 C 14.6 8 15.5 8.9 15.5 10 C 15.5 10.9 15 11.7 14.2 12 C 13.8 13.8 12.3 15 10.4 15 C 8 15 6.2 13.2 6.2 10.6 L 6.2 9.5 C 4.4 9.2 3.1 7.6 3.1 5.8 Z M 1.1 1.4 L 2.7 1.4 L 2.7 3 L 1.1 3 Z M 11.1 1.4 L 12.7 1.4 L 12.7 3 L 11.1 3 Z M 13.5 9.2 C 13 9.2 12.7 9.6 12.7 10 C 12.7 10.5 13 10.8 13.5 10.8 C 13.9 10.8 14.3 10.5 14.3 10 C 14.3 9.6 13.9 9.2 13.5 9.2 Z" />
-                                </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem
-                                x:Name="MachineRecoveryMenuItem"
-                                Text="Show Machine Recovery"
-                                Click="ToggleMachineRecoveryButton_Click">
-                                <MenuFlyoutItem.Icon>
-                                    <PathIcon
-                                        Width="16"
-                                        Height="16"
-                                        Foreground="#D7DCE5"
-                                        Data="M 5.7 1.5 L 10.3 1.5 L 10.3 3 L 14.2 3 L 14.2 13.8 L 1.8 13.8 L 1.8 3 L 5.7 3 Z M 7.1 2.5 L 7.1 3 L 8.9 3 L 8.9 2.5 Z M 3.2 4.4 L 3.2 12.4 L 12.8 12.4 L 12.8 4.4 Z M 7.3 6 L 8.7 6 L 8.7 7.4 L 10.1 7.4 L 10.1 8.8 L 8.7 8.8 L 8.7 10.2 L 7.3 10.2 L 7.3 8.8 L 5.9 8.8 L 5.9 7.4 L 7.3 7.4 Z" />
-                                </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem
-                                Text="View Logs"
-                                Click="ViewLogsButton_Click">
-                                <MenuFlyoutItem.Icon>
-                                    <PathIcon
-                                        Width="16"
-                                        Height="16"
-                                        Foreground="#D7DCE5"
-                                        Data="M 2.4 1.5 L 9.6 1.5 L 13.2 5.1 L 13.2 8.2 C 12.8 8.1 12.3 8 11.8 8 L 11.8 5.8 L 8.9 5.8 L 8.9 2.9 L 3.8 2.9 L 3.8 13.1 L 7.7 13.1 C 7.9 13.6 8.2 14.1 8.6 14.5 L 2.4 14.5 Z M 9.9 3.5 L 9.9 4.8 L 11.2 4.8 Z M 5.1 6.8 L 9.5 6.8 L 9.5 7.8 L 5.1 7.8 Z M 5.1 9.2 L 7.9 9.2 L 7.9 10.2 L 5.1 10.2 Z M 11.1 9.2 C 9.7 9.2 8.6 10.3 8.6 11.7 C 8.6 13.1 9.7 14.2 11.1 14.2 C 11.6 14.2 12.1 14 12.5 13.8 L 14.2 15.5 L 15.2 14.5 L 13.5 12.8 C 13.8 12.4 14 11.9 14 11.7 C 14 10.3 12.5 9.2 11.1 9.2 Z M 11.1 10.5 C 11.8 10.5 12.4 11 12.4 11.7 C 12.4 12.4 11.8 13 11.1 13 C 10.4 13 9.9 12.4 9.9 11.7 C 9.9 11 10.4 10.5 11.1 10.5 Z" />
-                                </MenuFlyoutItem.Icon>
-                            </MenuFlyoutItem>
-                        </MenuFlyout>
-                    </controls:SplitButton.Flyout>
-                    <StackPanel Orientation="Horizontal" Spacing="7">
-                        <Grid
-                            x:Name="HealthIcon"
-                            Width="16"
-                            Height="14"
-                            VerticalAlignment="Center">
-                            <Canvas
-                                x:Name="HealthRefreshIcon"
-                                Width="16"
-                                Height="14"
-                                Visibility="Collapsed">
-                                <Path
-                                    x:Name="HealthRefreshArrowPath"
-                                    Data="M 12.4 4.3 C 11.5 2.6 9.5 1.7 7.4 2 C 5.5 2.3 4 3.5 3.2 5.2 M 12.4 4.3 L 12.9 1.9 M 12.4 4.3 L 14.7 3.5 M 3.6 9.7 C 4.5 11.4 6.5 12.3 8.6 12 C 10.5 11.7 12 10.5 12.8 8.8 M 3.6 9.7 L 3.1 12.1 M 3.6 9.7 L 1.3 10.5"
-                                    Fill="#00FFFFFF"
-                                    Stroke="#D7DCE5"
-                                    StrokeThickness="1.1"
-                                    StrokeLineJoin="Round"
-                                    StrokeStartLineCap="Round"
-                                    StrokeEndLineCap="Round" />
-                            </Canvas>
-                            <Grid
-                                x:Name="HealthHeartCardIcon"
-                                Width="16"
-                                Height="14">
-                                <Border
-                                    x:Name="HealthHeartSquareOutline"
-                                    Width="15"
-                                    Height="13"
-                                    BorderBrush="#D7DCE5"
-                                    BorderThickness="1"
-                                    CornerRadius="2" />
-                                <Path
-                                    x:Name="HealthHeartPath"
-                                    Data="M 5.2 7.5 C 4 6.5 3.2 5.7 3.2 4.7 C 3.2 3.8 3.8 3.2 4.6 3.2 C 5.1 3.2 5.5 3.5 5.8 3.9 C 6.1 3.5 6.5 3.2 7 3.2 C 7.8 3.2 8.4 3.8 8.4 4.7 C 8.4 5.7 7.6 6.5 6.4 7.5 L 5.8 8 Z"
-                                    Fill="#D7DCE5"
-                                    HorizontalAlignment="Left"
-                                    Margin="2.6,1.8,0,0"
-                                    VerticalAlignment="Top" />
-                                <StackPanel
-                                    Spacing="2"
-                                    Width="6"
-                                    HorizontalAlignment="Right"
-                                    Margin="0,4,3,0"
-                                    VerticalAlignment="Top">
-                                    <Border x:Name="HealthTextLineTop" Height="1" Background="#D7DCE5" CornerRadius="0.5" />
-                                    <Border x:Name="HealthTextLineBottom" Height="1" Background="#D7DCE5" CornerRadius="0.5" Opacity="0.75" />
-                                </StackPanel>
-                            </Grid>
-                        </Grid>
-                        <TextBlock Text="Health" />
-                    </StackPanel>
-                </controls:SplitButton>
-
                 <Button
                     x:Name="ActivityButton"
                     Click="ActivityButton_Click"
@@ -4270,10 +4160,10 @@
                         </StackPanel>
                     </Border>
 
-                    <Border
-                        x:Name="MachineConnectForm"
-                        Padding="10"
-                        Background="#662A2C30"
+	                    <Border
+	                        x:Name="MachineConnectForm"
+	                        Padding="10"
+	                        Background="#662A2C30"
                         BorderBrush="#00FFFFFF"
                         BorderThickness="0"
                         CornerRadius="8"
@@ -4306,12 +4196,71 @@
                                     <FontIcon Glyph="&#xE8CE;" FontSize="14" />
                                     <TextBlock Text="Connect" />
                                 </StackPanel>
-                            </Button>
-                        </StackPanel>
-                    </Border>
+	                            </Button>
+	                        </StackPanel>
+	                    </Border>
 
 	                    <Border
-	                        x:Name="CodexRemotesSection"
+	                        x:Name="ConnectionRefreshRow"
+	                        Padding="10"
+	                        Background="#662A2C30"
+	                        BorderBrush="#24FFFFFF"
+	                        BorderThickness="1"
+	                        CornerRadius="8"
+	                        Visibility="Collapsed">
+	                        <Grid ColumnSpacing="8">
+	                            <Grid.ColumnDefinitions>
+	                                <ColumnDefinition Width="Auto" />
+	                                <ColumnDefinition Width="*" />
+	                                <ColumnDefinition Width="Auto" />
+	                            </Grid.ColumnDefinitions>
+	                            <FontIcon
+	                                x:Name="ConnectionRefreshIcon"
+	                                Glyph="&#xE72C;"
+	                                FontSize="15"
+	                                Width="18"
+	                                Foreground="#A7B0BF"
+	                                VerticalAlignment="Top" />
+	                            <StackPanel Grid.Column="1" Spacing="2">
+	                                <TextBlock
+	                                    Text="Connections"
+	                                    FontSize="12"
+	                                    FontWeight="SemiBold"
+	                                    Foreground="#F2F4F7" />
+	                                <TextBlock
+	                                    x:Name="ConnectionRefreshStatusText"
+	                                    Text="Refresh local and remote machine routes."
+	                                    FontSize="11"
+	                                    Foreground="#A7B0BF"
+	                                    TextWrapping="Wrap"
+	                                    MaxLines="2" />
+	                            </StackPanel>
+	                            <Button
+	                                x:Name="RefreshConnectionsButton"
+	                                Grid.Column="2"
+	                                Click="RefreshHealthButton_Click"
+	                                AutomationProperties.Name="Refresh connections"
+	                                HorizontalAlignment="Right"
+	                                VerticalAlignment="Center">
+	                                <StackPanel
+	                                    Orientation="Horizontal"
+	                                    Spacing="6">
+	                                    <FontIcon
+	                                        x:Name="RefreshConnectionsButtonIcon"
+	                                        Glyph="&#xE72C;"
+	                                        FontSize="12" />
+	                                    <TextBlock
+	                                        x:Name="RefreshConnectionsButtonText"
+	                                        Text="Refresh Connections"
+	                                        FontSize="12"
+	                                        FontWeight="SemiBold" />
+	                                </StackPanel>
+	                            </Button>
+	                        </Grid>
+	                    </Border>
+
+		                    <Border
+		                        x:Name="CodexRemotesSection"
 	                        Padding="10"
 	                        Background="#4D2A2C30"
 	                        BorderBrush="#24FFFFFF"
@@ -4376,7 +4325,7 @@
 	                                    CornerRadius="8">
 	                                <TextBlock
 	                                    x:Name="CodexRemotesMessageText"
-	                                    Text="No Codex remotes discovered yet. Add a WebSocket endpoint above or refresh machine health."
+		                                    Text="No Codex remotes discovered yet. Add a WebSocket endpoint above or refresh connections."
 	                                    FontSize="11"
 	                                    Foreground="#A7B0BF"
 	                                    TextWrapping="Wrap" />
@@ -4397,15 +4346,13 @@
 		                                                BorderThickness="1"
 		                                                CornerRadius="8">
 		                                                <StackPanel Spacing="6">
-		                                                    <Grid ColumnSpacing="{Binding RowColumnSpacing}">
-		                                                        <Grid.ColumnDefinitions>
-		                                                            <ColumnDefinition Width="16" />
-		                                                            <ColumnDefinition Width="*" />
-	                                                            <ColumnDefinition Width="Auto" />
-	                                                            <ColumnDefinition Width="Auto" />
-	                                                            <ColumnDefinition Width="Auto" />
-	                                                            <ColumnDefinition Width="Auto" />
-	                                                        </Grid.ColumnDefinitions>
+			                                                    <Grid ColumnSpacing="{Binding RowColumnSpacing}">
+			                                                        <Grid.ColumnDefinitions>
+			                                                            <ColumnDefinition Width="16" />
+			                                                            <ColumnDefinition Width="*" />
+		                                                            <ColumnDefinition Width="Auto" />
+		                                                            <ColumnDefinition Width="Auto" />
+		                                                        </Grid.ColumnDefinitions>
 		                                                        <FontIcon
 		                                                            Glyph="{Binding Glyph}"
 		                                                            FontSize="{Binding RowIconFontSize}"
@@ -4440,37 +4387,9 @@
 		                                                        </StackPanel>
 		                                                        <Button
 		                                                            Grid.Column="2"
-	                                                            Click="OpenCodexRemoteDiagnosticsButton_Click"
-	                                                            ToolTipService.ToolTip="{Binding DiagnosticsTooltip}"
-			                                                            AutomationProperties.Name="{Binding DiagnosticsAutomationName}"
-			                                                            AutomationProperties.HelpText="{Binding DiagnosticsTooltip}"
-		                                                            Visibility="{Binding DiagnosticsVisibility}"
-		                                                            Width="{Binding ActionButtonSize}"
-		                                                            Height="{Binding ActionButtonSize}"
-		                                                            Padding="0"
-		                                                            Background="#00FFFFFF"
-		                                                            BorderThickness="0">
-	                                                            <FontIcon Glyph="&#xE77F;" FontSize="12" />
-	                                                        </Button>
-	                                                        <Button
-	                                                            Grid.Column="3"
-	                                                            Click="DiagnoseRemoteDiscoveryButton_Click"
-	                                                            ToolTipService.ToolTip="{Binding DiagnoseTooltip}"
-			                                                            AutomationProperties.Name="{Binding DiagnoseAutomationName}"
-			                                                            AutomationProperties.HelpText="{Binding DiagnoseTooltip}"
-			                                                            Opacity="{Binding DiagnoseOpacity}"
-		                                                            Width="{Binding ActionButtonSize}"
-		                                                            Height="{Binding ActionButtonSize}"
-		                                                            Padding="0"
-		                                                            Background="#00FFFFFF"
-		                                                            BorderThickness="0">
-	                                                            <FontIcon Glyph="&#xE9D9;" FontSize="12" />
-	                                                        </Button>
-	                                                        <Button
-	                                                            Grid.Column="4"
-	                                                            Click="ConnectCodexRemoteDiscoveryButton_Click"
-	                                                            ToolTipService.ToolTip="{Binding ConnectTooltip}"
-		                                                            AutomationProperties.Name="{Binding ConnectAutomationName}"
+		                                                            Click="ConnectCodexRemoteDiscoveryButton_Click"
+		                                                            ToolTipService.ToolTip="{Binding ConnectTooltip}"
+			                                                            AutomationProperties.Name="{Binding ConnectAutomationName}"
 		                                                            AutomationProperties.HelpText="{Binding ConnectTooltip}"
 			                                                            Opacity="{Binding ConnectOpacity}"
 		                                                            Visibility="{Binding ConnectVisibility}"
@@ -4479,13 +4398,13 @@
 		                                                            Padding="0"
 		                                                            Background="#00FFFFFF"
 		                                                            BorderThickness="0">
-	                                                            <FontIcon Glyph="&#xE8CE;" FontSize="12" />
-	                                                        </Button>
-	                                                        <Button
-	                                                            Grid.Column="5"
-	                                                            Click="FillRemoteDiscoveryEndpointButton_Click"
-	                                                            ToolTipService.ToolTip="{Binding FillTooltip}"
-		                                                            AutomationProperties.Name="{Binding FillAutomationName}"
+		                                                            <FontIcon Glyph="&#xE8CE;" FontSize="12" />
+		                                                        </Button>
+		                                                        <Button
+		                                                            Grid.Column="3"
+		                                                            Click="FillRemoteDiscoveryEndpointButton_Click"
+		                                                            ToolTipService.ToolTip="{Binding FillTooltip}"
+			                                                            AutomationProperties.Name="{Binding FillAutomationName}"
 		                                                            AutomationProperties.HelpText="{Binding FillTooltip}"
 			                                                            Opacity="{Binding FillOpacity}"
 		                                                            Visibility="{Binding FillVisibility}"
@@ -4494,65 +4413,56 @@
 		                                                            Padding="0"
 		                                                            Background="#00FFFFFF"
 		                                                            BorderThickness="0">
-	                                                            <FontIcon Glyph="&#xE8CE;" FontSize="12" />
-	                                                        </Button>
-	                                                    </Grid>
-	                                                    <ItemsControl ItemsSource="{Binding Diagnostics}">
-		                                                        <ItemsControl.ItemTemplate>
-		                                                            <DataTemplate>
-		                                                                <Grid Margin="{Binding RowMargin}" ColumnSpacing="{Binding ColumnSpacing}">
-		                                                                    <Grid.ColumnDefinitions>
-		                                                                        <ColumnDefinition Width="14" />
-		                                                                        <ColumnDefinition Width="*" />
-	                                                                        <ColumnDefinition Width="Auto" />
-	                                                                    </Grid.ColumnDefinitions>
-		                                                                    <FontIcon
-		                                                                        Glyph="{Binding Glyph}"
-		                                                                        FontSize="{Binding IconFontSize}"
-		                                                                        Width="{Binding IconWidth}"
-		                                                                        Foreground="{Binding StatusBrush}"
-		                                                                        VerticalAlignment="Top" />
-		                                                                    <StackPanel Grid.Column="1" Spacing="1">
-		                                                                        <TextBlock
-		                                                                            Text="{Binding Title}"
-		                                                                            FontSize="{Binding TitleFontSize}"
-		                                                                            FontWeight="SemiBold"
-		                                                                            Foreground="#F2F4F7"
-		                                                                            TextTrimming="CharacterEllipsis" />
-		                                                                        <TextBlock
-		                                                                            Text="{Binding Detail}"
-		                                                                            FontSize="{Binding DetailFontSize}"
-		                                                                            Foreground="#A7B0BF"
-		                                                                            TextTrimming="CharacterEllipsis" />
-		                                                                    </StackPanel>
-	                                                                    <Button
-		                                                                        Grid.Column="2"
-		                                                                        Click="CodexRemoteDiagnosticActionButton_Click"
-		                                                                        ToolTipService.ToolTip="{Binding ActionTooltip}"
-			                                                                        Opacity="{Binding ActionOpacity}"
-			                                                                        Visibility="{Binding ActionVisibility}"
-		                                                                        Padding="{Binding ActionPadding}"
-		                                                                        MinWidth="0"
-		                                                                        MinHeight="0"
-		                                                                        Background="#1AFFFFFF"
-		                                                                        BorderBrush="#22FFFFFF"
-		                                                                        BorderThickness="1">
-		                                                                        <StackPanel Orientation="Horizontal" Spacing="4">
-		                                                                            <FontIcon
-		                                                                                Glyph="{Binding ActionGlyph}"
-		                                                                                FontSize="{Binding ActionIconFontSize}" />
-		                                                                            <TextBlock
-		                                                                                Text="{Binding ActionLabel}"
-		                                                                                FontSize="{Binding DetailFontSize}"
-		                                                                                FontWeight="SemiBold" />
-		                                                                        </StackPanel>
-		                                                                    </Button>
-		                                                                </Grid>
-		                                                            </DataTemplate>
-	                                                        </ItemsControl.ItemTemplate>
-	                                                    </ItemsControl>
-	                                                </StackPanel>
-		                                            </Border>
+		                                                            <FontIcon Glyph="&#xE8CE;" FontSize="12" />
+		                                                        </Button>
+		                                                    </Grid>
+		                                                    <Grid
+		                                                        Margin="{Binding DiagnosticsSummaryMargin}"
+		                                                        ColumnSpacing="6"
+		                                                        Visibility="{Binding DiagnosticsSummaryVisibility}">
+		                                                        <Grid.ColumnDefinitions>
+		                                                            <ColumnDefinition Width="16" />
+		                                                            <ColumnDefinition Width="*" />
+		                                                            <ColumnDefinition Width="Auto" />
+		                                                        </Grid.ColumnDefinitions>
+		                                                        <FontIcon
+		                                                            Glyph="{Binding DiagnosticsSummaryGlyph}"
+		                                                            FontSize="12"
+		                                                            Width="16"
+		                                                            Foreground="{Binding DiagnosticsSummaryBrush}"
+		                                                            VerticalAlignment="Center" />
+		                                                        <TextBlock
+		                                                            Grid.Column="1"
+		                                                            Text="{Binding DiagnosticsSummaryText}"
+		                                                            FontSize="11"
+		                                                            FontWeight="SemiBold"
+		                                                            Foreground="{Binding DiagnosticsSummaryBrush}"
+		                                                            TextTrimming="CharacterEllipsis"
+		                                                            VerticalAlignment="Center" />
+		                                                        <Button
+		                                                            Grid.Column="2"
+		                                                            Click="OpenCodexRemoteDiagnosticsButton_Click"
+		                                                            ToolTipService.ToolTip="{Binding DiagnosticsTooltip}"
+		                                                            AutomationProperties.Name="{Binding DiagnosticsAutomationName}"
+		                                                            AutomationProperties.HelpText="{Binding DiagnosticsTooltip}"
+		                                                            Visibility="{Binding DiagnosticsSummaryButtonVisibility}"
+		                                                            Padding="7,3"
+		                                                            MinWidth="0"
+		                                                            MinHeight="0"
+		                                                            Background="#1AFFFFFF"
+		                                                            BorderBrush="#22FFFFFF"
+		                                                            BorderThickness="1">
+		                                                            <StackPanel Orientation="Horizontal" Spacing="5">
+		                                                                <FontIcon Glyph="&#xE9D9;" FontSize="11" />
+		                                                                <TextBlock
+		                                                                    Text="Remote Diagnostics"
+		                                                                    FontSize="11"
+		                                                                    FontWeight="SemiBold" />
+		                                                            </StackPanel>
+		                                                        </Button>
+		                                                    </Grid>
+		                                                </StackPanel>
+			                                            </Border>
 	                                        </DataTemplate>
 	                                    </ItemsControl.ItemTemplate>
 	                                </ItemsControl>
