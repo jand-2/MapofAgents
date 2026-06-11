@@ -9,8 +9,10 @@ struct NodeView: View {
     var isHighlighted: Bool = false
     var defaultMachineFolderPath: String?
     var liveState: ThreadLiveStateSummary?
+    var threadAutomation: CodexAutomationSummary?
     var onChooseMachineFolder: (() -> Void)?
     var onAddMachineFolder: ((String) -> Void)?
+    var onOpenThreadAutomation: () -> Void = {}
     var onLinkAction: () -> Void
     var onControlTap: () -> Void = {}
 
@@ -62,6 +64,22 @@ struct NodeView: View {
                 }
 
                 Spacer(minLength: 4)
+
+                if node.kind == .codexThread,
+                   let threadAutomation {
+                    Button {
+                        onControlTap()
+                        onOpenThreadAutomation()
+                    } label: {
+                        Image(systemName: "alarm")
+                            .symbolVariant(threadAutomation.isActive ? .fill : .none)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(threadAutomation.isActive ? .orange : .secondary)
+                    .help(automationHelp(threadAutomation))
+                    .accessibilityLabel("Thread automation")
+                    .accessibilityValue(automationHelp(threadAutomation))
+                }
 
                 if shouldShowMachineFolderButton {
                     FeedbackButton(
@@ -238,6 +256,11 @@ struct NodeView: View {
             return "Cancel connection"
         }
         return hasPendingManualEdge ? "Complete connection" : "Draw connection"
+    }
+
+    private func automationHelp(_ automation: CodexAutomationSummary) -> String {
+        let state = automation.isActive ? "active" : "paused"
+        return "\(automation.name) automation is \(state)"
     }
 
     private var accentColor: Color {

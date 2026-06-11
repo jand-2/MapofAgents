@@ -76,6 +76,7 @@ public struct GraphCanvasView: View {
     private static let userTurnMarkerLeadWindow: TimeInterval = 5
     private static let userTurnMarkerFollowWindow: TimeInterval = 5 * 60
     private static let userTurnAttributionRetention: TimeInterval = 20 * 60
+    private static let threadAutomationRefreshInterval: Duration = .seconds(10)
 
     @Bindable private var graphStore: GraphStore
     @Bindable private var runtimeStore: CodexRuntimeStore
@@ -128,6 +129,8 @@ public struct GraphCanvasView: View {
     @State private var transientViewport: CanvasViewport?
     @State private var viewportCommitTask: Task<Void, Never>?
     @State private var remoteFolderPickerRequest: RemoteFolderPickerRequest?
+    @State private var threadAutomationsByThreadID: [String: CodexAutomationSummary] = [:]
+    @State private var activeThreadAutomationNodeID: NodeID?
     #if os(macOS)
     @State private var codexRemoteDiagnosticsWindow: CodexRemoteDiagnosticsWindowPresenter?
     #endif
@@ -184,6 +187,9 @@ public struct GraphCanvasView: View {
                 let popoverFrame = activeThreadNode.map {
                     currentPopoverFrame(for: $0, viewport: viewport, popoverSize: popoverSize, in: proxy.size)
                 }
+                let automationPanelFrame = activeThreadAutomationNode.map {
+                    threadAutomationPanelFrame(for: $0, viewport: viewport, canvasSize: proxy.size)
+                }
                 let rightRailFrame = CGRect(
                     x: max(0, proxy.size.width - rightRailReservedWidth(in: proxy.size) - 14),
                     y: 0,
@@ -195,7 +201,8 @@ public struct GraphCanvasView: View {
                     popoverFrame: popoverFrame,
                     rightRailFrame: rightRailFrame,
                     showsInspector: showsInspector,
-                    selectedEdgePopoverPosition: selectedManualEdge.flatMap { edgePopoverPosition(for: $0, viewport: viewport) }
+                    selectedEdgePopoverPosition: selectedManualEdge.flatMap { edgePopoverPosition(for: $0, viewport: viewport) },
+                    automationPanelFrame: automationPanelFrame
                 )
 
                 CanvasBackground(reducedDetail: activeThreadNode != nil || selectedManualEdge != nil)
@@ -205,6 +212,7 @@ public struct GraphCanvasView: View {
                         releaseTransientThreadSubscriptionIfNeeded()
                         transientOpenGeneration &+= 1
                         transientThreadNode = nil
+                        activeThreadAutomationNodeID = nil
                         graphStore.clearSelection()
                         resetThreadPopoverData()
                     }
@@ -243,6 +251,18 @@ public struct GraphCanvasView: View {
                    let edge = selectedManualEdge,
                    let position = edgePopoverPosition(for: edge, viewport: viewport) {
                     edgePopoverLayer(edge: edge, position: position)
+                }
+
+                if let automationNode = activeThreadAutomationNode,
+                   let automation = automation(for: automationNode),
+                   let threadID = automationNode.metadata.threadRef?.threadID {
+                    threadAutomationPanelLayer(
+                        for: automationNode,
+                        automation: automation,
+                        threadID: threadID,
+                        viewport: viewport,
+                        canvasSize: proxy.size
+                    )
                 }
             }
             .overlay(alignment: .bottomLeading) {
@@ -310,6 +330,9 @@ public struct GraphCanvasView: View {
             }
             .task {
                 await refreshThreadInbox()
+            }
+            .task(id: threadAutomationRefreshSignature) {
+                await refreshThreadAutomationsPeriodically()
             }
             .confirmationDialog(
                 pendingDestructiveAction?.title ?? "Confirm Action",
@@ -390,6 +413,16 @@ public struct GraphCanvasView: View {
             let node = graphStore.graph.nodes[id],
             node.kind == .codexThread
         else {
+            return nil
+        }
+        return node
+    }
+
+    private var activeThreadAutomationNode: CanvasNode? {
+        guard let activeThreadAutomationNodeID,
+              let node = graphStore.graph.nodes[activeThreadAutomationNodeID],
+              node.kind == .codexThread,
+              automation(for: node) != nil else {
             return nil
         }
         return node
@@ -517,6 +550,15 @@ public struct GraphCanvasView: View {
 
         parts.append("routes:\(graphStore.graph.messageRoutes.count)")
         return parts.joined(separator: "\u{1F}")
+    }
+
+    private var threadAutomationRefreshSignature: String {
+        graphStore.graph.sortedNodes
+            .compactMap { node in
+                node.kind == .codexThread ? node.metadata.threadRef?.threadID : nil
+            }
+            .sorted()
+            .joined(separator: "|")
     }
 
     private var threadCatalogRefreshSignature: String {
@@ -811,6 +853,31 @@ public struct GraphCanvasView: View {
         .transition(.opacity.combined(with: .scale(scale: 0.98)))
     }
 
+    private func threadAutomationPanelLayer(
+        for node: CanvasNode,
+        automation: CodexAutomationSummary,
+        threadID: String,
+        viewport: CanvasViewport,
+        canvasSize: CGSize
+    ) -> some View {
+        let frame = threadAutomationPanelFrame(for: node, viewport: viewport, canvasSize: canvasSize)
+        return ThreadAutomationPopoverView(
+            automation: automation,
+            threadTitle: node.title,
+            threadID: threadID,
+            onSave: { edit in
+                try await saveThreadAutomation(edit)
+            },
+            onClose: {
+                activeThreadAutomationNodeID = nil
+            }
+        )
+        .frame(width: frame.width, height: frame.height)
+        .position(x: frame.midX, y: frame.midY)
+        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+        .zIndex(45)
+    }
+
     @ViewBuilder
     private func canvasNodeView(for node: CanvasNode, viewport: CanvasViewport) -> some View {
         NodeView(
@@ -821,8 +888,12 @@ public struct GraphCanvasView: View {
             isHighlighted: hoveredInboxNodeID == node.id,
             defaultMachineFolderPath: defaultFolderPath(for: node),
             liveState: liveStateSummary(for: node),
+            threadAutomation: automation(for: node),
             onChooseMachineFolder: pickMachineFolderAction(for: node),
             onAddMachineFolder: addMachineFolderAction(for: node),
+            onOpenThreadAutomation: {
+                activeThreadAutomationNodeID = activeThreadAutomationNodeID == node.id ? nil : node.id
+            },
             onLinkAction: {
                 if let pending = graphStore.pendingManualEdgeSource, pending != node.id {
                     Task { await graphStore.completeManualEdge(to: node.id) }
@@ -857,6 +928,7 @@ public struct GraphCanvasView: View {
             return
         }
 
+        activeThreadAutomationNodeID = nil
         graphStore.selectNode(node.id)
         Task {
             if isReadingModePresented, node.kind == .codexThread {
@@ -906,6 +978,7 @@ public struct GraphCanvasView: View {
             errorMessage: transcriptError,
             threadMentionCandidates: allMentionCandidates(for: threadNode),
             attentionRequests: attentionRequests(for: threadNode),
+            threadAutomation: automation(for: threadNode),
             onRename: { title in
                 Task { await graphStore.updateNodeTitle(id: threadNode.id, title: title) }
             },
@@ -934,6 +1007,9 @@ public struct GraphCanvasView: View {
             onDeclineTypedAttention: { request in
                 Task { await declineTypedAttentionRequest(request) }
             },
+            onOpenAutomation: {
+                activeThreadAutomationNodeID = activeThreadAutomationNodeID == threadNode.id ? nil : threadNode.id
+            },
             onClose: closeActiveThreadPopover
         )
         .task(id: threadNode.metadata.threadRef?.qualifiedID ?? threadNode.id.rawValue) {
@@ -956,6 +1032,7 @@ public struct GraphCanvasView: View {
             errorMessage: transcriptError,
             threadMentionCandidates: allMentionCandidates(for: threadNode),
             attentionRequests: attentionRequests(for: threadNode),
+            threadAutomation: automation(for: threadNode),
             popoverSize: popoverSize,
             basePosition: popoverPosition(for: threadNode, viewport: viewport, popoverSize: popoverSize, in: canvasSize),
             canvasSize: canvasSize,
@@ -990,6 +1067,9 @@ public struct GraphCanvasView: View {
             },
             onDeclineTypedAttention: { request in
                 Task { await declineTypedAttentionRequest(request) }
+            },
+            onOpenAutomation: {
+                activeThreadAutomationNodeID = activeThreadAutomationNodeID == threadNode.id ? nil : threadNode.id
             },
             onClose: closeActiveThreadPopover
         )
@@ -1102,6 +1182,55 @@ public struct GraphCanvasView: View {
         #endif
     }
 
+    private func threadAutomationPanelSize(in canvasSize: CGSize) -> CGSize {
+        let availableWidth = max(320, canvasSize.width - rightRailReservedWidth(in: canvasSize) - 36)
+        return CGSize(
+            width: min(640, availableWidth),
+            height: min(500, max(380, canvasSize.height - 48))
+        )
+    }
+
+    private func threadAutomationPanelFrame(
+        for node: CanvasNode,
+        viewport: CanvasViewport,
+        canvasSize: CGSize
+    ) -> CGRect {
+        let panelSize = threadAutomationPanelSize(in: canvasSize)
+        let nodeCenter = screenPoint(for: node.position, viewport: viewport)
+        let nodeHalfWidth = CGFloat(node.size.width * viewport.scale / 2)
+        let margin: CGFloat = 16
+        let rightInset = rightRailReservedWidth(in: canvasSize)
+        let effectiveWidth = max(panelSize.width + margin * 2, canvasSize.width - rightInset)
+        let rightX = nodeCenter.x + nodeHalfWidth + margin + panelSize.width / 2
+        let leftX = nodeCenter.x - nodeHalfWidth - margin - panelSize.width / 2
+        let preferredX: CGFloat
+
+        if rightX + panelSize.width / 2 + margin <= effectiveWidth {
+            preferredX = rightX
+        } else if leftX - panelSize.width / 2 - margin >= 0 {
+            preferredX = leftX
+        } else {
+            preferredX = nodeCenter.x
+        }
+
+        let preferredY = nodeCenter.y
+        let position = clampedThreadPopoverPosition(
+            basePosition: CGPoint(x: preferredX, y: preferredY),
+            savedOffset: .zero,
+            dragOffset: .zero,
+            popoverSize: panelSize,
+            canvasSize: canvasSize,
+            rightInset: rightInset,
+            margin: margin
+        )
+        return CGRect(
+            x: position.x - panelSize.width / 2,
+            y: position.y - panelSize.height / 2,
+            width: panelSize.width,
+            height: panelSize.height
+        )
+    }
+
     private func popoverPosition(for node: CanvasNode, viewport: CanvasViewport, popoverSize: CGSize, in size: CGSize) -> CGPoint {
         #if os(iOS)
         return CGPoint(x: size.width / 2, y: size.height / 2)
@@ -1157,11 +1286,15 @@ public struct GraphCanvasView: View {
         popoverFrame: CGRect?,
         rightRailFrame: CGRect,
         showsInspector: Bool,
-        selectedEdgePopoverPosition: CGPoint?
+        selectedEdgePopoverPosition: CGPoint?,
+        automationPanelFrame: CGRect?
     ) -> [CGRect] {
         var rects = [CGRect]()
         if let popoverFrame {
             rects.append(popoverFrame)
+        }
+        if let automationPanelFrame {
+            rects.append(automationPanelFrame.insetBy(dx: -8, dy: -8))
         }
         rects.append(rightRailFrame)
         rects.append(CGRect(x: 0, y: 0, width: min(canvasSize.width, 720), height: 104))
@@ -1317,6 +1450,7 @@ public struct GraphCanvasView: View {
         releaseTransientThreadSubscriptionIfNeeded()
         transientOpenGeneration &+= 1
         transientThreadNode = nil
+        activeThreadAutomationNodeID = nil
         resetThreadPopoverData()
         graphStore.clearSelection()
     }
@@ -1716,6 +1850,42 @@ public struct GraphCanvasView: View {
             return try await runtimeStore.loadTranscript(for: threadRef)
         }
         return try await supervisorStore.loadTranscript(for: threadRef)
+    }
+
+    private func automation(for node: CanvasNode) -> CodexAutomationSummary? {
+        guard node.kind == .codexThread,
+              let threadID = node.metadata.threadRef?.threadID else {
+            return nil
+        }
+        return threadAutomationsByThreadID[threadID]
+    }
+
+    private func refreshThreadAutomations() async {
+        let store = CodexAutomationStore()
+        do {
+            let automations = try store.loadAutomationsByThreadID()
+            guard !Task.isCancelled else { return }
+            threadAutomationsByThreadID = automations
+        } catch {
+            guard !Task.isCancelled else { return }
+            threadAutomationsByThreadID = [:]
+        }
+    }
+
+    private func refreshThreadAutomationsPeriodically() async {
+        await refreshThreadAutomations()
+        while !Task.isCancelled {
+            try? await Task.sleep(for: Self.threadAutomationRefreshInterval)
+            guard !Task.isCancelled else { return }
+            await refreshThreadAutomations()
+        }
+    }
+
+    private func saveThreadAutomation(_ edit: CodexAutomationEdit) async throws -> CodexAutomationSummary {
+        let store = CodexAutomationStore()
+        let saved = try store.save(edit)
+        await refreshThreadAutomations()
+        return saved
     }
 
     private func refreshThreadInbox() async {
@@ -3625,6 +3795,7 @@ private struct FullScreenThreadPopoverLayer: View {
     var errorMessage: String?
     var threadMentionCandidates: [MentionCandidate]
     var attentionRequests: [RuntimeAttentionRequest]
+    var threadAutomation: CodexAutomationSummary?
     var onRename: (String) -> Void
     var onRefresh: () -> Void
     var onLoadOlder: () -> Void
@@ -3635,6 +3806,7 @@ private struct FullScreenThreadPopoverLayer: View {
     var onRespondToAttention: (RuntimeAttentionRequest, Bool) -> Void
     var onRespondToAttentionWithText: (RuntimeAttentionRequest, String) -> Void
     var onDeclineTypedAttention: (RuntimeAttentionRequest) -> Void
+    var onOpenAutomation: () -> Void
     var onClose: () -> Void
 
     var body: some View {
@@ -3651,6 +3823,7 @@ private struct FullScreenThreadPopoverLayer: View {
             errorMessage: errorMessage,
             threadMentionCandidates: threadMentionCandidates,
             attentionRequests: attentionRequests,
+            threadAutomation: threadAutomation,
             isFullScreen: true,
             allowsMoving: false,
             canStopTurn: canStopTurn,
@@ -3665,6 +3838,7 @@ private struct FullScreenThreadPopoverLayer: View {
             onRespondToAttention: onRespondToAttention,
             onRespondToAttentionWithText: onRespondToAttentionWithText,
             onDeclineTypedAttention: onDeclineTypedAttention,
+            onOpenAutomation: onOpenAutomation,
             onClose: onClose
         )
         .id(node.metadata.threadRef?.qualifiedID ?? node.id.rawValue)
@@ -3688,6 +3862,7 @@ private struct DraggableThreadPopoverLayer: View {
     var errorMessage: String?
     var threadMentionCandidates: [MentionCandidate]
     var attentionRequests: [RuntimeAttentionRequest]
+    var threadAutomation: CodexAutomationSummary?
     var popoverSize: CGSize
     var basePosition: CGPoint
     var canvasSize: CGSize
@@ -3703,6 +3878,7 @@ private struct DraggableThreadPopoverLayer: View {
     var onRespondToAttention: (RuntimeAttentionRequest, Bool) -> Void
     var onRespondToAttentionWithText: (RuntimeAttentionRequest, String) -> Void
     var onDeclineTypedAttention: (RuntimeAttentionRequest) -> Void
+    var onOpenAutomation: () -> Void
     var onClose: () -> Void
 
     @State private var dragOffset: CGSize = .zero
@@ -3721,6 +3897,7 @@ private struct DraggableThreadPopoverLayer: View {
             errorMessage: errorMessage,
             threadMentionCandidates: threadMentionCandidates,
             attentionRequests: attentionRequests,
+            threadAutomation: threadAutomation,
             isMoving: dragOffset != .zero,
             allowsMoving: true,
             canStopTurn: canStopTurn,
@@ -3757,6 +3934,7 @@ private struct DraggableThreadPopoverLayer: View {
             onRespondToAttention: onRespondToAttention,
             onRespondToAttentionWithText: onRespondToAttentionWithText,
             onDeclineTypedAttention: onDeclineTypedAttention,
+            onOpenAutomation: onOpenAutomation,
             onClose: onClose
         )
         .id(node.metadata.threadRef?.qualifiedID ?? node.id.rawValue)

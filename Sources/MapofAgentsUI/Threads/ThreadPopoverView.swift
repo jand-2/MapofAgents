@@ -318,6 +318,7 @@ struct ThreadPopoverView: View {
     var errorMessage: String?
     var threadMentionCandidates: [MentionCandidate] = []
     var attentionRequests: [RuntimeAttentionRequest] = []
+    var threadAutomation: CodexAutomationSummary? = nil
     var isMoving = false
     var isFullScreen = false
     var allowsMoving = false
@@ -335,6 +336,7 @@ struct ThreadPopoverView: View {
     var onRespondToAttention: (RuntimeAttentionRequest, Bool) -> Void = { _, _ in }
     var onRespondToAttentionWithText: (RuntimeAttentionRequest, String) -> Void = { _, _ in }
     var onDeclineTypedAttention: (RuntimeAttentionRequest) -> Void = { _ in }
+    var onOpenAutomation: () -> Void = {}
     var onClose: () -> Void
 
     @State private var draft = ""
@@ -468,11 +470,26 @@ struct ThreadPopoverView: View {
         VStack(alignment: .trailing, spacing: 8) {
             headerActionBar
 
-            ThreadHeaderRunStatusPill(
-                status: headerRunStatus,
-                isUnread: node.metadata.isUnread == true,
-                updatedAt: liveStateSummary?.updatedAt
-            )
+            HStack(spacing: 8) {
+                if let threadAutomation {
+                    Button(action: onOpenAutomation) {
+                        Image(systemName: "alarm")
+                            .symbolVariant(threadAutomation.isActive ? .fill : .none)
+                            .frame(width: 18, height: 18)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(threadAutomation.isActive ? .orange : .secondary)
+                    .help(automationHelp(threadAutomation))
+                    .accessibilityLabel("Thread automation")
+                    .accessibilityValue(automationHelp(threadAutomation))
+                }
+
+                ThreadHeaderRunStatusPill(
+                    status: headerRunStatus,
+                    isUnread: node.metadata.isUnread == true,
+                    updatedAt: liveStateSummary?.updatedAt
+                )
+            }
         }
         .fixedSize(horizontal: true, vertical: false)
     }
@@ -510,6 +527,11 @@ struct ThreadPopoverView: View {
             .accessibilityLabel("Close chat")
         }
         .foregroundStyle(.secondary)
+    }
+
+    private func automationHelp(_ automation: CodexAutomationSummary) -> String {
+        let state = automation.isActive ? "active" : "paused"
+        return "\(automation.name) automation is \(state)"
     }
 
     @ViewBuilder
