@@ -110,3 +110,13 @@ Date: 2026-06-10
 - Opened local folder nodes in Finder on macOS and Explorer on Windows.
 - Reused the remote folder browser in a read-only contents mode for remote folder nodes.
 - Kept the existing remote project picker behavior for adding folders.
+
+## 2c5f7c5 - Simplify remote diagnostics flow
+
+Date: 2026-06-10
+
+- Removed the Health toolbar menu and moved connection refresh into the Machines popover when a machine needs attention.
+- Simplified Codex remote rows so successful remotes stay compact and remote diagnostics appear only for failed or warning states.
+- Added a machine-node context-menu action for opening Codex remote diagnostics.
+- Shortened the Windows remote app-server start command to avoid PowerShell SSH command-length parsing failures.
+- Made restart recovery skip untracked occupied app-server ports and continue through configured port candidates.
