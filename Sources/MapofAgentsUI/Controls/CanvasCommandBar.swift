@@ -17,10 +17,6 @@ public struct CanvasCommandBar: View {
     var onCreateThread: () -> Void
     var onAutoArrange: () -> Void
     var onSearch: () -> Void
-    var onHealthCheck: () -> Void
-    var onRunDiagnostics: () -> Void
-    var onViewLogs: () -> Void
-    var onToggleMachineRecovery: () -> Void
     var onShowActivity: () -> Void
     var onZoomOut: () -> Void
     var onZoomIn: () -> Void
@@ -37,7 +33,6 @@ public struct CanvasCommandBar: View {
     var isReadingModePresented: Bool
     var readingThreadCount: Int
     var showsSubagents: Bool
-    var isMachineRecoveryPresented: Bool
 
     @State private var menuFeedbackMessage: String?
     @State private var menuFeedbackToken = UUID()
@@ -58,10 +53,6 @@ public struct CanvasCommandBar: View {
         onCreateThread: @escaping () -> Void,
         onAutoArrange: @escaping () -> Void,
         onSearch: @escaping () -> Void = {},
-        onHealthCheck: @escaping () -> Void = {},
-        onRunDiagnostics: @escaping () -> Void = {},
-        onViewLogs: @escaping () -> Void = {},
-        onToggleMachineRecovery: @escaping () -> Void = {},
         onShowActivity: @escaping () -> Void = {},
         onZoomOut: @escaping () -> Void,
         onZoomIn: @escaping () -> Void,
@@ -77,8 +68,7 @@ public struct CanvasCommandBar: View {
         isRefreshingConnections: Bool,
         isReadingModePresented: Bool = false,
         readingThreadCount: Int = 0,
-        showsSubagents: Bool = true,
-        isMachineRecoveryPresented: Bool = false
+        showsSubagents: Bool = true
     ) {
         self.graphStore = graphStore
         self.runtimeStore = runtimeStore
@@ -95,10 +85,6 @@ public struct CanvasCommandBar: View {
         self.onCreateThread = onCreateThread
         self.onAutoArrange = onAutoArrange
         self.onSearch = onSearch
-        self.onHealthCheck = onHealthCheck
-        self.onRunDiagnostics = onRunDiagnostics
-        self.onViewLogs = onViewLogs
-        self.onToggleMachineRecovery = onToggleMachineRecovery
         self.onShowActivity = onShowActivity
         self.onZoomOut = onZoomOut
         self.onZoomIn = onZoomIn
@@ -115,7 +101,6 @@ public struct CanvasCommandBar: View {
         self.isReadingModePresented = isReadingModePresented
         self.readingThreadCount = readingThreadCount
         self.showsSubagents = showsSubagents
-        self.isMachineRecoveryPresented = isMachineRecoveryPresented
     }
 
     public var body: some View {
@@ -171,8 +156,6 @@ public struct CanvasCommandBar: View {
                 Label("Search", systemImage: "magnifyingglass")
             }
             .help("Search the thread inbox")
-
-            healthControl
 
             Button(action: onShowActivity) {
                 Label("Activity", systemImage: "bell.badge")
@@ -285,6 +268,10 @@ public struct CanvasCommandBar: View {
                 localMachineSetupRow
             }
 
+            if shouldShowConnectionRefresh {
+                connectionRefreshRow
+            }
+
             MachinesPanelView(
                 supervisorStore: supervisorStore,
                 localHostID: runtimeStore.localHost.id,
@@ -295,6 +282,21 @@ public struct CanvasCommandBar: View {
         }
         .padding(8)
         .frame(width: 344, alignment: .topLeading)
+    }
+
+    private var connectionRefreshRow: some View {
+        FeedbackButton(
+            unavailableReason: refreshUnavailableReason,
+            action: onRefreshConnections
+        ) {
+            Label(
+                isRefreshingConnections ? "Refreshing Connections" : "Refresh Connections",
+                systemImage: isRefreshingConnections ? "arrow.triangle.2.circlepath" : "arrow.clockwise"
+            )
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .padding(.horizontal, 2)
     }
 
     private var localMachineSetupRow: some View {
@@ -335,39 +337,6 @@ public struct CanvasCommandBar: View {
         }
     }
 
-    private var healthControl: some View {
-        Menu {
-            Button(action: onRefreshConnections) {
-                Label("Refresh Now", systemImage: "arrow.clockwise")
-            }
-
-            Button(action: onRunDiagnostics) {
-                Label("Run Diagnostics", systemImage: "stethoscope")
-            }
-
-            Button(action: onToggleMachineRecovery) {
-                Label(
-                    isMachineRecoveryPresented ? "Hide Machine Recovery" : "Show Machine Recovery",
-                    systemImage: "cross.case"
-                )
-            }
-
-            Button(action: onViewLogs) {
-                Label("View Logs", systemImage: "doc.text.magnifyingglass")
-            }
-        } label: {
-            Label(
-                "Health",
-                systemImage: isRefreshingConnections
-                    ? "arrow.triangle.2.circlepath"
-                    : "heart.text.square"
-            )
-        } primaryAction: {
-            onHealthCheck()
-        }
-        .help(refreshUnavailableReason ?? "Refresh machine and runtime health")
-    }
-
     private var activeWorkflowName: String {
         workflows.first(where: { $0.id == activeWorkflowID })?.name ?? "Workflow"
     }
@@ -388,6 +357,17 @@ public struct CanvasCommandBar: View {
 
     private var shouldShowLocalSetup: Bool {
         runtimeStore.connectionState != .connected || !hasLocalMachineNode
+    }
+
+    private var shouldShowConnectionRefresh: Bool {
+        isRefreshingConnections
+            || runtimeStore.connectionState != .connected
+            || supervisorStore.machines.contains { machine in
+                machine.status != .connected || machine.lastError != nil
+            }
+            || supervisorStore.codexRemoteDiagnostics.values.contains { steps in
+                steps.contains { $0.status == .failed || $0.status == .warning || $0.status == .running }
+            }
     }
 
     private var machinesNeedAttention: Bool {

@@ -384,7 +384,7 @@ private struct CodexRemoteRowView: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 8) {
                 Image(systemName: remote.isConnectable ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(remote.isConnectable ? .green : .secondary)
+                    .foregroundStyle(statusColor)
                     .frame(width: 16)
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -409,30 +409,6 @@ private struct CodexRemoteRowView: View {
 
                 Spacer(minLength: 6)
 
-                #if os(macOS)
-                Button {
-                    openDiagnosticsWindow()
-                } label: {
-                    Image(systemName: "list.clipboard")
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-                .help("Open remote diagnostics")
-                .accessibilityLabel("Open diagnostics for \(remote.displayName)")
-                #endif
-
-                FeedbackButton(
-                    unavailableReason: actionUnavailableReason,
-                    action: {
-                        performOrExplainIdentityAccess(.diagnose)
-                    }
-                ) {
-                    Image(systemName: "stethoscope")
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-                .help(actionUnavailableReason ?? "Diagnose remote Codex over SSH")
-
                 FeedbackButton(
                     unavailableReason: actionUnavailableReason,
                     action: {
@@ -446,18 +422,50 @@ private struct CodexRemoteRowView: View {
                 .help(actionUnavailableReason ?? "Start remote App Server and connect through SSH")
             }
 
-            if !diagnostics.isEmpty {
-                VStack(spacing: 5) {
-                    ForEach(diagnostics) { step in
-                        CodexRemoteDiagnosticStepView(
-                            step: step,
-                            isBusy: isBusy,
-                            onAction: onAction
-                        )
+            #if os(macOS)
+            if diagnosticsSummary != nil || shouldShowDiagnosticsButton {
+                HStack(spacing: 6) {
+                    if let diagnosticsSummary {
+                        Image(systemName: diagnosticsSummary.icon)
+                            .foregroundStyle(diagnosticsSummary.color)
+                            .frame(width: 16)
+                        Text(diagnosticsSummary.text)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 6)
+
+                    if shouldShowDiagnosticsButton {
+                        Button {
+                            openDiagnosticsWindow()
+                        } label: {
+                            Label("Remote Diagnostics", systemImage: "list.clipboard")
+                        }
+                        .labelStyle(.titleAndIcon)
+                        .controlSize(.small)
+                        .buttonStyle(.bordered)
+                        .help("Open remote diagnostics")
+                        .accessibilityLabel("Open diagnostics for \(remote.displayName)")
                     }
                 }
                 .padding(.leading, 24)
             }
+            #else
+            if let diagnosticsSummary {
+                HStack(spacing: 6) {
+                    Image(systemName: diagnosticsSummary.icon)
+                        .foregroundStyle(diagnosticsSummary.color)
+                        .frame(width: 16)
+                    Text(diagnosticsSummary.text)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.leading, 24)
+            }
+            #endif
 
         }
         .padding(.vertical, 6)
@@ -484,6 +492,37 @@ private struct CodexRemoteRowView: View {
 
     private var isBusy: Bool {
         diagnostics.contains { $0.status == .running }
+    }
+
+    private var statusColor: Color {
+        if diagnostics.contains(where: { $0.status == .failed }) {
+            return .orange
+        }
+        if diagnostics.contains(where: { $0.status == .warning }) {
+            return .orange
+        }
+        if isBusy {
+            return .blue
+        }
+        return remote.isConnectable ? .green : .secondary
+    }
+
+    private var diagnosticsSummary: (icon: String, color: Color, text: String)? {
+        guard !diagnostics.isEmpty else { return nil }
+        if isBusy {
+            return ("arrow.triangle.2.circlepath", .blue, "Remote diagnostics running")
+        }
+        if let failed = diagnostics.first(where: { $0.status == .failed }) {
+            return ("exclamationmark.triangle.fill", .orange, failed.title)
+        }
+        if let warning = diagnostics.first(where: { $0.status == .warning }) {
+            return ("exclamationmark.triangle.fill", .orange, warning.title)
+        }
+        return nil
+    }
+
+    private var shouldShowDiagnosticsButton: Bool {
+        diagnostics.contains { $0.status == .failed || $0.status == .warning }
     }
 
     private var actionUnavailableReason: String? {
@@ -547,80 +586,6 @@ private struct CodexRemoteRowView: View {
     }
 }
 
-private struct CodexRemoteDiagnosticStepView: View {
-    var step: RuntimeDiagnosticStep
-    var isBusy: Bool
-    var onAction: (RuntimeDiagnosticAction) -> Void
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 6) {
-            Image(systemName: icon)
-                .foregroundStyle(color)
-                .frame(width: 14)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(step.title)
-                    .font(.caption2.weight(.semibold))
-                    .lineLimit(1)
-
-                if !step.detail.isEmpty {
-                    Text(step.detail)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            Spacer(minLength: 6)
-
-            if let action = step.action {
-                FeedbackButton(
-                    unavailableReason: isBusy ? "Wait for the current remote operation to finish." : nil,
-                    action: {
-                        onAction(action)
-                    }
-                ) {
-                    Label(action.label, systemImage: action.icon)
-                        .labelStyle(.titleAndIcon)
-                }
-                .controlSize(.mini)
-                .buttonStyle(.bordered)
-                .help(action.help)
-            }
-        }
-    }
-
-    private var icon: String {
-        switch step.status {
-        case .pending:
-            return "circle"
-        case .running:
-            return "arrow.triangle.2.circlepath"
-        case .passed:
-            return "checkmark.circle.fill"
-        case .warning:
-            return "exclamationmark.triangle.fill"
-        case .failed:
-            return "xmark.circle.fill"
-        }
-    }
-
-    private var color: Color {
-        switch step.status {
-        case .pending:
-            return .secondary
-        case .running:
-            return .blue
-        case .passed:
-            return .green
-        case .warning:
-            return .orange
-        case .failed:
-            return .red
-        }
-    }
-}
-
 private struct TailnetMachineRowView: View {
     var machine: TailnetMachine
     var onFill: () -> Void
@@ -671,47 +636,6 @@ private struct TailnetMachineRowView: View {
     private var detail: String {
         let platform = machine.platform == .unknown ? "tailnet" : machine.platform.rawValue
         return "\(platform) - \(machine.displayAddress)"
-    }
-}
-
-private extension RuntimeDiagnosticAction {
-    var label: String {
-        switch self {
-        case .installCodexCLI:
-            return "Install"
-        case .updateCodexCLI:
-            return "Update"
-        case .startAppServer:
-            return "Start"
-        case .restartAppServer:
-            return "Restart"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .installCodexCLI:
-            return "square.and.arrow.down"
-        case .updateCodexCLI:
-            return "arrow.triangle.2.circlepath"
-        case .startAppServer:
-            return "play.fill"
-        case .restartAppServer:
-            return "restart"
-        }
-    }
-
-    var help: String {
-        switch self {
-        case .installCodexCLI:
-            return "Install Codex CLI on the remote machine over SSH"
-        case .updateCodexCLI:
-            return "Update Codex CLI on the remote machine over SSH"
-        case .startAppServer:
-            return "Start the remote Codex App Server"
-        case .restartAppServer:
-            return "Restart the remote Codex App Server"
-        }
     }
 }
 

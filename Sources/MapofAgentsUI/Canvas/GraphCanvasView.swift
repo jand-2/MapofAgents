@@ -128,6 +128,9 @@ public struct GraphCanvasView: View {
     @State private var transientViewport: CanvasViewport?
     @State private var viewportCommitTask: Task<Void, Never>?
     @State private var remoteFolderPickerRequest: RemoteFolderPickerRequest?
+    #if os(macOS)
+    @State private var codexRemoteDiagnosticsWindow: CodexRemoteDiagnosticsWindowPresenter?
+    #endif
 
     public init(
         graphStore: GraphStore,
@@ -2328,6 +2331,18 @@ public struct GraphCanvasView: View {
             }
         }
 
+        #if os(macOS)
+        if let remote = codexRemote(forMachineNode: node) {
+            Button {
+                openCodexRemoteDiagnostics(for: remote)
+            } label: {
+                Label("Remote Diagnostics", systemImage: "list.clipboard")
+            }
+
+            Divider()
+        }
+        #endif
+
         if node.kind == .codexThread {
             Button {
                 graphStore.selectNode(node.id)
@@ -2429,6 +2444,37 @@ public struct GraphCanvasView: View {
             }
         }
     }
+
+    #if os(macOS)
+    private func codexRemote(forMachineNode node: CanvasNode) -> CodexDesktopRemote? {
+        guard node.kind == .machine,
+              let hostID = node.metadata.hostID else {
+            return nil
+        }
+        return supervisorStore.codexRemote(for: hostID)
+    }
+
+    private func openCodexRemoteDiagnostics(for remote: CodexDesktopRemote) {
+        let presenter = CodexRemoteDiagnosticsWindowPresenter(
+            supervisorStore: supervisorStore,
+            remote: remote,
+            onConnect: {
+                Task { await supervisorStore.connectCodexRemote(remote) }
+            },
+            onDiagnose: {
+                Task { await supervisorStore.diagnoseCodexRemote(remote) }
+            },
+            onAction: { action in
+                Task { await supervisorStore.performCodexRemoteAction(action, for: remote) }
+            },
+            onClose: {
+                codexRemoteDiagnosticsWindow = nil
+            }
+        )
+        codexRemoteDiagnosticsWindow = presenter
+        presenter.show()
+    }
+    #endif
 
     private func canArchiveThread(_ node: CanvasNode) -> Bool {
         canControlThread(node)

@@ -104,12 +104,6 @@ struct RootView: View {
                         },
                         onAutoArrange: { Task { await graphStore.autoArrange(availableWidth: canvasSize.width > 0 ? canvasSize.width : nil) } },
                         onSearch: showThreadSearch,
-                        onHealthCheck: runHealthCheck,
-                        onRunDiagnostics: runDiagnostics,
-                        onViewLogs: viewLogs,
-                        onToggleMachineRecovery: {
-                            isMachineRecoveryPresented.toggle()
-                        },
                         onShowActivity: showNotificationHistory,
                         onZoomOut: { Task { await graphStore.zoomViewport(by: 0.86) } },
                         onZoomIn: { Task { await graphStore.zoomViewport(by: 1.16) } },
@@ -125,8 +119,7 @@ struct RootView: View {
                         isRefreshingConnections: isRefreshingWorkflowConnections,
                         isReadingModePresented: isReadingModePresented,
                         readingThreadCount: readingThreadCount,
-                        showsSubagents: showsSubagents,
-                        isMachineRecoveryPresented: isMachineRecoveryPresented
+                        showsSubagents: showsSubagents
                     )
                     .padding(14)
                 }
@@ -415,28 +408,6 @@ struct RootView: View {
         threadCatalogStore.selectedMode = .search
         isMachinesMenuPresented = false
         isShowingNotificationHistory = false
-    }
-
-    private func runHealthCheck() {
-        refreshWorkflowConnections(showProblemsAutomatically: true)
-    }
-
-    private func runDiagnostics() {
-        Task {
-            await runtimeStore.runDiagnostics()
-            isMachinesMenuPresented = true
-        }
-    }
-
-    private func viewLogs() {
-        Task { @MainActor in
-            do {
-                let paths = try ApplicationPaths.defaultPaths()
-                NSWorkspace.shared.open(paths.applicationSupportDirectory)
-            } catch {
-                recordPersistenceError(error, action: "Open app logs")
-            }
-        }
     }
 
     private func connectRemoteMachine(name: String, endpoint: String) {

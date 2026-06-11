@@ -225,9 +225,9 @@ func remoteStartCommandRequiresAuthenticatedAppServerToken() throws {
     }
 
     #expect(linuxCommand.contains("unauthenticated App Server"))
-    #expect(windowsCommand.contains("Find-MapofAgentsTrackedAppServerToken"))
-    #expect(windowsCommand.contains("MapofAgents\\local-app-server"))
-    #expect(windowsCommand.contains("Port $port is already in use by an app-server without a readable MapofAgents token."))
+    #expect(!windowsCommand.contains("Find-MapofAgentsTrackedAppServerToken"))
+    #expect(windowsCommand.contains("Port $port is already in use by an untracked or unauthenticated App Server."))
+    #expect(CodexRemoteTunnelService.remoteStartAppServerCommand(remote: windowsRemote, remotePort: 14_500).count < 8_000)
 }
 
 @Test
@@ -398,6 +398,19 @@ func remoteRestartStopCommandOnlyTargetsTrackedAppServerPids() {
     #expect(command.contains("kill $pids") == false)
     #expect(command.contains("fuser -k") == false)
     #expect(command.contains("untracked process"))
+    #expect(command.contains("exit 64") == false)
+
+    let windowsRemote = CodexDesktopRemote(
+        id: HostID(rawValue: "windows"),
+        displayName: "Windows",
+        hostID: "windows",
+        hostname: "windows.example.test",
+        source: "test"
+    )
+    let windowsCommand = CodexRemoteTunnelService.remoteStopAppServerCommand(remote: windowsRemote, ports: [14_500])
+    let windowsScript = try? decodedPowerShellScript(from: windowsCommand)
+    #expect(windowsScript?.contains("Write-Warning \"Port $port is in use by an untracked process") == true)
+    #expect(windowsScript?.contains("throw \"Port $port is in use by an untracked process") == false)
 }
 
 private func decodedPowerShellScript(from command: String) throws -> String {

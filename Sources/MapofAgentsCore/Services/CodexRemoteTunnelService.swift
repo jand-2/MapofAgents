@@ -609,16 +609,7 @@ public enum CodexRemoteTunnelService {
         }
 
         try await stopRemoteAppServer(remote: remote, hostname: hostname)
-        guard let preferredPort = remotePortCandidates(for: remote).first else {
-            throw CodexRemoteTunnelError.tunnelFailed("No remote App Server port candidates are configured.")
-        }
-        let session = try await startRemoteAppServer(remote: remote, remotePort: preferredPort)
-        guard await waitForRemoteAppServer(remote: remote, hostname: hostname, remotePort: session.port, timeout: 12) else {
-            throw CodexRemoteTunnelError.tunnelFailed(
-                "Remote Codex App Server did not restart on 127.0.0.1:\(session.port)."
-            )
-        }
-        return session.port
+        return try await ensureRemoteAppServer(remote: remote, hostname: hostname).port
         #else
         throw CodexRemoteTunnelError.unsupportedPlatform
         #endif
@@ -727,15 +718,9 @@ public enum CodexRemoteTunnelService {
                 $tokenPath = Join-Path $env:TEMP "mapofagents-codex-app-server-$port.token"
                 $stdoutPath = Join-Path $env:TEMP "codex-app-server-$port.out.log"
                 $stderrPath = Join-Path $env:TEMP "codex-app-server-$port.err.log"
-                \(windowsTrackedAppServerTokenFunction())
                 $existing = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $port -State Listen -ErrorAction SilentlyContinue
                 if ($existing) {
-                    $existingToken = Find-MapofAgentsTrackedAppServerToken -Port $port
-                    if (-not [string]::IsNullOrWhiteSpace($existingToken)) {
-                        Write-Output "token:$existingToken"
-                        exit 0
-                    }
-                    throw "Port $port is already in use by an app-server without a readable MapofAgents token. Restart MapofAgents on Windows or free the port."
+                    throw "Port $port is already in use by an untracked or unauthenticated App Server."
                 }
 
                 $bytes = New-Object 'Byte[]' 32
@@ -828,7 +813,7 @@ public enum CodexRemoteTunnelService {
                     if (-not $stopped) {
                         $existing = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $port -State Listen -ErrorAction SilentlyContinue
                         if ($existing) {
-                            throw "Port $port is in use by an untracked process; mapofagents will not stop it."
+                            Write-Warning "Port $port is in use by an untracked process; mapofagents will not stop it."
                         }
                     }
                 }
@@ -861,7 +846,6 @@ public enum CodexRemoteTunnelService {
           if [ "$stopped" -eq 0 ]; then
             if command -v lsof >/dev/null 2>&1 && [ -n "$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)" ]; then
               echo "Port $port is in use by an untracked process; mapofagents will not stop it." >&2
-              exit 64
             fi
           fi
         done
