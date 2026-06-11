@@ -63,6 +63,7 @@ public sealed partial class MainWindow : Window
 
     private readonly ControlRoomStore _store = new();
     private readonly AppPreferencesStore _preferencesStore = new();
+    private readonly CodexAutomationStore _automationStore = new();
     private readonly MapofAgentsPairingHostService _pairingHostService = new();
     private readonly WorkflowHookEventFileBridge _workflowHookEventFileBridge = new(
         defaultHostID: LocalHostIdentity.CanonicalHostID);
@@ -105,6 +106,8 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<string, ThreadInboxCatalogThread> _threadInboxCatalogThreadsByKey = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ThreadInboxCatalogThread> _threadInboxServerCatalogThreadsByKey = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ThreadInboxCatalogThread> _threadInboxCatalogThreadsByItemId = new(StringComparer.OrdinalIgnoreCase);
+    private IReadOnlyDictionary<string, CodexAutomationSummary> _threadAutomationsByThreadId =
+        new Dictionary<string, CodexAutomationSummary>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AppServerEndpoint> _connectedAppServerEndpointsByHostId = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, IReadOnlyList<CodexModelOption>> _newThreadModelsByHostId = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, IReadOnlyList<MentionCatalogCandidate>> _mentionCatalogsByContextKey = new(StringComparer.OrdinalIgnoreCase);
@@ -177,6 +180,7 @@ public sealed partial class MainWindow : Window
     private string? _pendingLinkSourceNodeId;
     private string? _threadPopoverNodeId;
     private string? _artifactSourceNodeId;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _threadAutomationRefreshTimer;
     private ThreadArtifactItem? _selectedArtifactPreview;
     private string? _importedPairingEndpointUrl;
     private string? _importedPairingBearerToken;
@@ -2005,6 +2009,7 @@ public sealed partial class MainWindow : Window
         _newThreadModelRefreshCancellation?.Cancel();
         _newThreadModelRefreshCancellation?.Dispose();
         StopWorkflowHookEventBridge();
+        StopThreadAutomationRefreshTimer();
         _pairingHostService.StopPairingSession();
         StopAllCodexRemoteTunnels();
     }
@@ -2037,6 +2042,72 @@ public sealed partial class MainWindow : Window
         _workflowHookEventBridgeCancellation?.Dispose();
         _workflowHookEventBridgeCancellation = null;
         _workflowHookEventBridgeTask = null;
+    }
+
+    private void StartThreadAutomationRefreshTimer()
+    {
+        StopThreadAutomationRefreshTimer();
+        _threadAutomationRefreshTimer = DispatcherQueue.CreateTimer();
+        _threadAutomationRefreshTimer.Interval = TimeSpan.FromSeconds(10);
+        _threadAutomationRefreshTimer.Tick += async (_, _) =>
+        {
+            await RefreshThreadAutomationsAsync(renderAfterChange: true);
+        };
+        _threadAutomationRefreshTimer.Start();
+    }
+
+    private void StopThreadAutomationRefreshTimer()
+    {
+        _threadAutomationRefreshTimer?.Stop();
+        _threadAutomationRefreshTimer = null;
+    }
+
+    private async Task RefreshThreadAutomationsAsync(bool renderAfterChange)
+    {
+        var previousSignature = AutomationSignature(_threadAutomationsByThreadId);
+        IReadOnlyDictionary<string, CodexAutomationSummary> automations;
+        try
+        {
+            automations = await Task.Run(() => _automationStore.LoadAutomationsByThreadId());
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or CodexAutomationStoreException)
+        {
+            automations = new Dictionary<string, CodexAutomationSummary>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        _threadAutomationsByThreadId = new Dictionary<string, CodexAutomationSummary>(
+            automations,
+            StringComparer.OrdinalIgnoreCase);
+        if (!renderAfterChange ||
+            string.Equals(previousSignature, AutomationSignature(_threadAutomationsByThreadId), StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (SelectedThreadNode() is { } selectedThread &&
+            ThreadPopover.Visibility == Visibility.Visible)
+        {
+            UpdateThreadPopover(selectedThread);
+        }
+
+        UpdateChrome();
+        await RenderGraphAsync();
+    }
+
+    private static string AutomationSignature(IReadOnlyDictionary<string, CodexAutomationSummary> automations)
+    {
+        return string.Join(
+            "\u001F",
+            automations
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(pair => string.Join(
+                    "\u001E",
+                    pair.Key,
+                    pair.Value.Id,
+                    pair.Value.Name,
+                    pair.Value.Status,
+                    pair.Value.RRule,
+                    pair.Value.UpdatedAt?.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture) ?? "")));
     }
 
     private async Task ApplyWorkflowHookEventsSafelyAsync(IReadOnlyList<WorkflowEvent> events)
@@ -2312,6 +2383,8 @@ public sealed partial class MainWindow : Window
             SetStatusStripError(null);
             await RefreshWorkflowMenuAsync();
             await RefreshWorkflowMembershipsAsync();
+            await RefreshThreadAutomationsAsync(renderAfterChange: false);
+            StartThreadAutomationRefreshTimer();
             RebuildAppServerEndpointsFromGraph();
             StartWorkflowHookEventBridge();
             SyncLocalRuntimeStatusFromGraph();
@@ -6330,6 +6403,14 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void OpenThreadPopoverAutomationButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (TryGetSelectedThread(out var node))
+        {
+            await ShowThreadAutomationDialogAsync(node, sender as FrameworkElement);
+        }
+    }
+
     private async void AttachThreadPopoverFilesButton_Click(object sender, RoutedEventArgs e)
     {
         if (!ThreadPopoverComposerIsEnabled())
@@ -8374,7 +8455,8 @@ public sealed partial class MainWindow : Window
                 _graph,
                 _showsSubagents,
                 BrowsableMachineIds(),
-                SemanticEdgeResolver.ResolveEdges(_graph)));
+                SemanticEdgeResolver.ResolveEdges(_graph),
+                _threadAutomationsByThreadId));
             return;
         }
 
@@ -8385,6 +8467,7 @@ public sealed partial class MainWindow : Window
             semanticEdges = SemanticEdgeResolver.ResolveEdges(_graph),
             showsSubagents = _showsSubagents,
             browsableMachineIds = BrowsableMachineIds(),
+            threadAutomationsByThreadId = _threadAutomationsByThreadId,
             selectedNodeId = _selectedNodeId ?? "",
             selectedEdgeId = _selectedEdgeId ?? ""
         });
@@ -8549,6 +8632,9 @@ public sealed partial class MainWindow : Window
                 break;
             case "openChat":
                 await OpenThreadChatFromGraphAsync(node);
+                break;
+            case "automation":
+                await OpenThreadAutomationFromGraphAsync(node);
                 break;
             case "openReader":
                 await OpenThreadInReaderFromGraphAsync(node);
@@ -8717,6 +8803,16 @@ public sealed partial class MainWindow : Window
         AddActivity($"Opened {node.Title}.");
         UpdateChrome();
         await SendGraphCommandAsync("selectNode", node.Id);
+    }
+
+    private async Task OpenThreadAutomationFromGraphAsync(CanvasNode node)
+    {
+        if (node.Kind != NodeKinds.CodexThread)
+        {
+            return;
+        }
+
+        await ShowThreadAutomationDialogAsync(node);
     }
 
     private async Task OpenThreadInReaderFromGraphAsync(CanvasNode node)
@@ -9414,6 +9510,7 @@ public sealed partial class MainWindow : Window
             ThreadPopoverStatusText,
             ThreadPopoverStatusIcon,
             ThreadStatusPresentation.Resolve(headerStatus, isUnread));
+        ApplyThreadAutomationPresentation(node);
         var composerMetadata = ThreadComposerMetadataPresentation.Resolve(
             node.Metadata.Model,
             node.Metadata.ReasoningEffort);
@@ -9508,6 +9605,501 @@ public sealed partial class MainWindow : Window
             : presentation.RenameWindowsGlyph;
         ToolTipService.SetToolTip(ThreadPopoverTitleActionButton, toolTip);
         AutomationProperties.SetName(ThreadPopoverTitleActionButton, accessibilityName);
+    }
+
+    private void ApplyThreadAutomationPresentation(CanvasNode node)
+    {
+        var automation = ThreadAutomationFor(node);
+        var presentation = ThreadAutomationPresentation.Resolve(automation);
+        ThreadPopoverAutomationButton.Visibility = presentation.IsVisible ? Visibility.Visible : Visibility.Collapsed;
+        ThreadPopoverAutomationButton.Width = presentation.HitTargetSize;
+        ThreadPopoverAutomationButton.Height = presentation.HitTargetSize;
+        ThreadPopoverAutomationButton.MinWidth = 0;
+        ThreadPopoverAutomationButton.MinHeight = 0;
+        ThreadPopoverAutomationButton.Padding = new Thickness(0);
+        ThreadPopoverAutomationButton.Background = BrushFromHex(presentation.BackgroundHex);
+        ThreadPopoverAutomationButton.BorderThickness = new Thickness(presentation.BorderThickness);
+        ThreadPopoverAutomationButton.Foreground = BrushFromHex(presentation.ForegroundHex);
+        ThreadPopoverAutomationIcon.Glyph = presentation.WindowsGlyph;
+        ThreadPopoverAutomationIcon.FontSize = presentation.IconFontSize;
+        ThreadPopoverAutomationIcon.Foreground = BrushFromHex(presentation.ForegroundHex);
+        ToolTipService.SetToolTip(ThreadPopoverAutomationButton, presentation.ToolTip);
+        AutomationProperties.SetName(ThreadPopoverAutomationButton, presentation.AccessibilityName);
+        AutomationProperties.SetHelpText(ThreadPopoverAutomationButton, presentation.AccessibilityValue);
+    }
+
+    private CodexAutomationSummary? ThreadAutomationFor(CanvasNode node)
+    {
+        var threadID = node.Metadata.ThreadRef?.ThreadID;
+        return node.Kind == NodeKinds.CodexThread &&
+            !string.IsNullOrWhiteSpace(threadID) &&
+            _threadAutomationsByThreadId.TryGetValue(threadID, out var automation)
+                ? automation
+                : null;
+    }
+
+    private async Task ShowThreadAutomationDialogAsync(
+        CanvasNode node,
+        FrameworkElement? feedbackAnchor = null)
+    {
+        var automation = ThreadAutomationFor(node);
+        if (automation is null)
+        {
+            const string message = "No Codex automation is linked to this thread.";
+            AddActivity(message);
+            ShowCommandFeedback(message, feedbackAnchor);
+            return;
+        }
+
+        var current = automation;
+        var titleBox = AutomationTextBox(current.Name, "Automation name", 18, bold: true);
+        var promptBox = AutomationTextBox(current.Prompt, "Prompt", 13);
+        promptBox.AcceptsReturn = true;
+        promptBox.TextWrapping = TextWrapping.Wrap;
+        promptBox.MinHeight = 112;
+        promptBox.MaxHeight = 132;
+        ScrollViewer.SetVerticalScrollBarVisibility(promptBox, ScrollBarVisibility.Auto);
+
+        var statusBox = new ComboBox
+        {
+            MinWidth = 118,
+            Items =
+            {
+                new ComboBoxItem { Content = "Active", Tag = CodexAutomationStatuses.Active },
+                new ComboBoxItem { Content = "Paused", Tag = CodexAutomationStatuses.Paused }
+            }
+        };
+        var frequencyBox = new ComboBox
+        {
+            MinWidth = 116,
+            Items =
+            {
+                new ComboBoxItem { Content = "Daily", Tag = CodexAutomationScheduleFrequency.Daily.ToString() },
+                new ComboBoxItem { Content = "Weekly", Tag = CodexAutomationScheduleFrequency.Weekly.ToString() },
+                new ComboBoxItem { Content = "Custom", Tag = CodexAutomationScheduleFrequency.Custom.ToString() }
+            }
+        };
+        var timePicker = new TimePicker
+        {
+            ClockIdentifier = "24HourClock",
+            MinuteIncrement = 5,
+            Width = 128
+        };
+        var rruleBox = AutomationTextBox(current.RRule, "RRULE", 12, monospace: true);
+        rruleBox.MinWidth = 280;
+
+        var runsInText = AutomationDetailValue();
+        var nextRunText = AutomationDetailValue(secondary: true);
+        var lastRunText = AutomationDetailValue(secondary: true);
+        var intervalText = AutomationDetailValue();
+        var threadTitleText = AutomationDetailValue(node.Title);
+        var threadIDText = new TextBlock
+        {
+            Text = ShortThreadId(node.Metadata.ThreadRef?.ThreadID ?? node.Id),
+            FontSize = 11,
+            FontFamily = new FontFamily("Consolas"),
+            Foreground = BrushFromHex("#A7B0BF"),
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        var errorText = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = BrushFromHex("#FF9F0A"),
+            TextWrapping = TextWrapping.Wrap,
+            Visibility = Visibility.Collapsed
+        };
+
+        var header = new Grid
+        {
+            ColumnSpacing = 10
+        };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.Children.Add(new Border
+        {
+            Width = 28,
+            Height = 28,
+            CornerRadius = new CornerRadius(6),
+            Background = BrushFromHex(current.IsActive
+                ? ThreadAutomationPresentation.ActiveBackgroundHex
+                : "#1AA7B0BF"),
+            Child = new FontIcon
+            {
+                Glyph = ThreadAutomationPresentation.WindowsGlyph,
+                FontSize = 14,
+                Foreground = BrushFromHex(current.IsActive
+                    ? ThreadAutomationPresentation.ActiveForegroundHex
+                    : ThreadAutomationPresentation.InactiveForegroundHex)
+            }
+        });
+        var headerText = new StackPanel
+        {
+            Spacing = 2
+        };
+        headerText.Children.Add(new TextBlock
+        {
+            Text = "Automations",
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground = BrushFromHex("#A7B0BF")
+        });
+        headerText.Children.Add(new TextBlock
+        {
+            Text = current.Name,
+            FontSize = 15,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground = BrushFromHex("#F2F4F7"),
+            TextTrimming = TextTrimming.CharacterEllipsis
+        });
+        Grid.SetColumn(headerText, 1);
+        header.Children.Add(headerText);
+
+        var scheduleRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8
+        };
+        scheduleRow.Children.Add(frequencyBox);
+        scheduleRow.Children.Add(timePicker);
+        scheduleRow.Children.Add(rruleBox);
+
+        var detailsGrid = new Grid
+        {
+            ColumnSpacing = 14,
+            RowSpacing = 16
+        };
+        for (var index = 0; index < 4; index++)
+        {
+            detailsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        }
+
+        AddAutomationDetail(detailsGrid, 0, 0, "Status", statusBox);
+        AddAutomationDetail(detailsGrid, 0, 1, "Runs in", runsInText);
+        AddAutomationDetail(detailsGrid, 0, 2, "Next run", nextRunText);
+        AddAutomationDetail(detailsGrid, 0, 3, "Last run", lastRunText);
+        AddAutomationDetail(detailsGrid, 1, 0, "Chat", Stack(threadTitleText, threadIDText, spacing: 1));
+        AddAutomationDetail(detailsGrid, 1, 1, "Schedule", scheduleRow, columnSpan: 2);
+        AddAutomationDetail(detailsGrid, 1, 3, "Interval", intervalText);
+
+        var detailsSurface = new Border
+        {
+            Padding = new Thickness(12),
+            Background = BrushFromHex("#1F000000"),
+            BorderBrush = BrushFromHex("#14FFFFFF"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(10),
+            Child = detailsGrid
+        };
+
+        var body = new StackPanel
+        {
+            Width = 640,
+            Spacing = 14
+        };
+        body.Children.Add(header);
+        body.Children.Add(titleBox);
+        body.Children.Add(AutomationSection("Prompt", promptBox));
+        body.Children.Add(errorText);
+        body.Children.Add(AutomationSection("Details", detailsSurface));
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = RootGrid.XamlRoot,
+            Content = body,
+            RequestedTheme = ElementTheme.Dark,
+            PrimaryButtonText = "Save",
+            SecondaryButtonText = "Reset",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            IsPrimaryButtonEnabled = false
+        };
+
+        void SetDraft(CodexAutomationSummary source)
+        {
+            current = source;
+            var draft = CodexAutomationScheduleDraft.FromRRule(source.RRule);
+            titleBox.Text = source.Name;
+            promptBox.Text = source.Prompt;
+            SelectComboBoxTag(statusBox, source.Status.ToUpperInvariant());
+            SelectComboBoxTag(frequencyBox, draft.Frequency.ToString());
+            timePicker.Time = new TimeSpan(draft.Hour, draft.Minute, 0);
+            rruleBox.Text = source.RRule;
+            errorText.Visibility = Visibility.Collapsed;
+            UpdateScheduleControls();
+            UpdateAutomationDialogState();
+        }
+
+        string SelectedStatus()
+        {
+            return (statusBox.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? CodexAutomationStatuses.Active;
+        }
+
+        CodexAutomationScheduleFrequency SelectedFrequency()
+        {
+            var tag = (frequencyBox.SelectedItem as ComboBoxItem)?.Tag?.ToString();
+            return Enum.TryParse<CodexAutomationScheduleFrequency>(tag, out var frequency)
+                ? frequency
+                : CodexAutomationScheduleFrequency.Custom;
+        }
+
+        void ApplyScheduleControls()
+        {
+            var hour = Math.Clamp(timePicker.Time.Hours, 0, 23);
+            var minute = Math.Clamp(timePicker.Time.Minutes, 0, 59);
+            switch (SelectedFrequency())
+            {
+                case CodexAutomationScheduleFrequency.Daily:
+                    rruleBox.Text = $"RRULE:FREQ=DAILY;BYHOUR={hour};BYMINUTE={minute}";
+                    break;
+                case CodexAutomationScheduleFrequency.Weekly:
+                    var weeklyDays = CodexAutomationScheduleDraft.FromRRule(current.RRule).WeeklyDays;
+                    if (string.IsNullOrWhiteSpace(weeklyDays))
+                    {
+                        weeklyDays = WeekdayCode(DateTimeOffset.Now.DayOfWeek);
+                    }
+
+                    rruleBox.Text = $"RRULE:FREQ=WEEKLY;BYHOUR={hour};BYMINUTE={minute};BYDAY={weeklyDays}";
+                    break;
+            }
+        }
+
+        void UpdateScheduleControls()
+        {
+            var isCustom = SelectedFrequency() == CodexAutomationScheduleFrequency.Custom;
+            timePicker.Visibility = isCustom ? Visibility.Collapsed : Visibility.Visible;
+            rruleBox.Visibility = isCustom ? Visibility.Visible : Visibility.Collapsed;
+            UpdateAutomationDialogState();
+        }
+
+        void UpdateAutomationDialogState()
+        {
+            var draftName = titleBox.Text.Trim();
+            var draftRRule = rruleBox.Text.Trim();
+            var edited = new CodexAutomationSummary(
+                current.Id,
+                current.Kind,
+                draftName.Length == 0 ? current.Name : draftName,
+                promptBox.Text,
+                SelectedStatus(),
+                draftRRule,
+                current.TargetThreadID,
+                current.ExecutionEnvironment,
+                current.Model,
+                current.ReasoningEffort,
+                current.CreatedAt,
+                current.UpdatedAt,
+                current.LastRunAt,
+                current.ConfigurationPath);
+            var hasChanges =
+                !string.Equals(titleBox.Text, current.Name, StringComparison.Ordinal) ||
+                !string.Equals(promptBox.Text, current.Prompt, StringComparison.Ordinal) ||
+                !string.Equals(SelectedStatus(), current.Status.ToUpperInvariant(), StringComparison.Ordinal) ||
+                !string.Equals(draftRRule, current.RRule, StringComparison.Ordinal);
+            dialog.IsPrimaryButtonEnabled = hasChanges && draftName.Length > 0 && draftRRule.Length > 0;
+            runsInText.Text = current.RunsInDisplayName;
+            nextRunText.Text = AutomationDateText(edited.NextRun());
+            lastRunText.Text = AutomationDateText(current.LastRunAt);
+            intervalText.Text = SelectedFrequency() switch
+            {
+                CodexAutomationScheduleFrequency.Daily => $"Daily at {AutomationTimeText(timePicker.Time)}",
+                CodexAutomationScheduleFrequency.Weekly => $"Weekly at {AutomationTimeText(timePicker.Time)}",
+                _ => new CodexAutomationSchedule(draftRRule).DisplayName
+            };
+        }
+
+        titleBox.TextChanged += (_, _) => UpdateAutomationDialogState();
+        promptBox.TextChanged += (_, _) => UpdateAutomationDialogState();
+        rruleBox.TextChanged += (_, _) => UpdateAutomationDialogState();
+        statusBox.SelectionChanged += (_, _) => UpdateAutomationDialogState();
+        frequencyBox.SelectionChanged += (_, _) =>
+        {
+            ApplyScheduleControls();
+            UpdateScheduleControls();
+        };
+        timePicker.TimeChanged += (_, _) =>
+        {
+            ApplyScheduleControls();
+            UpdateAutomationDialogState();
+        };
+        dialog.SecondaryButtonClick += (_, args) =>
+        {
+            args.Cancel = true;
+            SetDraft(current);
+        };
+        dialog.PrimaryButtonClick += async (_, args) =>
+        {
+            args.Cancel = true;
+            var deferral = args.GetDeferral();
+            try
+            {
+                var saved = await SaveThreadAutomationAsync(new CodexAutomationEdit(
+                    current.Id,
+                    titleBox.Text.Trim(),
+                    promptBox.Text,
+                    SelectedStatus(),
+                    rruleBox.Text.Trim()));
+                SetDraft(saved);
+                AddActivity($"Saved automation for {node.Title}.");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or CodexAutomationStoreException)
+            {
+                errorText.Text = exception.Message;
+                errorText.Visibility = Visibility.Visible;
+            }
+            finally
+            {
+                deferral.Complete();
+            }
+        };
+
+        SetDraft(current);
+        await dialog.ShowAsync();
+    }
+
+    private async Task<CodexAutomationSummary> SaveThreadAutomationAsync(CodexAutomationEdit edit)
+    {
+        var saved = await Task.Run(() => _automationStore.Save(edit));
+        await RefreshThreadAutomationsAsync(renderAfterChange: false);
+        if (SelectedThreadNode() is { } selectedThread &&
+            ThreadPopover.Visibility == Visibility.Visible)
+        {
+            UpdateThreadPopover(selectedThread);
+        }
+
+        UpdateChrome();
+        await RenderGraphAsync();
+        return saved;
+    }
+
+    private static TextBox AutomationTextBox(
+        string text,
+        string placeholder,
+        double fontSize,
+        bool bold = false,
+        bool monospace = false)
+    {
+        return new TextBox
+        {
+            Text = text,
+            PlaceholderText = placeholder,
+            FontSize = fontSize,
+            FontWeight = bold ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Normal,
+            FontFamily = monospace ? new FontFamily("Consolas") : new FontFamily("Segoe UI"),
+            Background = BrushFromHex("#18000000"),
+            BorderBrush = BrushFromHex("#22FFFFFF"),
+            Foreground = BrushFromHex("#F2F4F7"),
+            PlaceholderForeground = BrushFromHex("#697586")
+        };
+    }
+
+    private static TextBlock AutomationDetailValue(string text = "", bool secondary = false)
+    {
+        return new TextBlock
+        {
+            Text = text,
+            FontSize = 13,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground = BrushFromHex(secondary ? "#A7B0BF" : "#F2F4F7"),
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+    }
+
+    private static StackPanel AutomationSection(string title, UIElement content)
+    {
+        return Stack(
+            new TextBlock
+            {
+                Text = title,
+                FontSize = 11,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = BrushFromHex("#A7B0BF")
+            },
+            content,
+            spacing: 6);
+    }
+
+    private static void AddAutomationDetail(
+        Grid grid,
+        int row,
+        int column,
+        string title,
+        UIElement content,
+        int columnSpan = 1)
+    {
+        while (grid.RowDefinitions.Count <= row)
+        {
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        }
+
+        var stack = AutomationSection(title, content);
+        Grid.SetRow(stack, row);
+        Grid.SetColumn(stack, column);
+        if (columnSpan > 1)
+        {
+            Grid.SetColumnSpan(stack, columnSpan);
+        }
+
+        grid.Children.Add(stack);
+    }
+
+    private static StackPanel Stack(UIElement first, UIElement second, double spacing)
+    {
+        var stack = new StackPanel
+        {
+            Spacing = spacing
+        };
+        stack.Children.Add(first);
+        stack.Children.Add(second);
+        return stack;
+    }
+
+    private static void SelectComboBoxTag(ComboBox comboBox, string tag)
+    {
+        foreach (var item in comboBox.Items.OfType<ComboBoxItem>())
+        {
+            if (string.Equals(item.Tag?.ToString(), tag, StringComparison.OrdinalIgnoreCase))
+            {
+                comboBox.SelectedItem = item;
+                return;
+            }
+        }
+
+        if (comboBox.Items.Count > 0)
+        {
+            comboBox.SelectedIndex = 0;
+        }
+    }
+
+    private static string AutomationDateText(DateTimeOffset? date)
+    {
+        return date is null
+            ? "-"
+            : date.Value.ToLocalTime().ToString("g", CultureInfo.CurrentCulture);
+    }
+
+    private static string AutomationTimeText(TimeSpan time)
+    {
+        return DateTime.Today.Add(time).ToString("t", CultureInfo.CurrentCulture);
+    }
+
+    private static string ShortThreadId(string threadID)
+    {
+        return threadID.Length > 14 ? $"{threadID[..8]}...{threadID[^4..]}" : threadID;
+    }
+
+    private static string WeekdayCode(DayOfWeek day)
+    {
+        return day switch
+        {
+            DayOfWeek.Sunday => "SU",
+            DayOfWeek.Monday => "MO",
+            DayOfWeek.Tuesday => "TU",
+            DayOfWeek.Wednesday => "WE",
+            DayOfWeek.Thursday => "TH",
+            DayOfWeek.Friday => "FR",
+            DayOfWeek.Saturday => "SA",
+            _ => "MO"
+        };
     }
 
     private void UpdateThreadPopoverTranscriptState(

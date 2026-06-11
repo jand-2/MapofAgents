@@ -2332,30 +2332,52 @@
 		                                <FontIcon x:Name="CloseThreadPopoverIcon" Glyph="&#xE711;" FontSize="12" />
 		                            </Button>
 	                        </StackPanel>
-                        <Border
-                            x:Name="ThreadPopoverStatusPill"
-                            MinWidth="0"
-                            Padding="8,4"
-                            CornerRadius="10"
-                            Background="#1CA7B0BF"
-                            BorderBrush="#00FFFFFF"
-                            BorderThickness="0"
+                        <StackPanel
+                            x:Name="ThreadPopoverStatusStack"
+                            Orientation="Horizontal"
+                            Spacing="8"
                             HorizontalAlignment="Right">
-                            <StackPanel Orientation="Horizontal" Spacing="5" HorizontalAlignment="Center">
-                                <Viewbox
-                                    x:Name="ThreadPopoverStatusIcon"
-                                    Width="11"
-                                    Height="11"
-                                    VerticalAlignment="Center"
-                                    Stretch="Uniform" />
-                                <TextBlock
-                                    x:Name="ThreadPopoverStatusText"
-                                    Text="idle"
-                                    FontSize="11"
-                                    FontWeight="SemiBold"
+                            <Button
+                                x:Name="ThreadPopoverAutomationButton"
+                                AutomationProperties.Name="Thread automation"
+                                Click="OpenThreadPopoverAutomationButton_Click"
+                                ToolTipService.ToolTip="Thread automation"
+                                Width="24"
+                                Height="24"
+                                Padding="0"
+                                Background="#00FFFFFF"
+                                BorderThickness="0"
+                                Visibility="Collapsed">
+                                <FontIcon
+                                    x:Name="ThreadPopoverAutomationIcon"
+                                    Glyph="&#xE823;"
+                                    FontSize="12"
                                     Foreground="#A7B0BF" />
-                            </StackPanel>
-                        </Border>
+                            </Button>
+                            <Border
+                                x:Name="ThreadPopoverStatusPill"
+                                MinWidth="0"
+                                Padding="8,4"
+                                CornerRadius="10"
+                                Background="#1CA7B0BF"
+                                BorderBrush="#00FFFFFF"
+                                BorderThickness="0">
+                                <StackPanel Orientation="Horizontal" Spacing="5" HorizontalAlignment="Center">
+                                    <Viewbox
+                                        x:Name="ThreadPopoverStatusIcon"
+                                        Width="11"
+                                        Height="11"
+                                        VerticalAlignment="Center"
+                                        Stretch="Uniform" />
+                                    <TextBlock
+                                        x:Name="ThreadPopoverStatusText"
+                                        Text="idle"
+                                        FontSize="11"
+                                        FontWeight="SemiBold"
+                                        Foreground="#A7B0BF" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
                     </StackPanel>
                 </Grid>
 

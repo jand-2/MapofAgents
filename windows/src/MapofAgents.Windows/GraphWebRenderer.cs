@@ -9,7 +9,8 @@ internal static class GraphWebRenderer
         AgentGraph graph,
         bool showsSubagents = true,
         IReadOnlyCollection<string>? browsableMachineIds = null,
-        IReadOnlyList<CanvasEdge>? semanticEdges = null)
+        IReadOnlyList<CanvasEdge>? semanticEdges = null,
+        IReadOnlyDictionary<string, CodexAutomationSummary>? threadAutomationsByThreadId = null)
     {
         var graphJson = JsonSerializer.Serialize(graph, MapofAgentsJson.Options);
         var showsSubagentsJson = JsonSerializer.Serialize(showsSubagents, MapofAgentsJson.Options);
@@ -18,6 +19,9 @@ internal static class GraphWebRenderer
             MapofAgentsJson.Options);
         var semanticEdgesJson = JsonSerializer.Serialize(
             semanticEdges ?? SemanticEdgeResolver.ResolveEdges(graph),
+            MapofAgentsJson.Options);
+        var threadAutomationsByThreadIdJson = JsonSerializer.Serialize(
+            threadAutomationsByThreadId ?? new Dictionary<string, CodexAutomationSummary>(),
             MapofAgentsJson.Options);
         var statusPresentationsJson = JsonSerializer.Serialize(
             GraphNodeStatusPresentation.WebPresentationMap(),
@@ -46,6 +50,9 @@ internal static class GraphWebRenderer
             MapofAgentsJson.Options);
         var linkActionPresentationJson = JsonSerializer.Serialize(
             GraphNodeLinkActionPresentation.WebConfig(),
+            MapofAgentsJson.Options);
+        var threadAutomationPresentationJson = JsonSerializer.Serialize(
+            ThreadAutomationPresentation.WebConfig(),
             MapofAgentsJson.Options);
         var nodeCardPresentation = GraphNodeCardPresentation.Resolve();
         var nodeCardMaterial = GraphNodeCardPresentation.WebMaterial();
@@ -316,6 +323,12 @@ body {
   border: var(--node-link-active-border-width, 1.3px) solid currentColor;
   border-radius: var(--node-link-active-border-radius, 999px);
   background: transparent;
+}
+
+.node-action.automation-active {
+  color: var(--node-automation-active-color, #ff9f0a);
+  background: var(--node-automation-active-background, #1cff9f0a);
+  border-radius: 999px;
 }
 
 .node-link-icon {
@@ -759,6 +772,7 @@ body {
 <script>
 let graph = {{graphJson}};
 let semanticEdges = {{semanticEdgesJson}};
+let threadAutomationsByThreadId = {{threadAutomationsByThreadIdJson}};
 const stage = document.getElementById("stage");
 const canvas = document.getElementById("edges");
 const world = document.getElementById("world");
@@ -791,6 +805,9 @@ let view = {
 			const edgeVisualTreatment = {{edgeVisualTreatmentJson}};
 			const folderActionPresentation = {{folderActionPresentationJson}};
 			const linkActionPresentation = {{linkActionPresentationJson}};
+			const threadAutomationPresentation = {{threadAutomationPresentationJson}};
+			document.documentElement.style.setProperty("--node-automation-active-color", threadAutomationPresentation.activeForegroundHex || "#FF9F0A");
+			document.documentElement.style.setProperty("--node-automation-active-background", threadAutomationPresentation.activeBackgroundHex || "#1CFF9F0A");
 			document.documentElement.style.setProperty("--node-link-active-color", linkActionPresentation.activeHex || "#30D158");
 			document.documentElement.style.setProperty("--node-link-active-border-width", `${linkActionPresentation.activeBorderWidth || 1.3}px`);
 			document.documentElement.style.setProperty("--node-link-active-border-radius", `${linkActionPresentation.activeBorderRadius || 999}px`);
@@ -1100,6 +1117,10 @@ function formatThreadRelativeTime(signedValue, unit) {
 }
 
 		function nodeActionsHtml(node) {
+	  const automation = automationFor(node);
+	  const automationAction = automation
+	    ? `<button class="node-action node-automation-action${automation.isActive ? " automation-active" : ""}" data-command="automation" title="${escapeText(automationHelp(automation))}" aria-label="Thread automation" aria-description="${escapeText(automationHelp(automation))}">${escapeText(threadAutomationPresentation.glyph || "\uE823")}</button>`
+	    : "";
 	  const canChooseFolder = canChooseProject(node);
 	  const canAddFolder = node.kind === "machine" && (canChooseFolder || node.metadata?.hostStatus === "connected");
 	  const folderPresentation = folderActionFor(canChooseFolder, canAddFolder);
@@ -1113,10 +1134,25 @@ function formatThreadRelativeTime(signedValue, unit) {
 		  const drawLink = linkActionPresentation.draw;
 		  return `
 		    <div class="node-actions">
+	      ${automationAction}
 	      ${folderAction}
 	      <button class="node-action node-link-action" data-command="link" title="${escapeText(drawLink.label)}" aria-label="${escapeText(drawLink.label)}">${linkActionIconHtml(drawLink)}</button>
 	    </div>`;
 			}
+
+		function automationFor(node) {
+		  const threadId = node?.metadata?.threadRef?.threadID;
+		  if (node?.kind !== "codexThread" || !threadId) {
+		    return null;
+		  }
+
+		  return threadAutomationsByThreadId?.[threadId] || null;
+		}
+
+		function automationHelp(automation) {
+		  const state = automation?.isActive ? "active" : "paused";
+		  return `${automation?.name || "Thread"} automation is ${state}`;
+		}
 
 		function folderActionFor(canChooseFolder, canAddFolder) {
 		  if (canChooseFolder) {
@@ -1183,11 +1219,19 @@ function formatThreadRelativeTime(signedValue, unit) {
 	  }
 
 	  if (node.kind === "codexThread") {
+	    const automation = automationFor(node);
 	    const isUnread = Boolean(node.metadata?.isUnread);
 	    const isArchived = Boolean(node.metadata?.isArchived);
 	    const isRunning = node.metadata?.runStatus === "running";
 	    const hasThreadRef = Boolean(node.metadata?.threadRef?.threadID);
 	    items.push({ command: "openChat", icon: "&#xE8F2;", text: "Open Chat" });
+	    if (automation) {
+	      items.push({
+	        command: "automation",
+	        icon: threadAutomationPresentation.glyph || "\uE823",
+	        text: "Automation"
+	      });
+	    }
 	    items.push({ command: "openReader", icon: "&#xE8A5;", text: "Open in Reader" });
 	    items.push({
 	      command: "toggleRead",
@@ -2237,6 +2281,9 @@ function applyGraphUpdate(payload) {
   }
   if (Array.isArray(payload.browsableMachineIds)) {
     browsableMachineIds = new Set(payload.browsableMachineIds);
+  }
+  if (payload.threadAutomationsByThreadId && typeof payload.threadAutomationsByThreadId === "object") {
+    threadAutomationsByThreadId = payload.threadAutomationsByThreadId;
   }
   const previousSelectedNodeId = selectedNodeId;
   const previousSelectedEdgeId = selectedEdgeId;
