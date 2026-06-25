@@ -148,3 +148,11 @@ Date: 2026-06-11
 - Added alarm indicators to Windows graph nodes, node context menus, and thread popovers.
 - Added a Windows automation editing dialog with matching status, prompt, and schedule controls.
 - Added Windows presentation and automation store tests.
+
+## 92be560 - Gate folder events by mapped source thread
+
+Date: 2026-06-24
+
+- Required `folder.created` hook events to come from a source thread already represented on the active map before materializing a folder.
+- Reused the source-thread membership gate when replaying or consuming folder events on macOS and Windows.
+- Added Swift and Windows tests for accepting mapped source threads and ignoring unmapped source threads.
