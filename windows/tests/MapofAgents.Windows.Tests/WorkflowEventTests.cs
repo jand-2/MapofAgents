@@ -59,6 +59,27 @@ public sealed class WorkflowEventTests
                 HostStatus = HostStatuses.Connected
             }
         };
+        graph.Nodes["source-thread-node"] = new CanvasNode
+        {
+            Id = "source-thread-node",
+            Kind = NodeKinds.CodexThread,
+            Title = "Source thread",
+            Subtitle = "/Users/example/project",
+            Position = new CanvasPoint(120, 330),
+            Size = CanvasSize.Thread,
+            Metadata = new NodeMetadata
+            {
+                HostID = "local",
+                Platform = HostPlatforms.MacOS,
+                ThreadRef = new ThreadRef
+                {
+                    HostID = "local",
+                    ThreadID = "source-thread",
+                    Cwd = "/Users/example/project",
+                    Name = "Source thread"
+                }
+            }
+        };
 
         var result = WorkflowEventIngestor.Apply(graph, workflowEvent!);
 
@@ -70,6 +91,22 @@ public sealed class WorkflowEventTests
         Assert.AreEqual(@"C:\Users\Example\Desktop", folder.Metadata.FolderPath);
         Assert.AreEqual("remote-windows", folder.Metadata.HostID);
         Assert.AreEqual(HostPlatforms.Windows, folder.Metadata.Platform);
+    }
+
+    [TestMethod]
+    public void WorkflowEventIngestorIgnoresFolderCreatedFromUnmappedThread()
+    {
+        var line = File.ReadAllText(SharedWorkflowEventFixturePath("folder-created.json"));
+        var workflowEvent = WorkflowEventParser.Parse(line);
+        Assert.IsNotNull(workflowEvent);
+        var graph = AgentGraph.CreateStarter("DESKTOP-EXAMPLE");
+
+        var result = WorkflowEventIngestor.Apply(graph, workflowEvent!);
+
+        Assert.IsFalse(result.Applied);
+        Assert.IsNull(result.NodeID);
+        Assert.AreEqual("Ignored folder.created from unmapped source thread.", result.Message);
+        Assert.IsFalse(graph.Nodes.Values.Any(node => node.Kind == NodeKinds.Folder));
     }
 
     [TestMethod]

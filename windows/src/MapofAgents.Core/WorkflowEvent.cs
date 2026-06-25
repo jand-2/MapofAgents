@@ -659,6 +659,11 @@ public static class WorkflowEventIngestor
             return new WorkflowEventIngestionResult(false, null, "Ignored folder.created without folderPath.");
         }
 
+        if (!graph.ContainsWorkflowThread(workflowEvent.HostID, workflowEvent.ThreadID))
+        {
+            return new WorkflowEventIngestionResult(false, null, "Ignored folder.created from unmapped source thread.");
+        }
+
         var childHostID = string.IsNullOrWhiteSpace(workflowEvent.ChildHostID)
             ? workflowEvent.HostID ?? LocalHostIdentity.CanonicalHostID
             : workflowEvent.ChildHostID;

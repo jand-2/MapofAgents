@@ -499,6 +499,23 @@ public sealed class AgentGraph
         };
     }
 
+    public bool ContainsWorkflowThread(string? hostID, string? threadID)
+    {
+        if (string.IsNullOrWhiteSpace(threadID))
+        {
+            return false;
+        }
+
+        var trimmedThreadID = threadID.Trim();
+        var trimmedHostID = hostID?.Trim();
+        return Nodes.Values.Any(node =>
+            node.Kind == NodeKinds.CodexThread &&
+            node.Metadata.ThreadRef is { } threadRef &&
+            string.Equals(threadRef.ThreadID, trimmedThreadID, StringComparison.OrdinalIgnoreCase) &&
+            (string.IsNullOrWhiteSpace(trimmedHostID) ||
+                string.Equals(threadRef.HostID, trimmedHostID, StringComparison.OrdinalIgnoreCase)));
+    }
+
     public string? MaterializeWorkflowFolderRoot(
         string path,
         string hostID,

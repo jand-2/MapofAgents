@@ -46,6 +46,12 @@ public final class GraphStore {
         }
     }
 
+    public func containsWorkflowThread(hostID: HostID?, threadID: String?) -> Bool {
+        workflowThreadRefs.contains { threadRef in
+            threadRef.matches(hostID: hostID, threadID: threadID)
+        }
+    }
+
     public func workflowThreadMentionCandidates(excluding excludedThreadRef: ThreadRef? = nil) -> [MentionCandidate] {
         graph.sortedNodes.compactMap { node in
             guard
@@ -689,6 +695,24 @@ public final class GraphStore {
         )
         await apply(.upsertNode(node))
         return node.id
+    }
+
+    @discardableResult
+    public func materializeWorkflowFolderRoot(from event: WorkflowEvent) async -> NodeID? {
+        guard event.kind == .folderCreated,
+              containsWorkflowThread(hostID: event.hostID, threadID: event.threadID),
+              let path = event.childFolderPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty,
+              let hostID = event.childHostID ?? event.hostID
+        else {
+            return nil
+        }
+
+        return await materializeWorkflowFolderRoot(
+            path: path,
+            hostID: hostID,
+            title: event.childTitle
+        )
     }
 
     private func createdThreadDisplayTitle(

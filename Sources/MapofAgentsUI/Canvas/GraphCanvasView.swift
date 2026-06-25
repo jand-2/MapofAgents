@@ -3242,18 +3242,7 @@ public struct GraphCanvasView: View {
 
     private func materializeCreatedFolderIfNeeded(from event: WorkflowEvent) async {
         if event.kind == .folderCreated {
-            guard let path = event.childFolderPath?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !path.isEmpty,
-                  let hostID = event.childHostID ?? event.hostID
-            else {
-                return
-            }
-
-            await graphStore.materializeWorkflowFolderRoot(
-                path: path,
-                hostID: hostID,
-                title: event.childTitle
-            )
+            await graphStore.materializeWorkflowFolderRoot(from: event)
             return
         }
 

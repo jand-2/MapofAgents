@@ -634,17 +634,7 @@ struct RootView: View {
                 return false
             }
 
-            let sourceMatches = event.threadID.map { threadID in
-                graphStore.workflowThreadRefs.contains { threadRef in
-                    threadRef.matches(hostID: event.hostID, threadID: threadID)
-                }
-            } ?? false
-            let targetHostID = event.childHostID ?? event.hostID ?? runtimeStore.localHost.id
-            let targetHostMatches = targetHostID == runtimeStore.localHost.id
-                || graphStore.graph.nodes.values.contains {
-                    $0.kind == .machine && $0.metadata.hostID == targetHostID
-                }
-            return sourceMatches || targetHostMatches
+            return graphStore.containsWorkflowThread(hostID: event.hostID, threadID: event.threadID)
         }
 
         guard let threadID = event.threadID else {

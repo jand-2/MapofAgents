@@ -921,6 +921,65 @@ func materializeWorkflowFolderRootIgnoresDescendantFolders() async throws {
 
 @Test
 @MainActor
+func materializeWorkflowFolderRootFromEventRequiresMappedSourceThread() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-folder-created-source-tests-\(UUID().uuidString)", isDirectory: true)
+    let store = LocalControlRoomStore(paths: ApplicationPaths(applicationSupportDirectory: directory))
+    let graphStore = GraphStore(repository: store)
+
+    let ignoredID = await graphStore.materializeWorkflowFolderRoot(
+        from: WorkflowEvent(
+            kind: .folderCreated,
+            hostID: HostID(rawValue: "local"),
+            threadID: "unmapped-thread",
+            method: "folder/created",
+            summary: "Created folder",
+            childHostID: HostID(rawValue: "local"),
+            childFolderPath: "/Users/example/projects/unmapped",
+            childTitle: "unmapped"
+        )
+    )
+    #expect(ignoredID == nil)
+    #expect(graphStore.graph.nodes.values.contains { $0.kind == .folder } == false)
+
+    let sourceRef = ThreadRef(
+        hostID: HostID(rawValue: "local"),
+        threadID: "source-thread",
+        cwd: "/Users/example/projects/current",
+        name: "Source"
+    )
+    await graphStore.addThreadNode(
+        threadRef: sourceRef,
+        model: "gpt-5.5",
+        reasoningEffort: "low",
+        title: "Source"
+    )
+
+    let folderID = try #require(
+        await graphStore.materializeWorkflowFolderRoot(
+            from: WorkflowEvent(
+                kind: .folderCreated,
+                hostID: sourceRef.hostID,
+                threadID: sourceRef.threadID,
+                method: "folder/created",
+                summary: "Created folder",
+                childHostID: sourceRef.hostID,
+                childFolderPath: "/Users/example/projects/mapped",
+                childTitle: "mapped"
+            )
+        )
+    )
+    let folder = try #require(graphStore.graph.nodes[folderID])
+    #expect(folder.kind == .folder)
+    #expect(folder.title == "mapped")
+    #expect(folder.metadata.folderPath == "/Users/example/projects/mapped")
+    #expect(folder.metadata.hostID == sourceRef.hostID)
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+@MainActor
 func autoArrangePlacesProjectThreadsAfterFoldersAndScratchThreadsAfterMachine() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("mapofagents-arrange-tests-\(UUID().uuidString)", isDirectory: true)
