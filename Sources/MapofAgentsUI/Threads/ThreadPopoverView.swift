@@ -349,6 +349,8 @@ struct ThreadPopoverView: View {
     @State private var isFileImporterPresented = false
     @State private var attachmentError: String?
     @State private var activeRowCategories = Set(TranscriptRowCategory.allCases)
+    @State private var currentUserMessageNavigationID: String?
+    @State private var manualTranscriptNavigationStartedAt: Date?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -654,108 +656,151 @@ struct ThreadPopoverView: View {
 
     private var messageList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                let messages = displayMessages
-                let timeline = displayTimeline
-                let filteredMessages = messages.filter { $0.transcriptRowCategories.isDisjoint(with: activeRowCategories) == false }
-                let categoryCounts = transcriptCategoryCounts
-                let canLoadOlder = transcript?.nextCursor?.isEmpty == false
-                let hasLoadedMessages = !messages.isEmpty || timeline?.turns.isEmpty == false
-                let visibleFilterCount = activeRowCategories.reduce(0) { partial, category in
-                    partial + (categoryCounts[category] ?? 0)
-                }
-                let hasFilterableContent = categoryCounts.values.contains { $0 > 0 }
+            let navigationEntries = userMessageNavigationEntries
 
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if activeRowCategories.contains(.progress), isLoading, !hasLoadedMessages {
-                        LoadingTranscriptRow(phase: loadPhase)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 30)
-                    } else if activeRowCategories.contains(.progress), isLoading || isLoadingOlder {
-                        LoadingTranscriptRow(phase: isLoadingOlder ? .loadingOlder : loadPhase, compact: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            ZStack(alignment: .leading) {
+                ScrollView {
+                    let messages = displayMessages
+                    let timeline = displayTimeline
+                    let filteredMessages = messages.filter { $0.transcriptRowCategories.isDisjoint(with: activeRowCategories) == false }
+                    let categoryCounts = transcriptCategoryCounts
+                    let canLoadOlder = transcript?.nextCursor?.isEmpty == false
+                    let hasLoadedMessages = !messages.isEmpty || timeline?.turns.isEmpty == false
+                    let visibleFilterCount = activeRowCategories.reduce(0) { partial, category in
+                        partial + (categoryCounts[category] ?? 0)
                     }
+                    let hasFilterableContent = categoryCounts.values.contains { $0 > 0 }
 
-                    if canLoadOlder {
-                        FeedbackButton(
-                            unavailableReason: isLoadingOlder ? "Older messages are already loading." : nil,
-                            action: {
-                                pendingOlderAnchorID = filteredMessages.first?.id ?? messages.first?.id
-                                onLoadOlder()
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        if activeRowCategories.contains(.progress), isLoading, !hasLoadedMessages {
+                            LoadingTranscriptRow(phase: loadPhase)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 30)
+                        } else if activeRowCategories.contains(.progress), isLoading || isLoadingOlder {
+                            LoadingTranscriptRow(phase: isLoadingOlder ? .loadingOlder : loadPhase, compact: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
+                        if canLoadOlder {
+                            FeedbackButton(
+                                unavailableReason: isLoadingOlder ? "Older messages are already loading." : nil,
+                                action: {
+                                    pendingOlderAnchorID = filteredMessages.first?.id ?? messages.first?.id
+                                    onLoadOlder()
+                                }
+                            ) {
+                                OlderMessagesButtonLabel(isLoading: isLoadingOlder)
                             }
-                        ) {
-                            OlderMessagesButtonLabel(isLoading: isLoadingOlder)
+                            .buttonStyle(.plain)
+                            .frame(maxWidth: .infinity, alignment: .center)
                         }
-                        .buttonStyle(.plain)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                    }
 
-                    if activeRowCategories.contains(.system), let errorMessage {
-                        TranscriptErrorBanner(
-                            message: errorMessage,
-                            hasCachedTranscript: hasLoadedMessages,
-                            onRetry: onRefresh,
-                            onUseCached: onUseCachedTranscript
-                        )
-                    }
-
-                    if let timeline, !timeline.turns.isEmpty {
-                        ForEach(timeline.turns) { turn in
-                            ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
-                        }
-                    } else {
-                        ForEach(filteredMessages) { message in
-                            ThreadMessageRow(message: message)
-                                .id(message.id)
-                        }
-                    }
-
-                    if activeRowCategories.contains(.messages), !liveAssistantText.isEmpty {
-                        ThreadMessageRow(
-                            message: ThreadMessage(
-                                role: .assistant,
-                                text: liveAssistantText
+                        if activeRowCategories.contains(.system), let errorMessage {
+                            TranscriptErrorBanner(
+                                message: errorMessage,
+                                hasCachedTranscript: hasLoadedMessages,
+                                onRetry: onRefresh,
+                                onUseCached: onUseCachedTranscript
                             )
-                        )
-                        .id("live-assistant")
-                    }
-
-                    if activeRowCategories.contains(.approvals), !attentionRequests.isEmpty {
-                        ForEach(attentionRequests) { request in
-                            VStack(alignment: .leading, spacing: 6) {
-                                TranscriptCategoryPill(category: .approvals, title: "Approval")
-
-                                AttentionRequestCardView(
-                                    request: request,
-                                    onFocus: onFocusAttention,
-                                    onRespond: onRespondToAttention,
-                                    onRespondWithText: onRespondToAttentionWithText,
-                                    onDeclineTyped: onDeclineTypedAttention
-                                )
-                            }
-                            .id("attention-\(request.id)")
                         }
-                    }
 
-                    if hasFilterableContent, visibleFilterCount == 0 {
-                        FilteredTranscriptEmptyState(selection: $activeRowCategories)
-                            .frame(maxWidth: .infinity, minHeight: 180)
-                    }
+                        if let timeline, !timeline.turns.isEmpty {
+                            ForEach(timeline.turns) { turn in
+                                if let navigationMessageID = turn.items.first(where: { $0.message.role == .user })?.message.id {
+                                    ThreadUserMessageNavigationTarget(messageID: navigationMessageID) {
+                                        ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
+                                    }
+                                } else {
+                                    ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
+                                }
+                            }
+                        } else {
+                            ForEach(filteredMessages) { message in
+                                if message.role == .user {
+                                    ThreadUserMessageNavigationTarget(messageID: message.id) {
+                                        ThreadMessageRow(message: message)
+                                            .id(message.id)
+                                    }
+                                } else {
+                                    ThreadMessageRow(message: message)
+                                        .id(message.id)
+                                }
+                            }
+                        }
 
-                    if activeRowCategories.contains(.system), transcript?.messages.isEmpty != false, liveAssistantText.isEmpty, !isLoading, !isAwaitingResponse {
-                        ContentUnavailableView(
-                            "No loaded turns",
-                            systemImage: "text.bubble",
-                            description: Text("Send the first message or refresh after the thread starts responding.")
-                        )
-                        .frame(maxWidth: .infinity, minHeight: 220)
-                    }
+                        if activeRowCategories.contains(.messages), !liveAssistantText.isEmpty {
+                            ThreadMessageRow(
+                                message: ThreadMessage(
+                                    role: .assistant,
+                                    text: liveAssistantText
+                                )
+                            )
+                            .id("live-assistant")
+                        }
 
-                    Color.clear
-                        .frame(height: 1)
-                        .id(Self.messageBottomAnchorID)
+                        if activeRowCategories.contains(.approvals), !attentionRequests.isEmpty {
+                            ForEach(attentionRequests) { request in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    TranscriptCategoryPill(category: .approvals, title: "Approval")
+
+                                    AttentionRequestCardView(
+                                        request: request,
+                                        onFocus: onFocusAttention,
+                                        onRespond: onRespondToAttention,
+                                        onRespondWithText: onRespondToAttentionWithText,
+                                        onDeclineTyped: onDeclineTypedAttention
+                                    )
+                                }
+                                .id("attention-\(request.id)")
+                            }
+                        }
+
+                        if hasFilterableContent, visibleFilterCount == 0 {
+                            FilteredTranscriptEmptyState(selection: $activeRowCategories)
+                                .frame(maxWidth: .infinity, minHeight: 180)
+                        }
+
+                        if activeRowCategories.contains(.system), transcript?.messages.isEmpty != false, liveAssistantText.isEmpty, !isLoading, !isAwaitingResponse {
+                            ContentUnavailableView(
+                                "No loaded turns",
+                                systemImage: "text.bubble",
+                                description: Text("Send the first message or refresh after the thread starts responding.")
+                            )
+                            .frame(maxWidth: .infinity, minHeight: 220)
+                        }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.messageBottomAnchorID)
+                    }
+                    .padding(.top, 14)
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 14)
+                    .padding(.leading, navigationEntries.isEmpty ? 14 : 42)
                 }
-                .padding(14)
+                .coordinateSpace(name: ThreadUserMessageNavigationLayout.coordinateSpaceName)
+                .onPreferenceChange(ThreadUserMessageNavigationAnchorPreferenceKey.self) { positions in
+                    updateCurrentUserMessageNavigationID(from: positions, entries: navigationEntries)
+                }
+                .onChange(of: navigationEntries.map(\.id)) { _, entryIDs in
+                    if entryIDs.isEmpty {
+                        currentUserMessageNavigationID = nil
+                    } else if currentUserMessageNavigationID.map(entryIDs.contains) != true {
+                        currentUserMessageNavigationID = entryIDs.first
+                    }
+                }
+
+                if !navigationEntries.isEmpty {
+                    ThreadUserMessageNavigationRail(
+                        entries: navigationEntries,
+                        currentEntryID: currentUserMessageNavigationID
+                    ) { entry in
+                        scrollToUserMessage(entry, with: proxy)
+                    }
+                    .frame(width: 36)
+                    .padding(.leading, 2)
+                    .padding(.vertical, 10)
+                }
             }
             .onChange(of: transcript?.messages.last?.id) { _, id in
                 guard let id else { return }
@@ -781,6 +826,56 @@ struct ThreadPopoverView: View {
             .task(id: threadIdentity) {
                 scrollToBottom(with: proxy, animated: false)
             }
+        }
+    }
+
+    private var userMessageNavigationEntries: [ThreadUserMessageNavigationEntry] {
+        guard activeRowCategories.contains(.messages) else {
+            return []
+        }
+
+        if let timeline = displayTimeline, !timeline.turns.isEmpty {
+            return timeline.turns
+                .compactMap { turn -> (ThreadMessage, [ThreadTurnItem])? in
+                    guard let userItem = turn.items.first(where: { $0.message.role == .user }) else {
+                        return nil
+                    }
+                    return (userItem.message, turn.items)
+                }
+                .enumerated()
+                .map { offset, turn in
+                    ThreadUserMessageNavigationEntry(
+                        userMessage: turn.0,
+                        turnItems: turn.1,
+                        index: offset + 1
+                    )
+                }
+        }
+
+        var groupedMessages: [(user: ThreadMessage, messages: [ThreadMessage])] = []
+        var currentUser: ThreadMessage?
+        var currentMessages: [ThreadMessage] = []
+        for message in displayMessages {
+            if message.role == .user {
+                if let currentUser {
+                    groupedMessages.append((currentUser, currentMessages))
+                }
+                currentUser = message
+                currentMessages = [message]
+            } else if currentUser != nil {
+                currentMessages.append(message)
+            }
+        }
+        if let currentUser {
+            groupedMessages.append((currentUser, currentMessages))
+        }
+
+        return groupedMessages.enumerated().map { offset, group in
+            ThreadUserMessageNavigationEntry(
+                userMessage: group.user,
+                messages: group.messages,
+                index: offset + 1
+            )
         }
     }
 
@@ -893,6 +988,7 @@ struct ThreadPopoverView: View {
 
     private func scrollToMessageEnd(_ messageID: String, with proxy: ScrollViewProxy) {
         guard pendingOlderAnchorID == nil else { return }
+        guard !isManualTranscriptNavigationActive else { return }
         withAnimation(.snappy) {
             proxy.scrollTo(messageID, anchor: .bottom)
         }
@@ -901,6 +997,7 @@ struct ThreadPopoverView: View {
 
     private func scrollToBottom(with proxy: ScrollViewProxy, animated: Bool = true) {
         guard pendingOlderAnchorID == nil else { return }
+        guard !isManualTranscriptNavigationActive else { return }
         let action = {
             proxy.scrollTo(Self.messageBottomAnchorID, anchor: .bottom)
         }
@@ -910,6 +1007,60 @@ struct ThreadPopoverView: View {
             }
         } else {
             action()
+        }
+    }
+
+    private func scrollToUserMessage(_ entry: ThreadUserMessageNavigationEntry, with proxy: ScrollViewProxy) {
+        pendingOlderAnchorID = nil
+        currentUserMessageNavigationID = entry.id
+        manualTranscriptNavigationStartedAt = Date()
+        proxy.scrollTo(entry.scrollAnchorID, anchor: .top)
+    }
+
+    private var isManualTranscriptNavigationActive: Bool {
+        guard let manualTranscriptNavigationStartedAt else {
+            return false
+        }
+        return Date().timeIntervalSince(manualTranscriptNavigationStartedAt) < 2.0
+    }
+
+    private func updateCurrentUserMessageNavigationID(
+        from positions: [ThreadUserMessageNavigationAnchorPosition],
+        entries: [ThreadUserMessageNavigationEntry]
+    ) {
+        let entryIDs = entries.map(\.id)
+        guard !entryIDs.isEmpty else {
+            currentUserMessageNavigationID = nil
+            return
+        }
+
+        let positionsByID = positions.reduce(into: [String: CGFloat]()) { partial, position in
+            partial[position.id] = position.minY
+        }
+        let orderedPositions = entries.compactMap { entry -> (id: String, minY: CGFloat)? in
+            guard let minY = positionsByID[entry.id] else {
+                return nil
+            }
+            return (entry.id, minY)
+        }
+
+        guard !orderedPositions.isEmpty else {
+            if currentUserMessageNavigationID.map(entryIDs.contains) != true {
+                currentUserMessageNavigationID = entryIDs.first
+            }
+            return
+        }
+
+        let topThreshold: CGFloat = 32
+        if let activePosition = orderedPositions
+            .filter({ $0.minY <= topThreshold })
+            .max(by: { lhs, rhs in lhs.minY < rhs.minY }) {
+            if currentUserMessageNavigationID != activePosition.id {
+                currentUserMessageNavigationID = activePosition.id
+            }
+        } else if currentUserMessageNavigationID.map(entryIDs.contains) != true {
+            currentUserMessageNavigationID = orderedPositions.min { lhs, rhs in lhs.minY < rhs.minY }?.id
+                ?? entryIDs.first
         }
     }
 
@@ -1650,6 +1801,440 @@ private struct TranscriptErrorBanner: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct ThreadUserMessageNavigationEntry: Identifiable, Hashable {
+    var id: String
+    var index: Int
+    var userPreview: String
+    var responsePreview: String?
+    var artifactSummary: ArtifactSummary?
+    var timestampText: String
+
+    init(userMessage: ThreadMessage, turnItems: [ThreadTurnItem], index: Int) {
+        self.id = userMessage.id
+        self.index = index
+        self.userPreview = Self.previewText(for: userMessage.text, limit: 96)
+        self.responsePreview = Self.responsePreview(in: turnItems)
+        self.artifactSummary = ArtifactSummary(attachments: Self.deduplicatedAttachments(
+            turnItems.flatMap(\.effectiveAttachments)
+        ))
+        self.timestampText = userMessage.createdAt.formatted(date: .omitted, time: .shortened)
+    }
+
+    init(userMessage: ThreadMessage, messages: [ThreadMessage], index: Int) {
+        self.id = userMessage.id
+        self.index = index
+        self.userPreview = Self.previewText(for: userMessage.text, limit: 96)
+        self.responsePreview = messages.first {
+            $0.role == .assistant && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.map { Self.previewText(for: $0.text, limit: 150) }
+        self.artifactSummary = ArtifactSummary(attachments: Self.deduplicatedAttachments(
+            messages.flatMap(\.attachments)
+        ))
+        self.timestampText = userMessage.createdAt.formatted(date: .omitted, time: .shortened)
+    }
+
+    var title: String {
+        "Message \(index)"
+    }
+
+    var scrollAnchorID: String {
+        Self.scrollAnchorID(for: id)
+    }
+
+    var accessibilityLabel: String {
+        "\(title), \(userPreview)"
+    }
+
+    static func scrollAnchorID(for messageID: String) -> String {
+        "thread-user-message-navigation-\(messageID)"
+    }
+
+    private static func responsePreview(in items: [ThreadTurnItem]) -> String? {
+        items.first {
+            $0.message.role == .assistant && !$0.message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.map { previewText(for: $0.message.text, limit: 150) }
+    }
+
+    private static func previewText(for text: String, limit: Int) -> String {
+        let collapsed = text
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard !collapsed.isEmpty else {
+            return "Empty message"
+        }
+        guard collapsed.count > limit else {
+            return collapsed
+        }
+        return "\(collapsed.prefix(limit))..."
+    }
+
+    private static func deduplicatedAttachments(_ attachments: [ThreadMessageAttachment]) -> [ThreadMessageAttachment] {
+        var seen = Set<String>()
+        return attachments.filter { attachment in
+            seen.insert(artifactKey(attachment)).inserted
+        }
+    }
+
+    private static func artifactKey(_ attachment: ThreadMessageAttachment) -> String {
+        [
+            attachment.kind.rawValue,
+            attachment.sourceHostID.rawValue,
+            attachment.sourcePath ?? attachment.cachedPath ?? attachment.title ?? attachment.id,
+            attachment.diffText ?? "",
+        ].joined(separator: "::")
+    }
+
+    struct ArtifactSummary: Hashable {
+        var title: String
+        var fileNames: [String]
+        var extraCount: Int
+        var added: Int
+        var removed: Int
+
+        init?(attachments: [ThreadMessageAttachment]) {
+            guard !attachments.isEmpty else {
+                return nil
+            }
+
+            let changedAttachments = attachments.filter { $0.kind == .diff || $0.kind == .file }
+            let displayedAttachments = changedAttachments.isEmpty ? attachments : changedAttachments
+            let names = displayedAttachments
+                .map { attachment in
+                    artifactFileName(attachment.sourcePath ?? attachment.cachedPath ?? attachment.title ?? attachment.kind.rawValue)
+                }
+                .filter { !$0.isEmpty }
+            let uniqueNames = names.reduce(into: [String]()) { partial, name in
+                if partial.contains(name) == false {
+                    partial.append(name)
+                }
+            }
+            let stats = attachments.compactMap { attachment in
+                attachment.diffText.map(DiffStats.init(diffText:))
+            }
+
+            let count = max(uniqueNames.count, displayedAttachments.count)
+            if changedAttachments.isEmpty {
+                self.title = "\(attachments.count) artifact\(attachments.count == 1 ? "" : "s")"
+            } else {
+                self.title = "Edited \(count) file\(count == 1 ? "" : "s")"
+            }
+            let visibleNames = Array(uniqueNames.prefix(2))
+            self.fileNames = visibleNames
+            self.extraCount = max(uniqueNames.count - visibleNames.count, 0)
+            self.added = stats.reduce(0) { $0 + $1.added }
+            self.removed = stats.reduce(0) { $0 + $1.removed }
+        }
+    }
+}
+
+private struct ThreadUserMessageNavigationTarget<Content: View>: View {
+    var messageID: String
+    private var content: Content
+
+    init(messageID: String, @ViewBuilder content: () -> Content) {
+        self.messageID = messageID
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .id(ThreadUserMessageNavigationEntry.scrollAnchorID(for: messageID))
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ThreadUserMessageNavigationAnchorPreferenceKey.self,
+                        value: [
+                            ThreadUserMessageNavigationAnchorPosition(
+                                id: messageID,
+                                minY: proxy.frame(in: .named(ThreadUserMessageNavigationLayout.coordinateSpaceName)).minY
+                            )
+                        ]
+                    )
+                }
+            }
+    }
+}
+
+private enum ThreadUserMessageNavigationLayout {
+    static let coordinateSpaceName = "thread-user-message-navigation-scroll"
+}
+
+private struct ThreadUserMessageNavigationAnchorPosition: Equatable {
+    var id: String
+    var minY: CGFloat
+}
+
+private struct ThreadUserMessageNavigationAnchorPreferenceKey: PreferenceKey {
+    static let defaultValue: [ThreadUserMessageNavigationAnchorPosition] = []
+
+    static func reduce(
+        value: inout [ThreadUserMessageNavigationAnchorPosition],
+        nextValue: () -> [ThreadUserMessageNavigationAnchorPosition]
+    ) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+private struct ThreadUserMessageNavigationRail: View {
+    var entries: [ThreadUserMessageNavigationEntry]
+    var currentEntryID: String?
+    var onSelect: (ThreadUserMessageNavigationEntry) -> Void
+
+    @State private var hoveredEntryID: String?
+
+    private let horizontalCenter: CGFloat = 18
+    private let verticalPadding: CGFloat = 14
+    private let previewHeight: CGFloat = 132
+
+    var body: some View {
+        GeometryReader { proxy in
+            let height = max(proxy.size.height, 1)
+
+            ZStack(alignment: .topLeading) {
+                Capsule()
+                    .fill(.secondary.opacity(0.18))
+                    .frame(width: 2, height: max(height - verticalPadding * 2, 1))
+                    .position(x: horizontalCenter, y: height / 2)
+
+                ForEach(Array(entries.enumerated()), id: \.element.id) { offset, entry in
+                    let isHovered = hoveredEntryID == entry.id
+                    let isCurrent = currentEntryID == entry.id
+                    let y = yPosition(index: offset, count: entries.count, height: height)
+
+                    Capsule()
+                        .fill(tickColor(isHovered: isHovered, isCurrent: isCurrent))
+                        .frame(
+                            width: tickWidth(isHovered: isHovered, isCurrent: isCurrent),
+                            height: tickHeight(isHovered: isHovered, isCurrent: isCurrent)
+                        )
+                        .shadow(color: isCurrent ? Color.primary.opacity(0.18) : .clear, radius: 4)
+                        .animation(.snappy, value: isHovered)
+                        .animation(.snappy, value: isCurrent)
+                        .position(x: horizontalCenter, y: y)
+                }
+
+                if let hoveredEntry,
+                   let offset = entries.firstIndex(of: hoveredEntry) {
+                    ThreadUserMessageNavigationPreview(entry: hoveredEntry)
+                        .offset(
+                            x: horizontalCenter + 18,
+                            y: previewOffsetY(
+                                index: offset,
+                                count: entries.count,
+                                height: height
+                            )
+                        )
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .leading)))
+                        .allowsHitTesting(false)
+                }
+
+                railInteractionLayer(height: height)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .animation(.snappy, value: hoveredEntryID)
+        .animation(.snappy, value: currentEntryID)
+    }
+
+    private var hoveredEntry: ThreadUserMessageNavigationEntry? {
+        guard let hoveredEntryID else {
+            return nil
+        }
+        return entries.first { $0.id == hoveredEntryID }
+    }
+
+    @ViewBuilder
+    private func railInteractionLayer(height: CGFloat) -> some View {
+        Rectangle()
+            .fill(.clear)
+            .contentShape(Rectangle())
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(hoveredEntry?.accessibilityLabel ?? "User message navigation")
+            .accessibilityHint("Click to jump to the nearest user message")
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onChanged { value in
+                        hoveredEntryID = nearestEntry(toY: value.location.y, height: height)?.id
+                    }
+                    .onEnded { value in
+                        guard let entry = nearestEntry(toY: value.location.y, height: height) else {
+                            return
+                        }
+                        hoveredEntryID = entry.id
+                        onSelect(entry)
+                    }
+            )
+            #if os(macOS)
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hoveredEntryID = nearestEntry(toY: location.y, height: height)?.id
+                case .ended:
+                    hoveredEntryID = nil
+                }
+            }
+            #endif
+    }
+
+    private func tickColor(isHovered: Bool, isCurrent: Bool) -> Color {
+        if isHovered {
+            return .accentColor
+        }
+        if isCurrent {
+            return .primary.opacity(0.95)
+        }
+        return .secondary.opacity(0.58)
+    }
+
+    private func tickWidth(isHovered: Bool, isCurrent: Bool) -> CGFloat {
+        if isHovered {
+            return 20
+        }
+        if isCurrent {
+            return 24
+        }
+        return 10
+    }
+
+    private func tickHeight(isHovered: Bool, isCurrent: Bool) -> CGFloat {
+        if isHovered || isCurrent {
+            return 4
+        }
+        return 3
+    }
+
+    private func yPosition(index: Int, count: Int, height: CGFloat) -> CGFloat {
+        guard count > 1 else {
+            return height / 2
+        }
+
+        let available = max(height - verticalPadding * 2, 1)
+        let fraction = CGFloat(index) / CGFloat(count - 1)
+        return verticalPadding + available * fraction
+    }
+
+    private func nearestEntry(toY y: CGFloat, height: CGFloat) -> ThreadUserMessageNavigationEntry? {
+        guard !entries.isEmpty else {
+            return nil
+        }
+        guard entries.count > 1 else {
+            return entries.first
+        }
+
+        let available = max(height - verticalPadding * 2, 1)
+        let clampedY = min(max(y, verticalPadding), height - verticalPadding)
+        let fraction = (clampedY - verticalPadding) / available
+        let index = Int((fraction * CGFloat(entries.count - 1)).rounded())
+        return entries[min(max(index, 0), entries.count - 1)]
+    }
+
+    private func previewOffsetY(index: Int, count: Int, height: CGFloat) -> CGFloat {
+        let y = yPosition(index: index, count: count, height: height) - previewHeight / 2
+        return min(max(y, 0), max(height - previewHeight, 0))
+    }
+}
+
+private struct ThreadUserMessageNavigationPreview: View {
+    var entry: ThreadUserMessageNavigationEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Image(systemName: "text.bubble")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Text(entry.title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.primary)
+
+                Spacer(minLength: 8)
+
+                Text(entry.timestampText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+
+            Text(entry.userPreview)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(entry.responsePreview ?? "No assistant response loaded yet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let artifactSummary = entry.artifactSummary {
+                ThreadUserMessageNavigationArtifactSummaryView(summary: artifactSummary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(width: 320, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(.quaternary, lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.18), radius: 12, x: 0, y: 6)
+    }
+}
+
+private struct ThreadUserMessageNavigationArtifactSummaryView: View {
+    var summary: ThreadUserMessageNavigationEntry.ArtifactSummary
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "doc.badge.plus")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 20, height: 20)
+                .background(.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(summary.title)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    if summary.added > 0 || summary.removed > 0 {
+                        HStack(spacing: 3) {
+                            Text("+\(summary.added)")
+                                .foregroundStyle(.green)
+                            Text("-\(summary.removed)")
+                                .foregroundStyle(.red)
+                        }
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    ForEach(summary.fileNames, id: \.self) { fileName in
+                        Text(fileName)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    if summary.extraCount > 0 {
+                        Text("+\(summary.extraCount)")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
