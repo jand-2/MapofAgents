@@ -17,13 +17,11 @@ using Microsoft.UI.Xaml.Markup;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.Web.WebView2.Core;
-using QRCoder;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 using Windows.Graphics;
 using Windows.Storage;
 using Windows.Storage.Pickers;
-using Windows.Storage.Streams;
 using WinRT.Interop;
 
 namespace MapofAgents.WindowsApp;
@@ -37,10 +35,6 @@ public sealed partial class MainWindow : Window
     private const string ThreadInboxModeRecent = "recent";
     private const string ThreadInboxModeSearch = "search";
     private const string ThreadInboxModeArchived = "archived";
-    private const string ArtifactFilterAll = "all";
-    private const string ArtifactFilterImages = "images";
-    private const string ArtifactFilterFiles = "files";
-    private const string ArtifactFilterDiffs = "diffs";
     private const string WorkflowFilterAll = "all";
     private const string WorkflowFilterOnWorkflows = "on-workflows";
     private const string WorkflowFilterNotOnWorkflows = "not-on-workflows";
@@ -64,7 +58,7 @@ public sealed partial class MainWindow : Window
     private readonly ControlRoomStore _store = new();
     private readonly AppPreferencesStore _preferencesStore = new();
     private readonly CodexAutomationStore _automationStore = new();
-    private readonly MapofAgentsPairingHostService _pairingHostService = new();
+    private readonly AppServerConnectionController _appServerConnectionController = new();
     private readonly WorkflowHookEventFileBridge _workflowHookEventFileBridge = new(
         defaultHostID: LocalHostIdentity.CanonicalHostID);
     private readonly ObservableCollection<ActivityEntry> _activity = [];
@@ -97,7 +91,10 @@ public sealed partial class MainWindow : Window
     private readonly ObservableCollection<MentionSuggestionItem> _threadPopoverMentionSuggestions = [];
     private readonly HashSet<TextBox> _composerDraftBoxesWithKeyHandler = [];
     private readonly List<string> _readerThreadIds = [];
-    private readonly List<ThreadArtifactItem> _allThreadArtifactItems = [];
+    private readonly TranscriptSessionStore _transcriptSessions = new();
+    private readonly ArtifactCatalog<ThreadArtifactItem> _artifactCatalog = new(
+        item => item.Id,
+        item => item.KindKey);
     private readonly List<CodexDesktopRemote> _discoveredCodexRemotes = [];
     private readonly List<TailnetMachine> _discoveredTailnetMachines = [];
     private readonly Dictionary<string, ObservableCollection<ComposerAttachmentItem>> _readerPendingAttachments = [];
@@ -110,21 +107,17 @@ public sealed partial class MainWindow : Window
         new Dictionary<string, CodexAutomationSummary>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, AppServerEndpoint> _connectedAppServerEndpointsByHostId = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, IReadOnlyList<CodexModelOption>> _newThreadModelsByHostId = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, IReadOnlyList<MentionCatalogCandidate>> _mentionCatalogsByContextKey = new(StringComparer.OrdinalIgnoreCase);
+    private readonly MentionCatalogSession _mentionCatalogSession = new();
+    private readonly MentionSelectionController _newThreadMentionSelection = new();
+    private readonly MentionSelectionController _threadPopoverMentionSelection = new();
+    private readonly Dictionary<string, MentionSelectionController> _readerMentionSelections = new(StringComparer.Ordinal);
+    private readonly WindowLifetimeCoordinator _windowLifetime = new();
     private readonly Dictionary<string, CodexRemoteTunnel> _codexRemoteTunnels = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<RuntimeDiagnosticStep>> _codexRemoteDiagnostics = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string?> _threadTranscriptNextCursorsByNodeId = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, string> _threadTranscriptErrorsByNodeId = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, TranscriptLoadPhase> _threadTranscriptLoadPhasesByNodeId = new(StringComparer.Ordinal);
     private readonly HashSet<ReaderTranscriptCategory> _threadPopoverTranscriptFilters = [];
     private readonly HashSet<string> _expandedTranscriptRows = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _threadTranscriptLoadingNodeIds = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _threadTranscriptLoadingOlderNodeIds = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _threadTranscriptLoadedNodeIds = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _threadTranscriptAutoLoadAttemptedNodeIds = new(StringComparer.Ordinal);
     private readonly HashSet<string> _stoppingThreadKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _codexRemoteOperationIds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _mentionCatalogRefreshesInFlight = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _ingestedWorkflowHookEventKeys = new(StringComparer.Ordinal);
     private AgentGraph _graph = new();
     private AppPreferences _preferences = new();
@@ -170,21 +163,16 @@ public sealed partial class MainWindow : Window
     private ItemsWrapGrid? _readerItemsPanel;
     private string _threadInboxMode = ThreadInboxModeActive;
     private string _threadInboxWorkflowFilter = WorkflowFilterAll;
-    private string _artifactFilter = ArtifactFilterAll;
     private string _lastDiagnosticsSummary = "No diagnostics run yet.";
     private string _lastDiagnosticsDetail = "Refresh machines or run diagnostics to update this report.";
     private string? _selectedNodeId;
     private int _threadInboxSearchGeneration;
-    private int _pairingSessionGeneration;
     private string? _selectedEdgeId;
     private string? _pendingLinkSourceNodeId;
     private string? _threadPopoverNodeId;
-    private string? _artifactSourceNodeId;
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _threadAutomationRefreshTimer;
-    private ThreadArtifactItem? _selectedArtifactPreview;
     private string? _importedPairingEndpointUrl;
     private string? _importedPairingBearerToken;
-    private string? _generatedPairingUrl;
     private string? _hoveredInboxNodeId;
     private string? _activeReaderFilterThreadId;
     private bool _isDraggingThreadPopover;
@@ -208,6 +196,9 @@ public sealed partial class MainWindow : Window
     private CancellationTokenSource? _newThreadModelRefreshCancellation;
     private CancellationTokenSource? _workflowHookEventBridgeCancellation;
     private Task? _workflowHookEventBridgeTask;
+    private Task? _threadAutomationRefreshTask;
+    private bool _threadAutomationRenderRequested;
+    private bool _windowStoresDisposed;
 
     public ObservableCollection<ReaderThreadItem> ReaderThreads => _readerThreads;
 
@@ -313,6 +304,7 @@ public sealed partial class MainWindow : Window
         ThreadInboxWorkflowFilterBox.ItemsSource = _threadInboxWorkflowFilters;
         SeedThreadInboxWorkflowFilters();
         RegisterThreadPopoverDragHandlers();
+        _mentionCatalogSession.CatalogChanged += MentionCatalogSession_CatalogChanged;
         _threadPopoverPendingAttachments.CollectionChanged += (_, _) => UpdateThreadPopoverAttachmentChrome();
         _preferences = _preferencesStore.Load();
         ApplyPreferences(_preferences);
@@ -806,6 +798,13 @@ public sealed partial class MainWindow : Window
     private void ApplyPairingContentPresentation()
     {
         var presentation = PairingContentPresentation.Resolve();
+        PairingHeaderTitleText.Text = "Secure device enrollment";
+        RefreshPairingButton.Visibility = Visibility.Collapsed;
+        PairingProgressRing.IsActive = false;
+        PairingProgressRing.Visibility = Visibility.Collapsed;
+        GeneratedPairingPanel.Visibility = Visibility.Collapsed;
+        PairingImportPanel.Visibility = Visibility.Collapsed;
+        PairingNetworkAccessBorder.Visibility = Visibility.Collapsed;
         PairingPopover.Padding = new Thickness(presentation.SurfacePadding);
         PairingPopoverStack.Spacing = presentation.SurfaceSpacing;
 
@@ -852,6 +851,13 @@ public sealed partial class MainWindow : Window
         PairingPreviewPanel.Padding = new Thickness(presentation.PreviewPanelPadding);
         PairingPreviewPanel.CornerRadius = new CornerRadius(presentation.PreviewPanelCornerRadius);
         ImportPairingButtonStack.Spacing = presentation.ActionButtonContentSpacing;
+        SetPairingMessage(
+            WindowsDeviceEnrollmentAvailability.Title,
+            WindowsDeviceEnrollmentAvailability.Detail,
+            "#FFD60A",
+            "#1AFFD60A",
+            "#26FFD60A",
+            "\uE7BA");
     }
 
     private static void ApplyNewThreadComboBoxChrome(
@@ -2003,42 +2009,115 @@ public sealed partial class MainWindow : Window
         earTip.Fill = foreground;
     }
 
-    private void MainWindow_Closed(object sender, WindowEventArgs args)
+    private void MentionCatalogSession_CatalogChanged(
+        object? sender,
+        MentionCatalogChangedEventArgs eventArgs)
     {
+        if (!_windowLifetime.TryCapture(out var lease))
+        {
+            return;
+        }
+
+        _ = _windowLifetime.TryDispatch(
+            lease,
+            callback => DispatcherQueue.TryEnqueue(() => callback()),
+            RefreshVisibleMentionSuggestions);
+    }
+
+    private bool RunWindowOperation(Func<WindowLifetimeLease, Task> operation)
+    {
+        return _windowLifetime.TryRunTracked(operation, out _);
+    }
+
+    private async void MainWindow_Closed(object sender, WindowEventArgs args)
+    {
+        if (_windowLifetime.IsShuttingDown)
+        {
+            return;
+        }
+
         UninstallWindowMinimumSizeHook();
-        _newThreadModelRefreshCancellation?.Cancel();
-        _newThreadModelRefreshCancellation?.Dispose();
-        StopWorkflowHookEventBridge();
+        RootGrid.Loaded -= MainWindow_Loaded;
+        _mentionCatalogSession.CatalogChanged -= MentionCatalogSession_CatalogChanged;
+        if (GraphView.CoreWebView2 is not null)
+        {
+            GraphView.CoreWebView2.NavigationCompleted -= GraphView_NavigationCompleted;
+            GraphView.CoreWebView2.WebMessageReceived -= GraphView_WebMessageReceived;
+        }
+
         StopThreadAutomationRefreshTimer();
-        _pairingHostService.StopPairingSession();
+        _newThreadModelRefreshCancellation?.Cancel();
+        _workflowHookEventBridgeCancellation?.Cancel();
         StopAllCodexRemoteTunnels();
+
+        try
+        {
+            var producerFaults = await _windowLifetime.ShutdownAsync();
+            foreach (var fault in producerFaults)
+            {
+                Debug.WriteLine($"Window background producer failed during shutdown: {fault}");
+            }
+        }
+        finally
+        {
+            _newThreadModelRefreshCancellation?.Dispose();
+            _newThreadModelRefreshCancellation = null;
+            DisposeWorkflowHookEventBridgeResources();
+            if (!_windowStoresDisposed)
+            {
+                _windowStoresDisposed = true;
+                _transcriptSessions.Dispose();
+                _mentionCatalogSession.Dispose();
+                _readerMentionSelections.Clear();
+            }
+
+            _windowLifetime.Dispose();
+        }
     }
 
     private void StartWorkflowHookEventBridge()
     {
-        StopWorkflowHookEventBridge();
-        _workflowHookEventBridgeCancellation = new CancellationTokenSource();
-        var cancellationToken = _workflowHookEventBridgeCancellation.Token;
-        _workflowHookEventBridgeTask = _workflowHookEventFileBridge.RunAsync(
-            (events, eventCancellationToken) =>
-            {
-                if (!eventCancellationToken.IsCancellationRequested)
-                {
-                    _ = DispatcherQueue.TryEnqueue(async () =>
-                    {
-                        await ApplyWorkflowHookEventsSafelyAsync(events);
-                    });
-                }
+        if (_workflowHookEventBridgeTask is { IsCompleted: false } ||
+            !_windowLifetime.TryCapture(out var windowLease))
+        {
+            return;
+        }
 
-                return Task.CompletedTask;
-            },
-            replayExistingEvents: false,
-            cancellationToken: cancellationToken);
+        DisposeWorkflowHookEventBridgeResources();
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(windowLease.CancellationToken);
+        if (!_windowLifetime.TryRunTracked(
+            lease => _workflowHookEventFileBridge.RunAsync(
+                (events, eventCancellationToken) =>
+                {
+                    if (!eventCancellationToken.IsCancellationRequested)
+                    {
+                        _ = _windowLifetime.TryDispatch(
+                            lease,
+                            callback => DispatcherQueue.TryEnqueue(() => callback()),
+                            () =>
+                            {
+                                _ = _windowLifetime.TryRunTracked(
+                                    ignoredLease => ApplyWorkflowHookEventsSafelyAsync(events),
+                                    out _);
+                            });
+                    }
+
+                    return Task.CompletedTask;
+                },
+                replayExistingEvents: false,
+                cancellationToken: cancellation.Token),
+            out var task))
+        {
+            cancellation.Dispose();
+            return;
+        }
+
+        _workflowHookEventBridgeCancellation = cancellation;
+        _workflowHookEventBridgeTask = task;
     }
 
-    private void StopWorkflowHookEventBridge()
+    private void DisposeWorkflowHookEventBridgeResources()
     {
-        _workflowHookEventBridgeCancellation?.Cancel();
         _workflowHookEventBridgeCancellation?.Dispose();
         _workflowHookEventBridgeCancellation = null;
         _workflowHookEventBridgeTask = null;
@@ -2046,39 +2125,86 @@ public sealed partial class MainWindow : Window
 
     private void StartThreadAutomationRefreshTimer()
     {
+        if (_windowLifetime.IsShuttingDown)
+        {
+            return;
+        }
+
         StopThreadAutomationRefreshTimer();
         _threadAutomationRefreshTimer = DispatcherQueue.CreateTimer();
         _threadAutomationRefreshTimer.Interval = TimeSpan.FromSeconds(10);
-        _threadAutomationRefreshTimer.Tick += async (_, _) =>
-        {
-            await RefreshThreadAutomationsAsync(renderAfterChange: true);
-        };
+        _threadAutomationRefreshTimer.Tick += ThreadAutomationRefreshTimer_Tick;
         _threadAutomationRefreshTimer.Start();
+    }
+
+    private void ThreadAutomationRefreshTimer_Tick(
+        Microsoft.UI.Dispatching.DispatcherQueueTimer sender,
+        object args)
+    {
+        _ = RefreshThreadAutomationsAsync(renderAfterChange: true);
     }
 
     private void StopThreadAutomationRefreshTimer()
     {
-        _threadAutomationRefreshTimer?.Stop();
+        if (_threadAutomationRefreshTimer is null)
+        {
+            return;
+        }
+
+        _threadAutomationRefreshTimer.Stop();
+        _threadAutomationRefreshTimer.Tick -= ThreadAutomationRefreshTimer_Tick;
         _threadAutomationRefreshTimer = null;
     }
 
-    private async Task RefreshThreadAutomationsAsync(bool renderAfterChange)
+    private Task RefreshThreadAutomationsAsync(bool renderAfterChange)
+    {
+        _threadAutomationRenderRequested |= renderAfterChange;
+        if (_threadAutomationRefreshTask is { IsCompleted: false })
+        {
+            return _threadAutomationRefreshTask;
+        }
+
+        if (!_windowLifetime.TryRunTracked(
+            RefreshThreadAutomationsCoreAsync,
+            out var task))
+        {
+            return Task.CompletedTask;
+        }
+
+        _threadAutomationRefreshTask = task;
+        return task;
+    }
+
+    private async Task RefreshThreadAutomationsCoreAsync(WindowLifetimeLease lease)
     {
         var previousSignature = AutomationSignature(_threadAutomationsByThreadId);
         IReadOnlyDictionary<string, CodexAutomationSummary> automations;
         try
         {
-            automations = await Task.Run(() => _automationStore.LoadAutomationsByThreadId());
+            automations = await Task.Run(
+                () => _automationStore.LoadAutomationsByThreadId(),
+                lease.CancellationToken);
+        }
+        catch (OperationCanceledException) when (lease.CancellationToken.IsCancellationRequested)
+        {
+            return;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or CodexAutomationStoreException)
         {
             automations = new Dictionary<string, CodexAutomationSummary>(StringComparer.OrdinalIgnoreCase);
         }
 
+        if (!_windowLifetime.IsCurrent(lease))
+        {
+            return;
+        }
+
         _threadAutomationsByThreadId = new Dictionary<string, CodexAutomationSummary>(
             automations,
             StringComparer.OrdinalIgnoreCase);
-        if (!renderAfterChange ||
+        var shouldRender = _threadAutomationRenderRequested;
+        _threadAutomationRenderRequested = false;
+        if (!shouldRender ||
             string.Equals(previousSignature, AutomationSignature(_threadAutomationsByThreadId), StringComparison.Ordinal))
         {
             return;
@@ -2371,19 +2497,38 @@ public sealed partial class MainWindow : Window
         return Windows.UI.Color.FromArgb(alpha, red, green, blue);
     }
 
-    private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    private void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
         RootGrid.Loaded -= MainWindow_Loaded;
         ConfigureOperationalRailPlacement();
+        _ = _windowLifetime.TryRunTracked(InitializeMainWindowAsync, out _);
+    }
 
+    private async Task InitializeMainWindowAsync(WindowLifetimeLease lease)
+    {
         try
         {
-            await InitializeGraphViewAsync();
+            await InitializeGraphViewAsync(lease);
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             _graph = await _store.LoadOrCreateAsync();
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             SetStatusStripError(null);
             await RefreshWorkflowMenuAsync();
             await RefreshWorkflowMembershipsAsync();
             await RefreshThreadAutomationsAsync(renderAfterChange: false);
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             StartThreadAutomationRefreshTimer();
             RebuildAppServerEndpointsFromGraph();
             StartWorkflowHookEventBridge();
@@ -2399,6 +2544,11 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception exception)
         {
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             SetStatusStripError(exception.Message);
             SetStatus(HostStatuses.Unavailable, "Startup failed", exception.Message);
             AddActivity(
@@ -2431,9 +2581,9 @@ public sealed partial class MainWindow : Window
         UpdateTopNotificationsChrome();
     }
 
-    private async Task InitializeGraphViewAsync()
+    private async Task InitializeGraphViewAsync(WindowLifetimeLease? lease = null)
     {
-        if (_webViewReady)
+        if (_webViewReady || !WindowLeaseIsCurrent(lease))
         {
             return;
         }
@@ -2445,13 +2595,30 @@ public sealed partial class MainWindow : Window
             webViewUserDataDirectory,
             null);
 
+        if (!WindowLeaseIsCurrent(lease))
+        {
+            return;
+        }
+
         await GraphView.EnsureCoreWebView2Async(webViewEnvironment);
+        if (!WindowLeaseIsCurrent(lease))
+        {
+            return;
+        }
+
         GraphView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
         GraphView.CoreWebView2.Settings.AreDevToolsEnabled = false;
         GraphView.CoreWebView2.Settings.IsStatusBarEnabled = false;
         GraphView.CoreWebView2.NavigationCompleted += GraphView_NavigationCompleted;
         GraphView.CoreWebView2.WebMessageReceived += GraphView_WebMessageReceived;
         _webViewReady = true;
+    }
+
+    private bool WindowLeaseIsCurrent(WindowLifetimeLease? lease)
+    {
+        return lease is { } captured
+            ? _windowLifetime.IsCurrent(captured)
+            : !_windowLifetime.IsShuttingDown;
     }
 
     private static string WindowsLocalApplicationDataDirectory()
@@ -2464,6 +2631,11 @@ public sealed partial class MainWindow : Window
 
     private void GraphView_NavigationCompleted(CoreWebView2 sender, CoreWebView2NavigationCompletedEventArgs args)
     {
+        if (_windowLifetime.IsShuttingDown)
+        {
+            return;
+        }
+
         _graphDocumentReady = args.IsSuccess;
         if (!args.IsSuccess)
         {
@@ -2476,35 +2648,27 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void ConnectButton_Click(object sender, RoutedEventArgs e)
+    private void ConnectButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!Uri.TryCreate(EndpointBox.Text.Trim(), UriKind.Absolute, out var endpointUri))
-        {
-            SetStatus(HostStatuses.Unavailable, "Invalid endpoint", "Enter an absolute ws:// or wss:// endpoint.");
-            AddActivity(
-                "Enter an absolute ws:// or wss:// endpoint.",
-                showTopNotification: true,
-                notificationKind: ActivityNotificationKindFailed);
-            _isMachinesRailVisible = true;
-            _isMachinesRailCollapsed = false;
-            _isMachineConnectFormVisible = true;
-            UpdateChrome();
-            return;
-        }
+        RunWindowOperation(ConnectFromFormAsync);
+    }
 
+    private async Task ConnectFromFormAsync(WindowLifetimeLease lease)
+    {
         var token = string.IsNullOrWhiteSpace(BearerTokenBox.Password)
             ? null
             : BearerTokenBox.Password.Trim();
-        var endpointName = string.IsNullOrWhiteSpace(RemoteNameBox.Text)
-            ? "Codex App Server"
-            : RemoteNameBox.Text.Trim();
-        var endpointTrust = ImportedPairingEndpointTrust(token);
-        var validation = AppServerEndpointValidator.Validate(endpointUri, token, endpointTrust);
-        if (!validation.IsValid)
+        var preparation = _appServerConnectionController.Prepare(new AppServerConnectionRequest(
+            EndpointBox.Text,
+            RemoteNameBox.Text,
+            token,
+            ImportedPairingEndpointTrust(token)));
+        if (!preparation.IsValid)
         {
-            SetStatus(HostStatuses.Unavailable, "Invalid endpoint", validation.Message ?? "Endpoint validation failed.");
+            var message = preparation.ErrorMessage ?? "Endpoint validation failed.";
+            SetStatus(HostStatuses.Unavailable, "Invalid endpoint", message);
             AddActivity(
-                validation.Message ?? "Endpoint validation failed.",
+                message,
                 showTopNotification: true,
                 notificationKind: ActivityNotificationKindFailed);
             _isMachinesRailVisible = true;
@@ -2514,51 +2678,93 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        var endpoint = preparation.Endpoint!;
         ConnectButton.IsEnabled = false;
-        SetStatus(HostStatuses.Connecting, "Connecting", endpointUri.ToString());
-        AddActivity($"Connecting to {endpointUri}");
+        SetStatus(HostStatuses.Connecting, "Connecting", endpoint.Url.ToString());
+        AddActivity($"Connecting to {endpoint.Url}");
 
         try
         {
-            var result = await new AppServerClient().InitializeAsync(
-                new AppServerEndpoint(endpointName, endpointUri, token, endpointTrust));
+            var outcome = await _appServerConnectionController.ConnectAsync(
+                preparation,
+                lease.CancellationToken);
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
 
-            var machineID = UpsertMachineFromInitialize(endpointUri, result);
+            if (!outcome.IsConnected || outcome.InitializeResult is not { } result)
+            {
+                PublishConnectionFailure(outcome.Message);
+                return;
+            }
+
+            var machineID = UpsertMachineFromInitialize(endpoint.Url, result);
             _connectedAppServerEndpointsByHostId[machineID] = new AppServerEndpoint(
                 result.HostName,
-                endpointUri,
-                token,
-                endpointTrust);
+                endpoint.Url,
+                endpoint.BearerToken,
+                endpoint.Trust);
             await RefreshNewThreadModelOptionsForHostAsync(
                 machineID,
                 _connectedAppServerEndpointsByHostId[machineID],
-                CancellationToken.None);
+                lease.CancellationToken);
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             await SaveGraphAsync();
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             SetStatus(HostStatuses.Connected, "Connected", $"{result.HostName} - {result.Platform}");
             AddActivity($"Connected: {result.HostName} ({result.Platform})");
             await RefreshAppServerThreadCatalogAsync(search: false);
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             _isMachineConnectFormVisible = false;
             BearerTokenBox.Password = "";
             UpdateChrome();
             await RenderGraphAsync();
         }
+        catch (OperationCanceledException) when (lease.CancellationToken.IsCancellationRequested)
+        {
+            // Window shutdown owns cancellation and suppresses late UI updates.
+        }
         catch (Exception exception)
         {
-            SetStatus(HostStatuses.Unavailable, "Connection failed", exception.Message);
-            AddActivity(
-                $"Connection failed: {exception.Message}",
-                showTopNotification: true,
-                notificationKind: ActivityNotificationKindFailed);
-            _isMachinesRailVisible = true;
-            _isMachinesRailCollapsed = false;
-            _isMachineConnectFormVisible = true;
-            UpdateChrome();
+            if (_windowLifetime.IsCurrent(lease))
+            {
+                PublishConnectionFailure(exception.Message);
+            }
         }
         finally
         {
-            ConnectButton.IsEnabled = true;
-            UpdateConnectButtonAvailability();
+            if (_windowLifetime.IsCurrent(lease))
+            {
+                ConnectButton.IsEnabled = true;
+                UpdateConnectButtonAvailability();
+            }
         }
+    }
+
+    private void PublishConnectionFailure(string message)
+    {
+        SetStatus(HostStatuses.Unavailable, "Connection failed", message);
+        AddActivity(
+            $"Connection failed: {message}",
+            showTopNotification: true,
+            notificationKind: ActivityNotificationKindFailed);
+        _isMachinesRailVisible = true;
+        _isMachinesRailCollapsed = false;
+        _isMachineConnectFormVisible = true;
+        UpdateChrome();
     }
 
     private void EndpointBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -2653,15 +2859,19 @@ public sealed partial class MainWindow : Window
         UpdateChrome();
     }
 
-    private async void DiscoverMachinesButton_Click(object sender, RoutedEventArgs e)
+    private void DiscoverMachinesButton_Click(object sender, RoutedEventArgs e)
     {
-        if (IsDiscoveringMachines)
+        RunWindowOperation(async lease =>
         {
-            ShowCommandFeedback("Machine discovery is already running.");
-            return;
-        }
+            if (IsDiscoveringMachines)
+            {
+                ShowCommandFeedback("Machine discovery is already running.");
+                return;
+            }
 
-        await DiscoverMachinesForRailAsync(automatic: false);
+            await DiscoverMachinesForRailAsync(automatic: false);
+
+        });
     }
 
     private async Task DiscoverMachinesForRailAsync(bool automatic, bool showMachinesRail = true)
@@ -2721,7 +2931,7 @@ public sealed partial class MainWindow : Window
         }
 
         _hasRequestedInitialMachineDiscovery = true;
-        _ = DiscoverMachinesForRailAsync(automatic: true);
+        RunWindowOperation(_ => DiscoverMachinesForRailAsync(automatic: true));
     }
 
     private async Task DiscoverCodexRemotesForRailAsync()
@@ -2794,21 +3004,25 @@ public sealed partial class MainWindow : Window
         EndpointBox.SelectAll();
     }
 
-    private async void OpenCodexRemoteDiagnosticsButton_Click(object sender, RoutedEventArgs e)
+    private void OpenCodexRemoteDiagnosticsButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: RemoteDiscoveryItem item } ||
-            !item.IsCodexRemote)
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (sender is not FrameworkElement { DataContext: RemoteDiscoveryItem item } ||
+                !item.IsCodexRemote)
+            {
+                return;
+            }
 
-        if (!TryFindCodexRemote(item.RemoteId, out var remote))
-        {
-            ShowCommandFeedback("This Codex remote is no longer available. Run discovery again.");
-            return;
-        }
+            if (!TryFindCodexRemote(item.RemoteId, out var remote))
+            {
+                ShowCommandFeedback("This Codex remote is no longer available. Run discovery again.");
+                return;
+            }
 
-        await ShowCodexRemoteDiagnosticsDialogAsync(remote);
+            await ShowCodexRemoteDiagnosticsDialogAsync(remote);
+
+        });
     }
 
     private async Task ShowCodexRemoteDiagnosticsDialogAsync(CodexDesktopRemote remote)
@@ -3005,12 +3219,18 @@ public sealed partial class MainWindow : Window
 
             foreach (var step in steps)
             {
-                stepsStack.Children.Add(RemoteDiagnosticsStepRow(remote.Id, step, IsBusy(), async action =>
+                stepsStack.Children.Add(RemoteDiagnosticsStepRow(remote.Id, step, IsBusy(), action =>
                 {
-                    var operation = RunCodexRemoteActionAsync(remote.Id, action);
-                    RefreshDialog();
-                    await operation;
-                    RefreshDialog();
+                    RunWindowOperation(async lease =>
+                    {
+                        var operation = RunCodexRemoteActionAsync(remote.Id, action);
+                        RefreshDialog();
+                        await operation;
+                        if (_windowLifetime.IsCurrent(lease))
+                        {
+                            RefreshDialog();
+                        }
+                    });
                 }));
             }
         }
@@ -3032,19 +3252,31 @@ public sealed partial class MainWindow : Window
             RebuildSteps();
         }
 
-        rerunButton.Click += async (_, _) =>
+        rerunButton.Click += (_, _) =>
         {
-            var operation = RunCodexRemoteOperationAsync(remote.Id, connect: false);
-            RefreshDialog();
-            await operation;
-            RefreshDialog();
+            RunWindowOperation(async lease =>
+            {
+                var operation = RunCodexRemoteOperationAsync(remote.Id, connect: false);
+                RefreshDialog();
+                await operation;
+                if (_windowLifetime.IsCurrent(lease))
+                {
+                    RefreshDialog();
+                }
+            });
         };
-        connectButton.Click += async (_, _) =>
+        connectButton.Click += (_, _) =>
         {
-            var operation = RunCodexRemoteOperationAsync(remote.Id, connect: true);
-            RefreshDialog();
-            await operation;
-            RefreshDialog();
+            RunWindowOperation(async lease =>
+            {
+                var operation = RunCodexRemoteOperationAsync(remote.Id, connect: true);
+                RefreshDialog();
+                await operation;
+                if (_windowLifetime.IsCurrent(lease))
+                {
+                    RefreshDialog();
+                }
+            });
         };
         copyButton.Click += (_, _) =>
         {
@@ -3178,7 +3410,7 @@ public sealed partial class MainWindow : Window
         string remoteId,
         RuntimeDiagnosticStep step,
         bool isBusy,
-        Func<string, Task> onAction)
+        Action<string> onAction)
     {
         var presentation = RuntimeDiagnosticsRailPresentation.Resolve(step.Status);
         var rowStack = new StackPanel
@@ -3239,7 +3471,7 @@ public sealed partial class MainWindow : Window
                 actionItem.ActionLabel,
                 actionItem.ActionTooltip);
             actionButton.IsEnabled = !isBusy;
-            actionButton.Click += async (_, _) => await onAction(action);
+            actionButton.Click += (_, _) => onAction(action);
             Grid.SetColumn(actionButton, 4);
             header.Children.Add(actionButton);
         }
@@ -3295,21 +3527,25 @@ public sealed partial class MainWindow : Window
         return value.Length == 6 ? $"#1F{value}" : "#1AFFFFFF";
     }
 
-    private async void ConnectCodexRemoteDiscoveryButton_Click(object sender, RoutedEventArgs e)
+    private void ConnectCodexRemoteDiscoveryButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: RemoteDiscoveryItem item })
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (sender is not FrameworkElement { DataContext: RemoteDiscoveryItem item })
+            {
+                return;
+            }
 
-        if (!item.CanConnect)
-        {
-            AddActivity(item.ConnectTooltip);
-            ShowCommandFeedback(item.ConnectTooltip);
-            return;
-        }
+            if (!item.CanConnect)
+            {
+                AddActivity(item.ConnectTooltip);
+                ShowCommandFeedback(item.ConnectTooltip);
+                return;
+            }
 
-        await RunCodexRemoteOperationAsync(item.RemoteId, connect: true);
+            await RunCodexRemoteOperationAsync(item.RemoteId, connect: true);
+
+        });
     }
 
     private async Task RunCodexRemoteOperationAsync(string remoteId, bool connect)
@@ -3631,85 +3867,101 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private async void AddFolderButton_Click(object sender, RoutedEventArgs e)
+    private void AddFolderButton_Click(object sender, RoutedEventArgs e)
     {
-        NewThreadPopover.Visibility = Visibility.Collapsed;
-        WorkflowPopover.Visibility = Visibility.Collapsed;
-        WorkflowNamePopover.Visibility = Visibility.Collapsed;
-        HealthPopover.Visibility = Visibility.Collapsed;
-        PairingPopover.Visibility = Visibility.Collapsed;
-
-        if (CreateFolderUnavailableReason is { } reason)
+        RunWindowOperation(async lease =>
         {
-            ShowCommandFeedback(reason, AddFolderButton);
-            return;
-        }
+            NewThreadPopover.Visibility = Visibility.Collapsed;
+            WorkflowPopover.Visibility = Visibility.Collapsed;
+            WorkflowNamePopover.Visibility = Visibility.Collapsed;
+            HealthPopover.Visibility = Visibility.Collapsed;
+            PairingPopover.Visibility = Visibility.Collapsed;
 
-        var machine = SelectedMachineNode() ?? LocalMachineNode();
-        if (machine is null)
-        {
-            ShowCommandFeedback("Connect a machine before adding a folder.", AddFolderButton);
-            return;
-        }
+            if (CreateFolderUnavailableReason is { } reason)
+            {
+                ShowCommandFeedback(reason, AddFolderButton);
+                return;
+            }
 
-        if (!IsLocalHostId(machine.Metadata.HostID))
-        {
-            var remoteFolderPath = TryFindCodexRemoteForMachine(machine, out var codexRemote)
-                ? await ShowRemoteFolderPickerAsync(codexRemote, DefaultFolderPathFor(machine))
-                : await PromptForMachineFolderPathAsync(machine);
-            if (remoteFolderPath is null)
+            var machine = SelectedMachineNode() ?? LocalMachineNode();
+            if (machine is null)
+            {
+                ShowCommandFeedback("Connect a machine before adding a folder.", AddFolderButton);
+                return;
+            }
+
+            if (!IsLocalHostId(machine.Metadata.HostID))
+            {
+                var remoteFolderPath = TryFindCodexRemoteForMachine(machine, out var codexRemote)
+                    ? await ShowRemoteFolderPickerAsync(codexRemote, DefaultFolderPathFor(machine))
+                    : await PromptForMachineFolderPathAsync(machine);
+                if (remoteFolderPath is null)
+                {
+                    AddActivity("Canceled folder creation.");
+                    return;
+                }
+
+                await AddFolderNodeAsync(machine, remoteFolderPath);
+                return;
+            }
+
+            var folderPath = await PickLocalFolderPathAsync();
+            if (folderPath is null)
             {
                 AddActivity("Canceled folder creation.");
                 return;
             }
 
-            await AddFolderNodeAsync(machine, remoteFolderPath);
-            return;
-        }
+            await AddFolderNodeAsync(machine, folderPath);
 
-        var folderPath = await PickLocalFolderPathAsync();
-        if (folderPath is null)
+        });
+    }
+
+    private void AddThreadButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
         {
-            AddActivity("Canceled folder creation.");
-            return;
-        }
+            WorkflowPopover.Visibility = Visibility.Collapsed;
+            WorkflowNamePopover.Visibility = Visibility.Collapsed;
+            HealthPopover.Visibility = Visibility.Collapsed;
+            PairingPopover.Visibility = Visibility.Collapsed;
 
-        await AddFolderNodeAsync(machine, folderPath);
+            if (CreateThreadUnavailableReason is { } reason)
+            {
+                ShowCommandFeedback(reason, AddThreadButton);
+                return;
+            }
+
+            await ShowNewThreadPopoverAsync();
+
+        });
     }
 
-    private async void AddThreadButton_Click(object sender, RoutedEventArgs e)
+    private void ArrangeButton_Click(object sender, RoutedEventArgs e)
     {
-        WorkflowPopover.Visibility = Visibility.Collapsed;
-        WorkflowNamePopover.Visibility = Visibility.Collapsed;
-        HealthPopover.Visibility = Visibility.Collapsed;
-        PairingPopover.Visibility = Visibility.Collapsed;
-
-        if (CreateThreadUnavailableReason is { } reason)
+        RunWindowOperation(async lease =>
         {
-            ShowCommandFeedback(reason, AddThreadButton);
-            return;
-        }
+            ArrangeNodes();
+            await SaveGraphAsync();
+            AddActivity("Arranged workflow nodes.");
+            await RenderGraphAsync();
 
-        await ShowNewThreadPopoverAsync();
+        });
     }
 
-    private async void ArrangeButton_Click(object sender, RoutedEventArgs e)
+    private void WorkflowButton_Click(object sender, RoutedEventArgs e)
     {
-        ArrangeNodes();
-        await SaveGraphAsync();
-        AddActivity("Arranged workflow nodes.");
-        await RenderGraphAsync();
-    }
+        RunWindowOperation(async lease =>
+        {
+            NewThreadPopover.Visibility = Visibility.Collapsed;
+            WorkflowPopover.Visibility = Visibility.Collapsed;
+            WorkflowNamePopover.Visibility = Visibility.Collapsed;
+            HealthPopover.Visibility = Visibility.Collapsed;
+            PairingPopover.Visibility = Visibility.Collapsed;
+            await RefreshWorkflowMenuAsync();
+            ShowWorkflowMenuFlyout();
 
-    private async void WorkflowButton_Click(object sender, RoutedEventArgs e)
-    {
-        NewThreadPopover.Visibility = Visibility.Collapsed;
-        WorkflowPopover.Visibility = Visibility.Collapsed;
-        WorkflowNamePopover.Visibility = Visibility.Collapsed;
-        HealthPopover.Visibility = Visibility.Collapsed;
-        PairingPopover.Visibility = Visibility.Collapsed;
-        await RefreshWorkflowMenuAsync();
-        ShowWorkflowMenuFlyout();
+        });
     }
 
     private void ShowWorkflowMenuFlyout()
@@ -3819,12 +4071,16 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private async void WorkflowFlyoutItem_Click(object sender, RoutedEventArgs e)
+    private void WorkflowFlyoutItem_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is MenuFlyoutItem { Tag: WorkflowMenuItem item })
+        RunWindowOperation(async lease =>
         {
-            await SelectWorkflowAsync(item);
-        }
+            if (sender is MenuFlyoutItem { Tag: WorkflowMenuItem item })
+            {
+                await SelectWorkflowAsync(item);
+            }
+
+        });
     }
 
     private void ReadingModeButton_Click(object sender, RoutedEventArgs e)
@@ -3848,17 +4104,21 @@ public sealed partial class MainWindow : Window
         UpdateChrome();
     }
 
-    private async void SubagentsButton_Click(object sender, RoutedEventArgs e)
+    private void SubagentsButton_Click(object sender, RoutedEventArgs e)
     {
-        _showsSubagents = !_showsSubagents;
-        if (!_showsSubagents)
+        RunWindowOperation(async lease =>
         {
-            CloseHiddenSubagentSurfaces();
-        }
+            _showsSubagents = !_showsSubagents;
+            if (!_showsSubagents)
+            {
+                CloseHiddenSubagentSurfaces();
+            }
 
-        SavePreferences();
-        AddActivity(_showsSubagents ? "Showing subagent nodes." : "Hiding subagent nodes.");
-        await RenderGraphAsync();
+            SavePreferences();
+            AddActivity(_showsSubagents ? "Showing subagent nodes." : "Hiding subagent nodes.");
+            await RenderGraphAsync();
+
+        });
     }
 
     private void CloseHiddenSubagentSurfaces()
@@ -3905,21 +4165,15 @@ public sealed partial class MainWindow : Window
         {
             _readerPendingAttachments.Remove(hiddenId);
             _readerTranscriptFilters.Remove(hiddenId);
-            _threadTranscriptNextCursorsByNodeId.Remove(hiddenId);
-            _threadTranscriptErrorsByNodeId.Remove(hiddenId);
-            _threadTranscriptLoadPhasesByNodeId.Remove(hiddenId);
-            _threadTranscriptLoadingNodeIds.Remove(hiddenId);
-            _threadTranscriptLoadingOlderNodeIds.Remove(hiddenId);
-            _threadTranscriptLoadedNodeIds.Remove(hiddenId);
-            _threadTranscriptAutoLoadAttemptedNodeIds.Remove(hiddenId);
+            _transcriptSessions.Remove(hiddenId);
         }
 
         _expandedTranscriptRows.RemoveWhere(key =>
             hiddenIds.Any(hiddenId => key.StartsWith($"{hiddenId}::", StringComparison.Ordinal)));
 
-        if (_artifactSourceNodeId is not null && hiddenIds.Contains(_artifactSourceNodeId))
+        if (_artifactCatalog.SourceId is { } artifactSourceId && hiddenIds.Contains(artifactSourceId))
         {
-            _artifactSourceNodeId = null;
+            _artifactCatalog.ClearSource();
             ArtifactsPopover.Visibility = Visibility.Collapsed;
             CloseArtifactPreview();
         }
@@ -3961,7 +4215,7 @@ public sealed partial class MainWindow : Window
         AddActivity(wasSearchVisible ? "Thread inbox search focused." : "Thread inbox search opened.");
         UpdateChrome();
         FocusThreadInboxSearchBox();
-        _ = SearchAppServerThreadCatalogWithDelayAsync();
+        RunWindowOperation(_ => SearchAppServerThreadCatalogWithDelayAsync());
     }
 
     private void MachinesButton_Click(object sender, RoutedEventArgs e)
@@ -3976,9 +4230,13 @@ public sealed partial class MainWindow : Window
         AddActivity("Machines menu opened.");
     }
 
-    private async void SetupLocalMachineButton_Click(object sender, RoutedEventArgs e)
+    private void SetupLocalMachineButton_Click(object sender, RoutedEventArgs e)
     {
-        await SetupLocalMachineAsync();
+        RunWindowOperation(async lease =>
+        {
+            await SetupLocalMachineAsync();
+
+        });
     }
 
     private async Task SetupLocalMachineAsync()
@@ -4049,15 +4307,19 @@ public sealed partial class MainWindow : Window
         AddActivity("Machines menu closed.");
     }
 
-    private async void RefreshHealthButton_Click(object sender, RoutedEventArgs e)
+    private void RefreshHealthButton_Click(object sender, RoutedEventArgs e)
     {
-        await RefreshMachineHealthAsync(
-            showMachinesRail: true,
-            detail: "Machine catalog refreshed from the active Windows workflow.",
-            activityMessage: "Refreshing machine health.",
-            discoverMachines: true);
-        HealthPopover.Visibility = Visibility.Collapsed;
-        UpdateChrome();
+        RunWindowOperation(async lease =>
+        {
+            await RefreshMachineHealthAsync(
+                showMachinesRail: true,
+                detail: "Machine catalog refreshed from the active Windows workflow.",
+                activityMessage: "Refreshing machine health.",
+                discoverMachines: true);
+            HealthPopover.Visibility = Visibility.Collapsed;
+            UpdateChrome();
+
+        });
     }
 
     private async Task RefreshMachineHealthAsync(
@@ -4174,38 +4436,42 @@ public sealed partial class MainWindow : Window
         UpdateChrome();
     }
 
-    private async void MachineRecoveryStepActionButton_Click(object sender, RoutedEventArgs e)
+    private void MachineRecoveryStepActionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: MachineRecoveryStepItem step } ||
-            string.IsNullOrWhiteSpace(step.TargetId) ||
-            !_graph.Nodes.TryGetValue(step.TargetId, out var machine))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (sender is not FrameworkElement { DataContext: MachineRecoveryStepItem step } ||
+                string.IsNullOrWhiteSpace(step.TargetId) ||
+                !_graph.Nodes.TryGetValue(step.TargetId, out var machine))
+            {
+                return;
+            }
 
-        _isMachinesRailVisible = true;
-        _isMachinesRailCollapsed = false;
-        _isMachineRecoveryVisible = true;
-        _expandedMachineHealthItemId = machine.Id;
+            _isMachinesRailVisible = true;
+            _isMachinesRailCollapsed = false;
+            _isMachineRecoveryVisible = true;
+            _expandedMachineHealthItemId = machine.Id;
 
-        switch (step.Id)
-        {
-            case "verify-endpoint":
-                await DiagnoseRecoveryTargetAsync(machine);
-                break;
-            case "app-server":
-                await RepairRecoveryTargetAsync(machine);
-                break;
-            case "reconnect":
-                await ReconnectRecoveryTargetAsync(machine);
-                break;
-            case "remove-route":
-                await RemoveRecoveryRouteAsync(machine);
-                break;
-            default:
-                ShowCommandFeedback("This recovery action is not supported yet.");
-                break;
-        }
+            switch (step.Id)
+            {
+                case "verify-endpoint":
+                    await DiagnoseRecoveryTargetAsync(machine);
+                    break;
+                case "app-server":
+                    await RepairRecoveryTargetAsync(machine);
+                    break;
+                case "reconnect":
+                    await ReconnectRecoveryTargetAsync(machine);
+                    break;
+                case "remove-route":
+                    await RemoveRecoveryRouteAsync(machine);
+                    break;
+                default:
+                    ShowCommandFeedback("This recovery action is not supported yet.");
+                    break;
+            }
+
+        });
     }
 
     private async Task DiagnoseRecoveryTargetAsync(CanvasNode machine)
@@ -4329,31 +4595,35 @@ public sealed partial class MainWindow : Window
         UpdateChrome();
     }
 
-    private async void AddFolderFromMachineButton_Click(object sender, RoutedEventArgs e)
+    private void AddFolderFromMachineButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: MachineHealthItem item } ||
-            !_graph.Nodes.TryGetValue(item.Id, out var machine))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (sender is not FrameworkElement { DataContext: MachineHealthItem item } ||
+                !_graph.Nodes.TryGetValue(item.Id, out var machine))
+            {
+                return;
+            }
 
-        if (!item.CanAddFolder)
-        {
-            AddActivity(item.FolderActionTooltip);
-            ShowCommandFeedback(item.FolderActionTooltip);
-            return;
-        }
+            if (!item.CanAddFolder)
+            {
+                AddActivity(item.FolderActionTooltip);
+                ShowCommandFeedback(item.FolderActionTooltip);
+                return;
+            }
 
-        var folderPath = TryFindCodexRemoteForMachine(machine, out var codexRemote)
-            ? await ShowRemoteFolderPickerAsync(codexRemote, DefaultFolderPathFor(machine))
-            : await PromptForMachineFolderPathAsync(machine);
-        if (folderPath is null)
-        {
-            AddActivity("Canceled folder creation.");
-            return;
-        }
+            var folderPath = TryFindCodexRemoteForMachine(machine, out var codexRemote)
+                ? await ShowRemoteFolderPickerAsync(codexRemote, DefaultFolderPathFor(machine))
+                : await PromptForMachineFolderPathAsync(machine);
+            if (folderPath is null)
+            {
+                AddActivity("Canceled folder creation.");
+                return;
+            }
 
-        await AddFolderNodeAsync(machine, folderPath);
+            await AddFolderNodeAsync(machine, folderPath);
+
+        });
     }
 
     private async Task<string?> PickLocalFolderPathAsync()
@@ -4726,11 +4996,11 @@ public sealed partial class MainWindow : Window
                 };
                 ToolTipService.SetToolTip(openRowButton, "Open folder");
                 AutomationProperties.SetName(openRowButton, $"Open {entry.Name}");
-                openRowButton.Click += async (_, _) =>
+                openRowButton.Click += (_, _) =>
                 {
                     if (!isLoading && openRowButton.Tag is RemoteFolderEntry selectedEntry)
                     {
-                        await LoadAsync(selectedEntry.Path);
+                        RunWindowOperation(lease => LoadAsync(selectedEntry.Path, lease));
                     }
                 };
 
@@ -4762,51 +5032,64 @@ public sealed partial class MainWindow : Window
             }
         }
 
-        async Task LoadAsync(string path)
+        async Task LoadAsync(string path, WindowLifetimeLease lease)
         {
             var requestedPath = string.IsNullOrWhiteSpace(path) ? "~" : path.Trim();
             UpdateLoadingState(true);
             footerPathText.Text = requestedPath;
+            using var loadCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellation.Token,
+                lease.CancellationToken);
             try
             {
                 var nextListing = await CodexRemoteTunnelService.ListRemoteFoldersAsync(
                     remote,
                     requestedPath,
-                    cancellation.Token);
+                    loadCancellation.Token);
+                if (!_windowLifetime.IsCurrent(lease) || cancellation.IsCancellationRequested)
+                {
+                    return;
+                }
+
                 listing = nextListing;
                 currentPath = nextListing.Path;
                 pathBox.Text = nextListing.Path;
                 footerPathText.Text = nextListing.Path;
                 RebuildRows();
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (loadCancellation.IsCancellationRequested)
             {
             }
             catch (Exception exception)
             {
+                if (!_windowLifetime.IsCurrent(lease) || cancellation.IsCancellationRequested)
+                {
+                    return;
+                }
+
                 var message = CodexRemoteTunnelService.RedactSensitiveDiagnosticText(exception.Message);
                 footerPathText.Text = currentPath;
                 RebuildRows(message);
             }
             finally
             {
-                if (!cancellation.IsCancellationRequested)
+                if (_windowLifetime.IsCurrent(lease) && !cancellation.IsCancellationRequested)
                 {
                     UpdateLoadingState(false);
                 }
             }
         }
 
-        parentButton.Click += async (_, _) =>
+        parentButton.Click += (_, _) =>
         {
             if (listing?.ParentPath is { } parentPath)
             {
-                await LoadAsync(parentPath);
+                RunWindowOperation(lease => LoadAsync(parentPath, lease));
             }
         };
-        homeButton.Click += async (_, _) => await LoadAsync(startPath);
-        openButton.Click += async (_, _) => await LoadAsync(pathBox.Text);
-        refreshButton.Click += async (_, _) => await LoadAsync(currentPath);
+        homeButton.Click += (_, _) => RunWindowOperation(lease => LoadAsync(startPath, lease));
+        openButton.Click += (_, _) => RunWindowOperation(lease => LoadAsync(pathBox.Text, lease));
+        refreshButton.Click += (_, _) => RunWindowOperation(lease => LoadAsync(currentPath, lease));
         cancelButton.Click += (_, _) => dialog.Hide();
         addCurrentButton.Click += (_, _) =>
         {
@@ -4825,7 +5108,7 @@ public sealed partial class MainWindow : Window
             openButton.IsEnabled = !isLoading && !string.IsNullOrWhiteSpace(pathBox.Text);
             UpdateCurrentFolderAction(isLoading);
         };
-        dialog.Opened += async (_, _) => await LoadAsync(startPath);
+        dialog.Opened += (_, _) => RunWindowOperation(lease => LoadAsync(startPath, lease));
         dialog.Closing += (_, _) => cancellation.Cancel();
         UpdateCurrentFolderAction(isLoading);
 
@@ -4987,33 +5270,37 @@ public sealed partial class MainWindow : Window
             : trimmed;
     }
 
-    private async void DisconnectMachineButton_Click(object sender, RoutedEventArgs e)
+    private void DisconnectMachineButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: MachineHealthItem item } ||
-            !_graph.Nodes.TryGetValue(item.Id, out var machine))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (sender is not FrameworkElement { DataContext: MachineHealthItem item } ||
+                !_graph.Nodes.TryGetValue(item.Id, out var machine))
+            {
+                return;
+            }
 
-        if (!await ConfirmDisconnectMachineAsync(machine))
-        {
-            AddActivity("Canceled machine disconnect.");
-            return;
-        }
+            if (!await ConfirmDisconnectMachineAsync(machine))
+            {
+                AddActivity("Canceled machine disconnect.");
+                return;
+            }
 
-        machine.Metadata.HostStatus = HostStatuses.Disconnected;
-        machine.Metadata.HostLastError = null;
-        StopCodexRemoteTunnel(machine.Id);
-        if (IsLocalHostId(machine.Metadata.HostID))
-        {
-            UnregisterLocalAppServerEndpoint(machine);
-            SyncLocalRuntimeStatusFromGraph();
-        }
+            machine.Metadata.HostStatus = HostStatuses.Disconnected;
+            machine.Metadata.HostLastError = null;
+            StopCodexRemoteTunnel(machine.Id);
+            if (IsLocalHostId(machine.Metadata.HostID))
+            {
+                UnregisterLocalAppServerEndpoint(machine);
+                SyncLocalRuntimeStatusFromGraph();
+            }
 
-        await SaveGraphAsync();
-        AddActivity($"Disconnected {machine.Title}.");
-        UpdateChrome();
-        await RenderGraphAsync();
+            await SaveGraphAsync();
+            AddActivity($"Disconnected {machine.Title}.");
+            UpdateChrome();
+            await RenderGraphAsync();
+
+        });
     }
 
     private void ActivityButton_Click(object sender, RoutedEventArgs e)
@@ -5100,28 +5387,16 @@ public sealed partial class MainWindow : Window
         UpdateChrome();
     }
 
-    private async void PairButton_Click(object sender, RoutedEventArgs e)
-    {
-        var shouldShowPopover = PairingPopover.Visibility != Visibility.Visible;
-        WorkflowPopover.Visibility = Visibility.Collapsed;
-        WorkflowNamePopover.Visibility = Visibility.Collapsed;
-        NewThreadPopover.Visibility = Visibility.Collapsed;
-        HealthPopover.Visibility = Visibility.Collapsed;
-        PairingPopover.Visibility = shouldShowPopover ? Visibility.Visible : Visibility.Collapsed;
-        if (shouldShowPopover)
-        {
-            await BeginPairingSessionAsync();
-        }
-        else
-        {
-            _pairingHostService.StopPairingSession();
-        }
-    }
-
-    private async void RefreshPairingButton_Click(object sender, RoutedEventArgs e)
+    private void RefreshPairingButton_Click(object sender, RoutedEventArgs e)
     {
         PairingPopover.Visibility = Visibility.Visible;
-        await BeginPairingSessionAsync();
+        SetPairingMessage(
+            WindowsDeviceEnrollmentAvailability.Title,
+            WindowsDeviceEnrollmentAvailability.Detail,
+            "#FFD60A",
+            "#1AFFD60A",
+            "#26FFD60A",
+            "\uE7BA");
     }
 
     private void PairingCodeBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -5195,112 +5470,7 @@ public sealed partial class MainWindow : Window
 
     private void ClosePairingPopoverButton_Click(object sender, RoutedEventArgs e)
     {
-        _pairingHostService.StopPairingSession();
         PairingPopover.Visibility = Visibility.Collapsed;
-    }
-
-    private async Task BeginPairingSessionAsync()
-    {
-        var generation = ++_pairingSessionGeneration;
-        _generatedPairingUrl = null;
-        _generatedPairingEndpointItems.Clear();
-        PairingQRCodeImage.Source = null;
-        ClearPairingHeaderSubtitle();
-        PairingProgressRing.Visibility = Visibility.Visible;
-        PairingProgressRing.IsActive = true;
-        GeneratedPairingPanel.Visibility = Visibility.Collapsed;
-        PairingImportPanel.Visibility = Visibility.Collapsed;
-        PairingNetworkAccessBorder.Visibility = Visibility.Collapsed;
-        SetPairingMessage(
-            PairingMessagePresentation.StartingTitle,
-            "Preparing a short-lived pairing code for this Windows PC.",
-            PairingMessagePresentation.StartingAccentHex,
-            PairingMessagePresentation.StartingBackgroundHex,
-            PairingMessagePresentation.StartingBorderHex,
-            "\uE768");
-
-        try
-        {
-            var session = await _pairingHostService.BeginPairingSessionAsync();
-            if (generation != _pairingSessionGeneration)
-            {
-                return;
-            }
-
-            await ApplyGeneratedPairingSessionAsync(session);
-        }
-        catch (MapofAgentsPairingException exception)
-        {
-            if (generation != _pairingSessionGeneration)
-            {
-                return;
-            }
-
-            PairingProgressRing.IsActive = false;
-            PairingProgressRing.Visibility = Visibility.Collapsed;
-            GeneratedPairingPanel.Visibility = Visibility.Collapsed;
-            PairingImportPanel.Visibility = Visibility.Visible;
-            PairingNetworkAccessBorder.Visibility = Visibility.Collapsed;
-            ClearPairingHeaderSubtitle();
-            SetPairingMessage(
-                "Pairing host failed",
-                exception.Message,
-                "#B42318",
-                "#1AB42318",
-                "#26B42318",
-                "\uE946");
-        }
-        catch (Exception exception) when (exception is InvalidOperationException or Win32Exception or IOException or UnauthorizedAccessException)
-        {
-            if (generation != _pairingSessionGeneration)
-            {
-                return;
-            }
-
-            PairingProgressRing.IsActive = false;
-            PairingProgressRing.Visibility = Visibility.Collapsed;
-            GeneratedPairingPanel.Visibility = Visibility.Collapsed;
-            PairingImportPanel.Visibility = Visibility.Visible;
-            PairingNetworkAccessBorder.Visibility = Visibility.Collapsed;
-            ClearPairingHeaderSubtitle();
-            SetPairingMessage(
-                "Pairing host failed",
-                exception.Message,
-                "#B42318",
-                "#1AB42318",
-                "#26B42318",
-                "\uE946");
-        }
-    }
-
-    private async Task ApplyGeneratedPairingSessionAsync(MapofAgentsPairingHostSession session)
-    {
-        var preview = MapofAgentsPairingImportPreview.FromPayload(session.Payload);
-        _generatedPairingEndpointItems.Clear();
-        foreach (var endpoint in preview.Endpoints)
-        {
-            _generatedPairingEndpointItems.Add(PairingEndpointPreviewItem.FromPreview(endpoint));
-        }
-
-        _generatedPairingUrl = session.PairingUrl;
-        PairingProgressRing.IsActive = false;
-        PairingProgressRing.Visibility = Visibility.Collapsed;
-        PairingImportPanel.Visibility = Visibility.Collapsed;
-        GeneratedPairingPanel.Visibility = Visibility.Visible;
-        PairingNetworkAccessBorder.Visibility = session.MayRequireWindowsNetworkAccessApproval
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        ShowPairingHeaderSubtitle(session.Payload.Name);
-        GeneratedPairingExpiryText.Text = $"Valid until {session.ExpiresAt.ToLocalTime():t}";
-        ClearPairingPreview();
-        SetPairingMessage(
-            "Pairing ready",
-            "Scan this code from the iPhone app or copy the pairing URL.",
-            "#30D158",
-            "#1A30D158",
-            "#2630D158",
-            "\uE73E");
-        await SetPairingQRCodeAsync(session.PairingUrl);
     }
 
     private void SetReadyPairingMessage()
@@ -5314,37 +5484,6 @@ public sealed partial class MainWindow : Window
             "#1A0A84FF",
             "#260A84FF",
             "\uED14");
-    }
-
-    private async Task SetPairingQRCodeAsync(string value)
-    {
-        using var generator = new QRCodeGenerator();
-        using var data = generator.CreateQrCode(value, QRCodeGenerator.ECCLevel.M);
-        var bytes = new PngByteQRCode(data).GetGraphic(12);
-        var stream = new InMemoryRandomAccessStream();
-        var writer = new DataWriter(stream);
-        writer.WriteBytes(bytes);
-        await writer.StoreAsync();
-        await writer.FlushAsync();
-        writer.DetachStream();
-        stream.Seek(0);
-        var image = new BitmapImage();
-        await image.SetSourceAsync(stream);
-        PairingQRCodeImage.Source = image;
-    }
-
-    private void CopyPairingUrlButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (string.IsNullOrWhiteSpace(_generatedPairingUrl))
-        {
-            ShowCommandFeedback("No active pairing URL is available.");
-            return;
-        }
-
-        var package = new DataPackage();
-        package.SetText(_generatedPairingUrl);
-        Clipboard.SetContent(package);
-        ShowCommandFeedback("Copied pairing URL.");
     }
 
     private void UpdatePairingPreviewFromInput()
@@ -5483,18 +5622,26 @@ public sealed partial class MainWindow : Window
         BeginWorkflowNameEdit(WorkflowNameEditorMode.Create, NextWorkflowName());
     }
 
-    private async void SubmitWorkflowNameButton_Click(object sender, RoutedEventArgs e)
+    private void SubmitWorkflowNameButton_Click(object sender, RoutedEventArgs e)
     {
-        await SubmitWorkflowNameAsync();
+        RunWindowOperation(async lease =>
+        {
+            await SubmitWorkflowNameAsync();
+
+        });
     }
 
-    private async void WorkflowNameBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    private void WorkflowNameBox_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (e.Key == Windows.System.VirtualKey.Enter)
+        RunWindowOperation(async lease =>
         {
-            e.Handled = true;
-            await SubmitWorkflowNameAsync();
-        }
+            if (e.Key == Windows.System.VirtualKey.Enter)
+            {
+                e.Handled = true;
+                await SubmitWorkflowNameAsync();
+            }
+
+        });
     }
 
     private void WorkflowNameBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -5601,42 +5748,46 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private async void DeleteWorkflowButton_Click(object sender, RoutedEventArgs e)
+    private void DeleteWorkflowButton_Click(object sender, RoutedEventArgs e)
     {
-        var deletedTitle = string.IsNullOrWhiteSpace(_graph.Title) ? "workflow" : _graph.Title;
-        if (_workflowMenuItems.Count <= 1)
+        RunWindowOperation(async lease =>
         {
-            ShowCommandFeedback("Keep at least one workflow.");
+            var deletedTitle = string.IsNullOrWhiteSpace(_graph.Title) ? "workflow" : _graph.Title;
+            if (_workflowMenuItems.Count <= 1)
+            {
+                ShowCommandFeedback("Keep at least one workflow.");
+                await RefreshWorkflowMenuAsync();
+                return;
+            }
+
+            if (!await ConfirmDeleteWorkflowAsync(deletedTitle))
+            {
+                AddActivity("Canceled workflow deletion.");
+                return;
+            }
+
+            var replacement = await _store.DeleteWorkflowAsync(_graph.WorkspaceID);
+            if (replacement is null)
+            {
+                ShowCommandFeedback("Keep at least one workflow.");
+                await RefreshWorkflowMenuAsync();
+                return;
+            }
+
+            _graph = replacement;
+            _selectedNodeId = null;
+            _selectedEdgeId = null;
+            _pendingLinkSourceNodeId = null;
+            _readerThreadIds.Clear();
+            WorkflowPopover.Visibility = Visibility.Collapsed;
+            SelectionInspector.Visibility = Visibility.Collapsed;
             await RefreshWorkflowMenuAsync();
-            return;
-        }
+            await RefreshWorkflowMembershipsAsync();
+            AddActivity($"Deleted {deletedTitle}.");
+            UpdateChrome();
+            await RenderGraphAsync();
 
-        if (!await ConfirmDeleteWorkflowAsync(deletedTitle))
-        {
-            AddActivity("Canceled workflow deletion.");
-            return;
-        }
-
-        var replacement = await _store.DeleteWorkflowAsync(_graph.WorkspaceID);
-        if (replacement is null)
-        {
-            ShowCommandFeedback("Keep at least one workflow.");
-            await RefreshWorkflowMenuAsync();
-            return;
-        }
-
-        _graph = replacement;
-        _selectedNodeId = null;
-        _selectedEdgeId = null;
-        _pendingLinkSourceNodeId = null;
-        _readerThreadIds.Clear();
-        WorkflowPopover.Visibility = Visibility.Collapsed;
-        SelectionInspector.Visibility = Visibility.Collapsed;
-        await RefreshWorkflowMenuAsync();
-        await RefreshWorkflowMembershipsAsync();
-        AddActivity($"Deleted {deletedTitle}.");
-        UpdateChrome();
-        await RenderGraphAsync();
+        });
     }
 
     private async Task SelectWorkflowAsync(WorkflowMenuItem item)
@@ -5777,8 +5928,17 @@ public sealed partial class MainWindow : Window
 
     private void NewThreadMentionSuggestionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: MentionSuggestionItem item } ||
-            NewThreadPromptBox is null ||
+        if (sender is not FrameworkElement { DataContext: MentionSuggestionItem item })
+        {
+            return;
+        }
+
+        ApplyNewThreadMention(item);
+    }
+
+    private void ApplyNewThreadMention(MentionSuggestionItem item)
+    {
+        if (NewThreadPromptBox is null ||
             !TryActiveMention(NewThreadPromptBox.Text, out var mention))
         {
             return;
@@ -5815,8 +5975,17 @@ public sealed partial class MainWindow : Window
 
     private void ThreadPopoverMentionSuggestionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: MentionSuggestionItem item } ||
-            ThreadPopoverDraftBox is null ||
+        if (sender is not FrameworkElement { DataContext: MentionSuggestionItem item })
+        {
+            return;
+        }
+
+        ApplyThreadPopoverMention(item);
+    }
+
+    private void ApplyThreadPopoverMention(MentionSuggestionItem item)
+    {
+        if (ThreadPopoverDraftBox is null ||
             !TryGetSelectedThread(out _) ||
             !TryActiveMention(ThreadPopoverDraftBox.Text, out var mention))
         {
@@ -5859,8 +6028,20 @@ public sealed partial class MainWindow : Window
     {
         if (sender is not FrameworkElement { DataContext: MentionSuggestionItem suggestion } ||
             string.IsNullOrWhiteSpace(suggestion.OwnerThreadId) ||
-            _readerThreads.FirstOrDefault(item => item.Id == suggestion.OwnerThreadId) is not { } readerItem ||
-            !TryActiveMention(readerItem.DraftText, out var mention))
+            _readerThreads.FirstOrDefault(item => item.Id == suggestion.OwnerThreadId) is not { } readerItem)
+        {
+            return;
+        }
+
+        ApplyReaderMention(readerItem, suggestion, null);
+    }
+
+    private void ApplyReaderMention(
+        ReaderThreadItem readerItem,
+        MentionSuggestionItem suggestion,
+        TextBox? composer)
+    {
+        if (!TryActiveMention(readerItem.DraftText, out var mention))
         {
             return;
         }
@@ -5869,11 +6050,20 @@ public sealed partial class MainWindow : Window
         readerItem.DraftText = TextWithInsertedMention(readerItem.DraftText, suggestion, mention);
         _isApplyingReaderMention = false;
         ClearReaderMentionSuggestions(readerItem);
+        if (composer is not null)
+        {
+            composer.SelectionStart = composer.Text.Length;
+            composer.Focus(FocusState.Programmatic);
+        }
     }
 
-    private async void CreateThreadFromPopoverButton_Click(object sender, RoutedEventArgs e)
+    private void CreateThreadFromPopoverButton_Click(object sender, RoutedEventArgs e)
     {
-        await CreateThreadFromPopoverAsync();
+        RunWindowOperation(async lease =>
+        {
+            await CreateThreadFromPopoverAsync();
+
+        });
     }
 
     private void AddReaderThreadButton_Click(object sender, RoutedEventArgs e)
@@ -5930,37 +6120,49 @@ public sealed partial class MainWindow : Window
         AddActivity($"Copied thread ID for {item.Title}.");
     }
 
-    private async void RefreshReaderThreadButton_Click(object sender, RoutedEventArgs e)
+    private void RefreshReaderThreadButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is FrameworkElement { DataContext: ReaderThreadItem item } &&
-            _graph.Nodes.TryGetValue(item.Id, out var node))
+        RunWindowOperation(async lease =>
         {
-            await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
-        }
-    }
-
-    private async void LoadOlderReaderTranscriptButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is FrameworkElement { DataContext: ReaderThreadItem item } &&
-            _graph.Nodes.TryGetValue(item.Id, out var node))
-        {
-            if (_threadTranscriptLoadingOlderNodeIds.Contains(node.Id))
+            if (sender is FrameworkElement { DataContext: ReaderThreadItem item } &&
+                _graph.Nodes.TryGetValue(item.Id, out var node))
             {
-                ShowCommandFeedback(LoadOlderMessagesActionPresentation.UnavailableReason, sender as FrameworkElement);
-                return;
+                await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
             }
 
-            await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: true, userInitiated: true);
-        }
+        });
     }
 
-    private async void RetryReaderTranscriptButton_Click(object sender, RoutedEventArgs e)
+    private void LoadOlderReaderTranscriptButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is FrameworkElement { DataContext: ReaderThreadItem item } &&
-            _graph.Nodes.TryGetValue(item.Id, out var node))
+        RunWindowOperation(async lease =>
         {
-            await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
-        }
+            if (sender is FrameworkElement { DataContext: ReaderThreadItem item } &&
+                _graph.Nodes.TryGetValue(item.Id, out var node))
+            {
+                if (_transcriptSessions.Snapshot(node.Id).IsLoadingOlder)
+                {
+                    ShowCommandFeedback(LoadOlderMessagesActionPresentation.UnavailableReason, sender as FrameworkElement);
+                    return;
+                }
+
+                await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: true, userInitiated: true);
+            }
+
+        });
+    }
+
+    private void RetryReaderTranscriptButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
+        {
+            if (sender is FrameworkElement { DataContext: ReaderThreadItem item } &&
+                _graph.Nodes.TryGetValue(item.Id, out var node))
+            {
+                await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
+            }
+
+        });
     }
 
     private void UseCachedReaderTranscriptButton_Click(object sender, RoutedEventArgs e)
@@ -5971,66 +6173,74 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        _threadTranscriptErrorsByNodeId.Remove(node.Id);
+        _transcriptSessions.ClearError(node.Id);
         RefreshTranscriptSurfaces(node.Id);
         AddActivity($"Using cached transcript for {node.Title}.");
     }
 
-    private async void AttachReaderFilesButton_Click(object sender, RoutedEventArgs e)
+    private void AttachReaderFilesButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryReaderThreadItem(sender, out var item) ||
-            !_graph.Nodes.TryGetValue(item.Id, out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryReaderThreadItem(sender, out var item) ||
+                !_graph.Nodes.TryGetValue(item.Id, out var node))
+            {
+                return;
+            }
 
-        if (node.Metadata.RunStatus == ThreadRunStatuses.Running)
-        {
-            AddActivity($"{node.Title} is running. Stop the turn before changing attachments.");
-            return;
-        }
+            if (node.Metadata.RunStatus == ThreadRunStatuses.Running)
+            {
+                AddActivity($"{node.Title} is running. Stop the turn before changing attachments.");
+                return;
+            }
 
-        var picker = new FileOpenPicker
-        {
-            ViewMode = PickerViewMode.List,
-            SuggestedStartLocation = PickerLocationId.DocumentsLibrary
-        };
-        picker.FileTypeFilter.Add("*");
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
+            var picker = new FileOpenPicker
+            {
+                ViewMode = PickerViewMode.List,
+                SuggestedStartLocation = PickerLocationId.DocumentsLibrary
+            };
+            picker.FileTypeFilter.Add("*");
+            InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
 
-        var files = await picker.PickMultipleFilesAsync();
-        AddReaderAttachments(item, files);
+            var files = await picker.PickMultipleFilesAsync();
+            AddReaderAttachments(item, files);
+
+        });
     }
 
-    private async void PasteReaderAttachmentsButton_Click(object sender, RoutedEventArgs e)
+    private void PasteReaderAttachmentsButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryReaderThreadItem(sender, out var item) ||
-            !_graph.Nodes.TryGetValue(item.Id, out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryReaderThreadItem(sender, out var item) ||
+                !_graph.Nodes.TryGetValue(item.Id, out var node))
+            {
+                return;
+            }
 
-        if (node.Metadata.RunStatus == ThreadRunStatuses.Running)
-        {
-            AddActivity($"{node.Title} is running. Stop the turn before changing attachments.");
-            return;
-        }
+            if (node.Metadata.RunStatus == ThreadRunStatuses.Running)
+            {
+                AddActivity($"{node.Title} is running. Stop the turn before changing attachments.");
+                return;
+            }
 
-        var didAttach = await AddClipboardAttachmentsAsync(attachment =>
-        {
-            attachment.ThreadId = item.Id;
-            PendingReaderAttachments(item.Id).Add(attachment);
+            var didAttach = await AddClipboardAttachmentsAsync(attachment =>
+            {
+                attachment.ThreadId = item.Id;
+                PendingReaderAttachments(item.Id).Add(attachment);
+            });
+
+            if (didAttach)
+            {
+                item.AttachmentErrorText = "";
+                AddActivity($"Attached {PendingReaderAttachments(item.Id).Count} pending item{(PendingReaderAttachments(item.Id).Count == 1 ? "" : "s")}.");
+            }
+            else
+            {
+                item.AttachmentErrorText = ThreadAttachmentFeedbackPresentation.ClipboardUnavailableReason;
+            }
+
         });
-
-        if (didAttach)
-        {
-            item.AttachmentErrorText = "";
-            AddActivity($"Attached {PendingReaderAttachments(item.Id).Count} pending item{(PendingReaderAttachments(item.Id).Count == 1 ? "" : "s")}.");
-        }
-        else
-        {
-            item.AttachmentErrorText = ThreadAttachmentFeedbackPresentation.ClipboardUnavailableReason;
-        }
     }
 
     private void RemoveReaderAttachmentButton_Click(object sender, RoutedEventArgs e)
@@ -6088,19 +6298,24 @@ public sealed partial class MainWindow : Window
         ClearReaderMentionSuggestions(item);
         _readerThreadIds.Remove(item.Id);
         _readerPendingAttachments.Remove(item.Id);
+        _readerMentionSelections.Remove(item.Id);
         AddActivity($"Closed {item.Title} in reader.");
         UpdateChrome();
     }
 
-    private async void StopReaderThreadButton_Click(object sender, RoutedEventArgs e)
+    private void StopReaderThreadButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryReaderThreadItem(sender, out var item) ||
-            !_graph.Nodes.TryGetValue(item.Id, out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryReaderThreadItem(sender, out var item) ||
+                !_graph.Nodes.TryGetValue(item.Id, out var node))
+            {
+                return;
+            }
 
-        await StopThreadAsync(node, "reader", sender as FrameworkElement);
+            await StopThreadAsync(node, "reader", sender as FrameworkElement);
+
+        });
     }
 
     private async Task StopThreadAsync(
@@ -6149,15 +6364,19 @@ public sealed partial class MainWindow : Window
         await RenderGraphAsync();
     }
 
-    private async void SendReaderMessageButton_Click(object sender, RoutedEventArgs e)
+    private void SendReaderMessageButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryReaderThreadItem(sender, out var item) ||
-            !_graph.Nodes.TryGetValue(item.Id, out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryReaderThreadItem(sender, out var item) ||
+                !_graph.Nodes.TryGetValue(item.Id, out var node))
+            {
+                return;
+            }
 
-        await SendReaderMessageAsync(item, node, sender as FrameworkElement);
+            await SendReaderMessageAsync(item, node, sender as FrameworkElement);
+
+        });
     }
 
     private void ReaderDraftBox_Loaded(object sender, RoutedEventArgs e)
@@ -6172,31 +6391,153 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void ComposerDraftBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    private void ComposerDraftBox_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (e.Key != Windows.System.VirtualKey.Enter || IsShiftKeyDown())
+        RunWindowOperation(async lease =>
         {
-            return;
+            if (sender is TextBox textBox && TryHandleMentionSelectionKey(textBox, e))
+            {
+                return;
+            }
+
+            if (e.Key != Windows.System.VirtualKey.Enter || IsShiftKeyDown())
+            {
+                return;
+            }
+
+            e.Handled = true;
+            if (ReferenceEquals(sender, NewThreadPromptBox))
+            {
+                await CreateThreadFromPopoverAsync();
+                return;
+            }
+
+            if (ReferenceEquals(sender, ThreadPopoverDraftBox))
+            {
+                await SendThreadPopoverMessageAsync(ThreadPopoverSendButton);
+                return;
+            }
+
+            if (TryReaderThreadItem(sender, out var item) &&
+                _graph.Nodes.TryGetValue(item.Id, out var node))
+            {
+                await SendReaderMessageAsync(item, node, sender as FrameworkElement);
+            }
+
+        });
+    }
+
+    private bool TryHandleMentionSelectionKey(TextBox composer, KeyRoutedEventArgs e)
+    {
+        if (!TryMentionSelectionKey(e.Key, out var key) ||
+            (key == MentionSelectionKey.Enter && IsShiftKeyDown()))
+        {
+            return false;
         }
 
-        e.Handled = true;
-        if (ReferenceEquals(sender, NewThreadPromptBox))
+        if (ReferenceEquals(composer, NewThreadPromptBox))
         {
-            await CreateThreadFromPopoverAsync();
-            return;
+            return HandleMentionSelectionKey(
+                composer,
+                key,
+                _newThreadMentionSelection,
+                _newThreadMentionSuggestions,
+                HideNewThreadMentionSuggestions,
+                ApplyNewThreadMention,
+                e);
         }
 
-        if (ReferenceEquals(sender, ThreadPopoverDraftBox))
+        if (ReferenceEquals(composer, ThreadPopoverDraftBox))
         {
-            await SendThreadPopoverMessageAsync(ThreadPopoverSendButton);
-            return;
+            return HandleMentionSelectionKey(
+                composer,
+                key,
+                _threadPopoverMentionSelection,
+                _threadPopoverMentionSuggestions,
+                HideThreadPopoverMentionSuggestions,
+                ApplyThreadPopoverMention,
+                e);
         }
 
-        if (TryReaderThreadItem(sender, out var item) &&
-            _graph.Nodes.TryGetValue(item.Id, out var node))
+        if (!TryReaderThreadItem(composer, out var readerItem))
         {
-            await SendReaderMessageAsync(item, node, sender as FrameworkElement);
+            return false;
         }
+
+        var selection = ReaderMentionSelection(readerItem.Id);
+        return HandleMentionSelectionKey(
+            composer,
+            key,
+            selection,
+            readerItem.MentionSuggestions,
+            () => HideReaderMentionSuggestions(readerItem),
+            suggestion => ApplyReaderMention(readerItem, suggestion, composer),
+            e);
+    }
+
+    private static bool HandleMentionSelectionKey(
+        TextBox composer,
+        MentionSelectionKey key,
+        MentionSelectionController selection,
+        IList<MentionSuggestionItem> suggestions,
+        Action dismiss,
+        Action<MentionSuggestionItem> accept,
+        KeyRoutedEventArgs eventArgs)
+    {
+        var result = selection.Handle(key, suggestions.Count);
+        if (!result.Handled)
+        {
+            return false;
+        }
+
+        eventArgs.Handled = true;
+        if (result.ShouldDismiss)
+        {
+            dismiss();
+        }
+        else if (result.ShouldAccept &&
+            result.SelectedIndex >= 0 &&
+            result.SelectedIndex < suggestions.Count)
+        {
+            accept(suggestions[result.SelectedIndex]);
+        }
+        else
+        {
+            ApplyMentionSelectionVisuals(selection, suggestions);
+        }
+
+        composer.Focus(FocusState.Programmatic);
+        return true;
+    }
+
+    private static void ApplyMentionSelectionVisuals(
+        MentionSelectionController selection,
+        IEnumerable<MentionSuggestionItem> suggestions)
+    {
+        var index = 0;
+        foreach (var suggestion in suggestions)
+        {
+            suggestion.IsKeyboardSelected = index == selection.SelectedIndex;
+            index += 1;
+        }
+    }
+
+    private static bool TryMentionSelectionKey(
+        Windows.System.VirtualKey key,
+        out MentionSelectionKey selectionKey)
+    {
+        selectionKey = key switch
+        {
+            Windows.System.VirtualKey.Up => MentionSelectionKey.ArrowUp,
+            Windows.System.VirtualKey.Down => MentionSelectionKey.ArrowDown,
+            Windows.System.VirtualKey.Enter => MentionSelectionKey.Enter,
+            Windows.System.VirtualKey.Escape => MentionSelectionKey.Escape,
+            _ => default
+        };
+        return key is Windows.System.VirtualKey.Up or
+            Windows.System.VirtualKey.Down or
+            Windows.System.VirtualKey.Enter or
+            Windows.System.VirtualKey.Escape;
     }
 
     private async Task SendReaderMessageAsync(
@@ -6272,38 +6613,46 @@ public sealed partial class MainWindow : Window
         return false;
     }
 
-    private async void SaveThreadPopoverTitleButton_Click(object sender, RoutedEventArgs e)
+    private void SaveThreadPopoverTitleButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryGetSelectedThread(out var node))
+            {
+                return;
+            }
 
-        if (!_isThreadPopoverRenaming)
-        {
-            _isThreadPopoverRenaming = true;
-            ThreadPopoverTitleBox.Text = node.Title;
-            UpdateThreadPopoverTitleChrome();
-            ThreadPopoverTitleBox.Focus(FocusState.Programmatic);
-            ThreadPopoverTitleBox.SelectAll();
-            return;
-        }
+            if (!_isThreadPopoverRenaming)
+            {
+                _isThreadPopoverRenaming = true;
+                ThreadPopoverTitleBox.Text = node.Title;
+                UpdateThreadPopoverTitleChrome();
+                ThreadPopoverTitleBox.Focus(FocusState.Programmatic);
+                ThreadPopoverTitleBox.SelectAll();
+                return;
+            }
 
-        await CommitThreadPopoverTitleAsync(node);
+            await CommitThreadPopoverTitleAsync(node);
+
+        });
     }
 
-    private async void ThreadPopoverTitleBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    private void ThreadPopoverTitleBox_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (e.Key != Windows.System.VirtualKey.Enter)
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (e.Key != Windows.System.VirtualKey.Enter)
+            {
+                return;
+            }
 
-        e.Handled = true;
-        if (TryGetSelectedThread(out var node))
-        {
-            await CommitThreadPopoverTitleAsync(node);
-        }
+            e.Handled = true;
+            if (TryGetSelectedThread(out var node))
+            {
+                await CommitThreadPopoverTitleAsync(node);
+            }
+
+        });
     }
 
     private void ThreadPopoverDraftBox_Loaded(object sender, RoutedEventArgs e)
@@ -6403,82 +6752,94 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void OpenThreadPopoverAutomationButton_Click(object sender, RoutedEventArgs e)
+    private void OpenThreadPopoverAutomationButton_Click(object sender, RoutedEventArgs e)
     {
-        if (TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            await ShowThreadAutomationDialogAsync(node, sender as FrameworkElement);
-        }
-    }
-
-    private async void AttachThreadPopoverFilesButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (!ThreadPopoverComposerIsEnabled())
-        {
-            return;
-        }
-
-        var picker = new FileOpenPicker
-        {
-            ViewMode = PickerViewMode.List,
-            SuggestedStartLocation = PickerLocationId.DocumentsLibrary
-        };
-        picker.FileTypeFilter.Add("*");
-        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
-
-        var files = await picker.PickMultipleFilesAsync();
-        AddThreadPopoverAttachments(files);
-    }
-
-    private async void PasteThreadPopoverAttachmentsButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (!ThreadPopoverComposerIsEnabled())
-        {
-            return;
-        }
-
-        var data = Clipboard.GetContent();
-        var didAttach = false;
-
-        if (data.Contains(StandardDataFormats.StorageItems))
-        {
-            var items = await data.GetStorageItemsAsync();
-            var files = items.OfType<StorageFile>().ToList();
-            AddThreadPopoverAttachments(files);
-            didAttach = files.Count > 0;
-        }
-
-        if (!didAttach && data.Contains(StandardDataFormats.Bitmap))
-        {
-            _threadPopoverPendingAttachments.Add(ComposerAttachmentItem.FromClipboardImage());
-            didAttach = true;
-        }
-
-        if (!didAttach && data.Contains(StandardDataFormats.Text))
-        {
-            var text = (await data.GetTextAsync())
-                .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(line => line.Trim().Trim('"'))
-                .Where(System.IO.File.Exists)
-                .ToList();
-
-            foreach (var path in text)
+            if (TryGetSelectedThread(out var node))
             {
-                _threadPopoverPendingAttachments.Add(ComposerAttachmentItem.FromPath(path));
+                await ShowThreadAutomationDialogAsync(node, sender as FrameworkElement);
             }
 
-            didAttach = text.Count > 0;
-        }
+        });
+    }
 
-        if (didAttach)
+    private void AttachThreadPopoverFilesButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
         {
-            SetThreadPopoverAttachmentError(null);
-            AddActivity($"Attached {_threadPopoverPendingAttachments.Count} pending item{(_threadPopoverPendingAttachments.Count == 1 ? "" : "s")}.");
-        }
-        else
+            if (!ThreadPopoverComposerIsEnabled())
+            {
+                return;
+            }
+
+            var picker = new FileOpenPicker
+            {
+                ViewMode = PickerViewMode.List,
+                SuggestedStartLocation = PickerLocationId.DocumentsLibrary
+            };
+            picker.FileTypeFilter.Add("*");
+            InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
+
+            var files = await picker.PickMultipleFilesAsync();
+            AddThreadPopoverAttachments(files);
+
+        });
+    }
+
+    private void PasteThreadPopoverAttachmentsButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
         {
-            SetThreadPopoverAttachmentError(ThreadAttachmentFeedbackPresentation.ClipboardUnavailableReason);
-        }
+            if (!ThreadPopoverComposerIsEnabled())
+            {
+                return;
+            }
+
+            var data = Clipboard.GetContent();
+            var didAttach = false;
+
+            if (data.Contains(StandardDataFormats.StorageItems))
+            {
+                var items = await data.GetStorageItemsAsync();
+                var files = items.OfType<StorageFile>().ToList();
+                AddThreadPopoverAttachments(files);
+                didAttach = files.Count > 0;
+            }
+
+            if (!didAttach && data.Contains(StandardDataFormats.Bitmap))
+            {
+                _threadPopoverPendingAttachments.Add(ComposerAttachmentItem.FromClipboardImage());
+                didAttach = true;
+            }
+
+            if (!didAttach && data.Contains(StandardDataFormats.Text))
+            {
+                var text = (await data.GetTextAsync())
+                    .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(line => line.Trim().Trim('"'))
+                    .Where(System.IO.File.Exists)
+                    .ToList();
+
+                foreach (var path in text)
+                {
+                    _threadPopoverPendingAttachments.Add(ComposerAttachmentItem.FromPath(path));
+                }
+
+                didAttach = text.Count > 0;
+            }
+
+            if (didAttach)
+            {
+                SetThreadPopoverAttachmentError(null);
+                AddActivity($"Attached {_threadPopoverPendingAttachments.Count} pending item{(_threadPopoverPendingAttachments.Count == 1 ? "" : "s")}.");
+            }
+            else
+            {
+                SetThreadPopoverAttachmentError(ThreadAttachmentFeedbackPresentation.ClipboardUnavailableReason);
+            }
+
+        });
     }
 
     private static void CopyTextToClipboard(string text)
@@ -6656,7 +7017,7 @@ public sealed partial class MainWindow : Window
     {
         ArtifactsPopover.Visibility = Visibility.Collapsed;
         CloseArtifactPreview();
-        _artifactSourceNodeId = null;
+        _artifactCatalog.ClearSource();
     }
 
     private void OpenArtifactPreviewButton_Click(object sender, RoutedEventArgs e)
@@ -6676,69 +7037,81 @@ public sealed partial class MainWindow : Window
 
     private void CopyArtifactPreviewButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_selectedArtifactPreview is null)
+        if (_artifactCatalog.Selected is not { } selectedArtifact)
         {
             return;
         }
 
-        var copyText = _selectedArtifactPreview.KindKey == ThreadArtifactItem.KindImage &&
-            !string.IsNullOrWhiteSpace(_selectedArtifactPreview.DisplayPath)
-            ? _selectedArtifactPreview.DisplayPath!
-            : _selectedArtifactPreview.PreviewText;
+        var copyText = selectedArtifact.KindKey == ThreadArtifactItem.KindImage &&
+            !string.IsNullOrWhiteSpace(selectedArtifact.DisplayPath)
+            ? selectedArtifact.DisplayPath!
+            : selectedArtifact.PreviewText;
         CopyTextToClipboard(copyText);
-        AddActivity(_selectedArtifactPreview.KindKey == ThreadArtifactItem.KindImage
-            ? $"Copied image path for {_selectedArtifactPreview.Title}."
-            : $"Copied preview for {_selectedArtifactPreview.Title}.");
+        AddActivity(selectedArtifact.KindKey == ThreadArtifactItem.KindImage
+            ? $"Copied image path for {selectedArtifact.Title}."
+            : $"Copied preview for {selectedArtifact.Title}.");
     }
 
     private void ArtifactFilterAllButton_Click(object sender, RoutedEventArgs e)
     {
-        SetArtifactFilter(ArtifactFilterAll);
+        SetArtifactFilter(ArtifactCatalogFilter.All);
     }
 
     private void ArtifactFilterImagesButton_Click(object sender, RoutedEventArgs e)
     {
-        SetArtifactFilter(ArtifactFilterImages);
+        SetArtifactFilter(ArtifactCatalogFilter.Images);
     }
 
     private void ArtifactFilterFilesButton_Click(object sender, RoutedEventArgs e)
     {
-        SetArtifactFilter(ArtifactFilterFiles);
+        SetArtifactFilter(ArtifactCatalogFilter.Files);
     }
 
     private void ArtifactFilterDiffsButton_Click(object sender, RoutedEventArgs e)
     {
-        SetArtifactFilter(ArtifactFilterDiffs);
+        SetArtifactFilter(ArtifactCatalogFilter.Diffs);
     }
 
-    private async void RefreshThreadPopoverButton_Click(object sender, RoutedEventArgs e)
+    private void RefreshThreadPopoverButton_Click(object sender, RoutedEventArgs e)
     {
-        if (TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
-        }
-    }
-
-    private async void LoadOlderThreadPopoverButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (TryGetSelectedThread(out var node))
-        {
-            if (_threadTranscriptLoadingOlderNodeIds.Contains(node.Id))
+            if (TryGetSelectedThread(out var node))
             {
-                ShowCommandFeedback(LoadOlderMessagesActionPresentation.UnavailableReason, sender as FrameworkElement);
-                return;
+                await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
             }
 
-            await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: true, userInitiated: true);
-        }
+        });
     }
 
-    private async void RetryThreadPopoverTranscriptButton_Click(object sender, RoutedEventArgs e)
+    private void LoadOlderThreadPopoverButton_Click(object sender, RoutedEventArgs e)
     {
-        if (TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
-        }
+            if (TryGetSelectedThread(out var node))
+            {
+                if (_transcriptSessions.Snapshot(node.Id).IsLoadingOlder)
+                {
+                    ShowCommandFeedback(LoadOlderMessagesActionPresentation.UnavailableReason, sender as FrameworkElement);
+                    return;
+                }
+
+                await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: true, userInitiated: true);
+            }
+
+        });
+    }
+
+    private void RetryThreadPopoverTranscriptButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
+        {
+            if (TryGetSelectedThread(out var node))
+            {
+                await LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: true);
+            }
+
+        });
     }
 
     private void UseCachedThreadPopoverTranscriptButton_Click(object sender, RoutedEventArgs e)
@@ -6748,12 +7121,25 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        _threadTranscriptErrorsByNodeId.Remove(node.Id);
+        _transcriptSessions.ClearError(node.Id);
         UpdateThreadPopover(node);
         AddActivity($"Using cached transcript for {node.Title}.");
     }
 
-    private async Task LoadThreadTranscriptForNodeAsync(string nodeId, bool appendOlder, bool userInitiated)
+    private Task LoadThreadTranscriptForNodeAsync(string nodeId, bool appendOlder, bool userInitiated)
+    {
+        return _windowLifetime.TryRunTracked(
+            lease => LoadThreadTranscriptForNodeCoreAsync(nodeId, appendOlder, userInitiated, lease),
+            out var task)
+            ? task
+            : Task.CompletedTask;
+    }
+
+    private async Task LoadThreadTranscriptForNodeCoreAsync(
+        string nodeId,
+        bool appendOlder,
+        bool userInitiated,
+        WindowLifetimeLease lease)
     {
         if (!_graph.Nodes.TryGetValue(nodeId, out var node) ||
             node.Kind != NodeKinds.CodexThread)
@@ -6773,45 +7159,46 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        if (appendOlder &&
-            (!_threadTranscriptNextCursorsByNodeId.TryGetValue(node.Id, out var existingCursor) ||
-             string.IsNullOrWhiteSpace(existingCursor)))
+        if (appendOlder && !_transcriptSessions.Snapshot(node.Id).HasOlderPage)
         {
             AddActivity($"No older transcript page is available for {node.Title}.");
             return;
         }
 
-        if (_threadTranscriptLoadingNodeIds.Contains(node.Id))
+        if (!_transcriptSessions.TryBeginLoad(
+                node.Id,
+                appendOlder,
+                HasLoadedThreadTranscript(node),
+                TimeSpan.FromSeconds(20),
+                out var transcriptLoad))
         {
             return;
         }
 
-        _threadTranscriptLoadingNodeIds.Add(node.Id);
-        if (appendOlder)
-        {
-            _threadTranscriptLoadingOlderNodeIds.Add(node.Id);
-        }
-        _threadTranscriptLoadPhasesByNodeId[node.Id] = TranscriptLoadPhasePresentation.InitialPhase(
-            appendOlder,
-            node.Metadata.LocalTranscript.Count > 0);
-
-        _threadTranscriptErrorsByNodeId.Remove(node.Id);
+        using var load = transcriptLoad!;
         RefreshTranscriptSurfaces(node.Id);
 
         try
         {
-            var cursor = appendOlder ? _threadTranscriptNextCursorsByNodeId.GetValueOrDefault(node.Id) : null;
-            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             if (!appendOlder)
             {
-                SetThreadTranscriptLoadPhase(node.Id, TranscriptLoadPhase.LoadingHistory);
+                load.SetPhase(TranscriptLoadPhase.LoadingHistory);
+                RefreshTranscriptSurfaces(node.Id);
             }
 
+            using var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                load.CancellationToken,
+                lease.CancellationToken);
             var transcript = await new AppServerClient().LoadThreadTranscriptAsync(
                 endpoint,
                 threadRef,
-                cursor,
-                cancellationToken: cancellation.Token);
+                load.StartingCursor,
+                cancellationToken: requestCancellation.Token);
+
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
 
             if (!_graph.Nodes.TryGetValue(nodeId, out var currentNode))
             {
@@ -6820,7 +7207,8 @@ public sealed partial class MainWindow : Window
 
             if (!appendOlder)
             {
-                SetThreadTranscriptLoadPhase(currentNode.Id, TranscriptLoadPhase.HydratingArtifacts);
+                load.SetPhase(TranscriptLoadPhase.HydratingArtifacts);
+                RefreshTranscriptSurfaces(currentNode.Id);
             }
 
             currentNode.Metadata.LocalTranscript = MergeLoadedTranscriptMessages(
@@ -6830,38 +7218,46 @@ public sealed partial class MainWindow : Window
                 transcript.Turns,
                 currentNode.Metadata.LocalTranscriptTurns,
                 currentNode.Metadata.LocalTranscript);
-            _threadTranscriptNextCursorsByNodeId[currentNode.Id] = transcript.NextCursor;
-            _threadTranscriptLoadedNodeIds.Add(currentNode.Id);
-            _threadTranscriptAutoLoadAttemptedNodeIds.Add(currentNode.Id);
+            load.Complete(transcript.NextCursor);
             await SaveGraphAsync();
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             AddActivity(appendOlder
                 ? $"Loaded older messages for {currentNode.Title}."
                 : $"Loaded transcript for {currentNode.Title}.");
         }
+        catch (OperationCanceledException) when (lease.CancellationToken.IsCancellationRequested)
+        {
+            // Window shutdown owns this cancellation; do not publish an error.
+        }
         catch (Exception exception)
         {
+            load.Fail(exception.Message);
             if (_graph.Nodes.TryGetValue(nodeId, out var currentNode))
             {
-                SetThreadTranscriptError(currentNode, exception.Message, userInitiated);
+                AddActivity(
+                    $"Transcript unavailable for {currentNode.Title}: {exception.Message}",
+                    showTopNotification: userInitiated,
+                    notificationKind: ActivityNotificationKindFailed);
             }
         }
         finally
         {
-            _threadTranscriptLoadingNodeIds.Remove(nodeId);
-            _threadTranscriptLoadingOlderNodeIds.Remove(nodeId);
-            _threadTranscriptLoadPhasesByNodeId.Remove(nodeId);
-            RefreshTranscriptSurfaces(nodeId);
-            UpdateChrome();
-            await RenderGraphAsync();
+            if (_windowLifetime.IsCurrent(lease))
+            {
+                RefreshTranscriptSurfaces(nodeId);
+                UpdateChrome();
+                await RenderGraphAsync();
+            }
         }
     }
 
     private void SetThreadTranscriptError(CanvasNode node, string message, bool showNotification)
     {
-        _threadTranscriptErrorsByNodeId[node.Id] = message;
-        _threadTranscriptLoadingNodeIds.Remove(node.Id);
-        _threadTranscriptLoadingOlderNodeIds.Remove(node.Id);
-        _threadTranscriptLoadPhasesByNodeId.Remove(node.Id);
+        _transcriptSessions.SetError(node.Id, message);
         RefreshTranscriptSurfaces(node.Id);
         AddActivity(
             $"Transcript unavailable for {node.Title}: {message}",
@@ -6869,32 +7265,15 @@ public sealed partial class MainWindow : Window
             notificationKind: ActivityNotificationKindFailed);
     }
 
-    private void SetThreadTranscriptLoadPhase(string nodeId, TranscriptLoadPhase phase)
-    {
-        if (phase == TranscriptLoadPhase.Idle)
-        {
-            _threadTranscriptLoadPhasesByNodeId.Remove(nodeId);
-        }
-        else
-        {
-            _threadTranscriptLoadPhasesByNodeId[nodeId] = phase;
-        }
-
-        RefreshTranscriptSurfaces(nodeId);
-    }
-
     private void QueueInitialThreadTranscriptLoad(CanvasNode node)
     {
-        if (_threadTranscriptAutoLoadAttemptedNodeIds.Contains(node.Id) ||
-            _threadTranscriptLoadedNodeIds.Contains(node.Id) ||
-            _threadTranscriptLoadingNodeIds.Contains(node.Id) ||
-            !TryGetThreadRefForTranscript(node, out _) ||
-            !TryGetAppServerEndpointForThread(node, out _))
+        if (!TryGetThreadRefForTranscript(node, out _) ||
+            !TryGetAppServerEndpointForThread(node, out _) ||
+            !_transcriptSessions.TryReserveAutoLoad(node.Id))
         {
             return;
         }
 
-        _threadTranscriptAutoLoadAttemptedNodeIds.Add(node.Id);
         _ = LoadThreadTranscriptForNodeAsync(node.Id, appendOlder: false, userInitiated: false);
     }
 
@@ -7076,40 +7455,61 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private async void CloseThreadPopoverButton_Click(object sender, RoutedEventArgs e)
+    private void CloseThreadPopoverButton_Click(object sender, RoutedEventArgs e)
     {
-        _selectedNodeId = null;
-        _selectedEdgeId = null;
-        _pendingLinkSourceNodeId = null;
-        ResetThreadPopoverData();
-        await SendGraphCommandAsync("clearSelection");
-        UpdateChrome();
-    }
-
-    private async void StopThreadPopoverButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (!TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            _selectedNodeId = null;
+            _selectedEdgeId = null;
+            _pendingLinkSourceNodeId = null;
+            ResetThreadPopoverData();
+            await SendGraphCommandAsync("clearSelection");
+            UpdateChrome();
 
-        await StopThreadAsync(node, "thread popover", sender as FrameworkElement);
+        });
     }
 
-    private async void SendThreadPopoverMessageButton_Click(object sender, RoutedEventArgs e)
+    private void StopThreadPopoverButton_Click(object sender, RoutedEventArgs e)
     {
-        await SendThreadPopoverMessageAsync(sender as FrameworkElement);
-    }
-
-    private async void ThreadPopoverDraftBox_KeyDown(object sender, KeyRoutedEventArgs e)
-    {
-        if (e.Key != Windows.System.VirtualKey.Enter || IsShiftKeyDown())
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryGetSelectedThread(out var node))
+            {
+                return;
+            }
 
-        e.Handled = true;
-        await SendThreadPopoverMessageAsync(ThreadPopoverSendButton);
+            await StopThreadAsync(node, "thread popover", sender as FrameworkElement);
+
+        });
+    }
+
+    private void SendThreadPopoverMessageButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
+        {
+            await SendThreadPopoverMessageAsync(sender as FrameworkElement);
+
+        });
+    }
+
+    private void ThreadPopoverDraftBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
+        {
+            if (sender is TextBox textBox && TryHandleMentionSelectionKey(textBox, e))
+            {
+                return;
+            }
+
+            if (e.Key != Windows.System.VirtualKey.Enter || IsShiftKeyDown())
+            {
+                return;
+            }
+
+            e.Handled = true;
+            await SendThreadPopoverMessageAsync(ThreadPopoverSendButton);
+
+        });
     }
 
     private async Task SendThreadPopoverMessageAsync(FrameworkElement? feedbackAnchor = null)
@@ -7227,37 +7627,41 @@ public sealed partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private async void ThreadPopoverDragHandle_PointerReleased(object sender, PointerRoutedEventArgs e)
+    private void ThreadPopoverDragHandle_PointerReleased(object sender, PointerRoutedEventArgs e)
     {
-        if (!_isDraggingThreadPopover)
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!_isDraggingThreadPopover)
+            {
+                return;
+            }
 
-        var draggedNodeId = _draggingThreadPopoverNodeId;
-        _isDraggingThreadPopover = false;
-        _draggingThreadPopoverNodeId = null;
-        ThreadPopover.Opacity = 1;
+            var draggedNodeId = _draggingThreadPopoverNodeId;
+            _isDraggingThreadPopover = false;
+            _draggingThreadPopoverNodeId = null;
+            ThreadPopover.Opacity = 1;
 
-        if (sender is UIElement element)
-        {
-            element.ReleasePointerCapture(e.Pointer);
-        }
+            if (sender is UIElement element)
+            {
+                element.ReleasePointerCapture(e.Pointer);
+            }
 
-        e.Handled = true;
+            e.Handled = true;
 
-        if (draggedNodeId is null ||
-            !_graph.Nodes.TryGetValue(draggedNodeId, out var node) ||
-            node.Kind != NodeKinds.CodexThread)
-        {
-            return;
-        }
+            if (draggedNodeId is null ||
+                !_graph.Nodes.TryGetValue(draggedNodeId, out var node) ||
+                node.Kind != NodeKinds.CodexThread)
+            {
+                return;
+            }
 
-        var baseFrame = ThreadPopoverBaseFrame(node);
-        node.Metadata.PopoverOffset = new CanvasPoint(
-            ThreadPopover.Margin.Left - baseFrame.Left,
-            ThreadPopover.Margin.Top - baseFrame.Top);
-        await SaveGraphAsync();
+            var baseFrame = ThreadPopoverBaseFrame(node);
+            node.Metadata.PopoverOffset = new CanvasPoint(
+                ThreadPopover.Margin.Left - baseFrame.Left,
+                ThreadPopover.Margin.Top - baseFrame.Top);
+            await SaveGraphAsync();
+
+        });
     }
 
     private void ThreadPopoverDragHandle_PointerCanceled(object sender, PointerRoutedEventArgs e)
@@ -7319,6 +7723,7 @@ public sealed partial class MainWindow : Window
         _readerThreadIds.RemoveAt(_readerThreadIds.Count - 1);
         _readerTranscriptFilters.Remove(lastID);
         _readerPendingAttachments.Remove(lastID);
+        _readerMentionSelections.Remove(lastID);
         var title = _graph.Nodes.TryGetValue(lastID, out var node) ? node.Title : "chat";
         AddActivity($"Removed {title} from reader.");
         UpdateChrome();
@@ -7335,6 +7740,7 @@ public sealed partial class MainWindow : Window
         {
             _readerTranscriptFilters.Remove(id);
             _readerPendingAttachments.Remove(id);
+            _readerMentionSelections.Remove(id);
         }
 
         _readerThreadIds.Clear();
@@ -7562,11 +7968,15 @@ public sealed partial class MainWindow : Window
         RefreshTranscriptSurfaces(row.ThreadId);
     }
 
-    private async void RefreshInboxButton_Click(object sender, RoutedEventArgs e)
+    private void RefreshInboxButton_Click(object sender, RoutedEventArgs e)
     {
-        await RefreshAppServerThreadCatalogAsync(search: _threadInboxMode == ThreadInboxModeSearch);
-        AddActivity("Thread inbox refreshed.");
-        UpdateChrome();
+        RunWindowOperation(async lease =>
+        {
+            await RefreshAppServerThreadCatalogAsync(search: _threadInboxMode == ThreadInboxModeSearch);
+            AddActivity("Thread inbox refreshed.");
+            UpdateChrome();
+
+        });
     }
 
     private void ThreadInboxActiveModeButton_Click(object sender, RoutedEventArgs e)
@@ -7657,7 +8067,7 @@ public sealed partial class MainWindow : Window
         if (mode == ThreadInboxModeSearch)
         {
             FocusThreadInboxSearchBox();
-            _ = SearchAppServerThreadCatalogWithDelayAsync();
+            RunWindowOperation(_ => SearchAppServerThreadCatalogWithDelayAsync());
         }
     }
 
@@ -7666,7 +8076,7 @@ public sealed partial class MainWindow : Window
         UpdateThreadInbox();
         if (_threadInboxMode == ThreadInboxModeSearch)
         {
-            _ = SearchAppServerThreadCatalogWithDelayAsync();
+            RunWindowOperation(_ => SearchAppServerThreadCatalogWithDelayAsync());
         }
     }
 
@@ -7676,99 +8086,127 @@ public sealed partial class MainWindow : Window
         ThreadInboxSearchBox.SelectAll();
     }
 
-    private async void ThreadInboxItem_PointerEntered(object sender, PointerRoutedEventArgs e)
+    private void ThreadInboxItem_PointerEntered(object sender, PointerRoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: ThreadInboxItem item } ||
-            string.IsNullOrWhiteSpace(item.ActiveNodeId) ||
-            !_graph.Nodes.ContainsKey(item.ActiveNodeId))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (sender is not FrameworkElement { DataContext: ThreadInboxItem item } ||
+                string.IsNullOrWhiteSpace(item.ActiveNodeId) ||
+                !_graph.Nodes.ContainsKey(item.ActiveNodeId))
+            {
+                return;
+            }
 
-        _hoveredInboxNodeId = item.ActiveNodeId;
-        await SendGraphCommandAsync("highlightNode", item.ActiveNodeId);
+            _hoveredInboxNodeId = item.ActiveNodeId;
+            await SendGraphCommandAsync("highlightNode", item.ActiveNodeId);
+
+        });
     }
 
-    private async void ThreadInboxItem_PointerExited(object sender, PointerRoutedEventArgs e)
+    private void ThreadInboxItem_PointerExited(object sender, PointerRoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: ThreadInboxItem item } ||
-            string.IsNullOrWhiteSpace(item.ActiveNodeId) ||
-            _hoveredInboxNodeId != item.ActiveNodeId)
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (sender is not FrameworkElement { DataContext: ThreadInboxItem item } ||
+                string.IsNullOrWhiteSpace(item.ActiveNodeId) ||
+                _hoveredInboxNodeId != item.ActiveNodeId)
+            {
+                return;
+            }
 
-        _hoveredInboxNodeId = null;
-        await SendGraphCommandAsync("clearHighlight", item.ActiveNodeId);
+            _hoveredInboxNodeId = null;
+            await SendGraphCommandAsync("clearHighlight", item.ActiveNodeId);
+
+        });
     }
 
-    private async void FocusAttentionRequestButton_Click(object sender, RoutedEventArgs e)
+    private void FocusAttentionRequestButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryGetAttentionItem(sender, out var item) ||
-            string.IsNullOrWhiteSpace(item.OwningNodeId) ||
-            !_graph.Nodes.TryGetValue(item.OwningNodeId, out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryGetAttentionItem(sender, out var item) ||
+                string.IsNullOrWhiteSpace(item.OwningNodeId) ||
+                !_graph.Nodes.TryGetValue(item.OwningNodeId, out var node))
+            {
+                return;
+            }
 
-        await FocusThreadNodeAsync(node, $"Focused attention request for {node.Title}.");
+            await FocusThreadNodeAsync(node, $"Focused attention request for {node.Title}.");
+
+        });
     }
 
-    private async void AllowAttentionRequestButton_Click(object sender, RoutedEventArgs e)
+    private void AllowAttentionRequestButton_Click(object sender, RoutedEventArgs e)
     {
-        if (TryGetAttentionItem(sender, out var item))
+        RunWindowOperation(async lease =>
         {
+            if (TryGetAttentionItem(sender, out var item))
+            {
+                await ResolveAttentionRequestAsync(
+                    item,
+                    $"Allowed {item.Method}.",
+                    ThreadRunStatuses.Running,
+                    $"Allowed attention request for {item.ThreadLabel}.");
+            }
+
+        });
+    }
+
+    private void DenyAttentionRequestButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
+        {
+            if (TryGetAttentionItem(sender, out var item))
+            {
+                await ResolveAttentionRequestAsync(
+                    item,
+                    $"Denied {item.Method}.",
+                    ThreadRunStatuses.Idle,
+                    $"Denied attention request for {item.ThreadLabel}.");
+            }
+
+        });
+    }
+
+    private void SendTypedAttentionRequestButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
+        {
+            if (!TryGetAttentionItem(sender, out var item))
+            {
+                return;
+            }
+
+            var response = item.ResponseText.Trim();
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                AddActivity("Enter a response before sending.");
+                return;
+            }
+
             await ResolveAttentionRequestAsync(
                 item,
-                $"Allowed {item.Method}.",
+                $"Responded to {item.Method}: {response}",
                 ThreadRunStatuses.Running,
-                $"Allowed attention request for {item.ThreadLabel}.");
-        }
+                $"Sent attention response for {item.ThreadLabel}.");
+
+        });
     }
 
-    private async void DenyAttentionRequestButton_Click(object sender, RoutedEventArgs e)
+    private void DeclineTypedAttentionRequestButton_Click(object sender, RoutedEventArgs e)
     {
-        if (TryGetAttentionItem(sender, out var item))
+        RunWindowOperation(async lease =>
         {
-            await ResolveAttentionRequestAsync(
-                item,
-                $"Denied {item.Method}.",
-                ThreadRunStatuses.Idle,
-                $"Denied attention request for {item.ThreadLabel}.");
-        }
-    }
+            if (TryGetAttentionItem(sender, out var item))
+            {
+                await ResolveAttentionRequestAsync(
+                    item,
+                    $"Declined {item.Method}.",
+                    ThreadRunStatuses.Idle,
+                    $"Declined attention request for {item.ThreadLabel}.");
+            }
 
-    private async void SendTypedAttentionRequestButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (!TryGetAttentionItem(sender, out var item))
-        {
-            return;
-        }
-
-        var response = item.ResponseText.Trim();
-        if (string.IsNullOrWhiteSpace(response))
-        {
-            AddActivity("Enter a response before sending.");
-            return;
-        }
-
-        await ResolveAttentionRequestAsync(
-            item,
-            $"Responded to {item.Method}: {response}",
-            ThreadRunStatuses.Running,
-            $"Sent attention response for {item.ThreadLabel}.");
-    }
-
-    private async void DeclineTypedAttentionRequestButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (TryGetAttentionItem(sender, out var item))
-        {
-            await ResolveAttentionRequestAsync(
-                item,
-                $"Declined {item.Method}.",
-                ThreadRunStatuses.Idle,
-                $"Declined attention request for {item.ThreadLabel}.");
-        }
+        });
     }
 
     private static bool TryGetAttentionItem(object sender, out ThreadAttentionItem item)
@@ -7782,36 +8220,40 @@ public sealed partial class MainWindow : Window
         return !string.IsNullOrWhiteSpace(item.Id);
     }
 
-    private async void OpenInboxThreadButton_Click(object sender, RoutedEventArgs e)
+    private void OpenInboxThreadButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: ThreadInboxItem item } ||
-            string.IsNullOrWhiteSpace(item.ActiveNodeId))
+        RunWindowOperation(async lease =>
         {
-            if (sender is FrameworkElement { DataContext: ThreadInboxItem catalogItem })
+            if (sender is not FrameworkElement { DataContext: ThreadInboxItem item } ||
+                string.IsNullOrWhiteSpace(item.ActiveNodeId))
             {
-                await AddInboxThreadToCanvasAsync(catalogItem);
+                if (sender is FrameworkElement { DataContext: ThreadInboxItem catalogItem })
+                {
+                    await AddInboxThreadToCanvasAsync(catalogItem);
+                }
+
+                return;
             }
 
-            return;
-        }
+            if (!_graph.Nodes.TryGetValue(item.ActiveNodeId, out var node))
+            {
+                return;
+            }
 
-        if (!_graph.Nodes.TryGetValue(item.ActiveNodeId, out var node))
-        {
-            return;
-        }
+            _selectedNodeId = item.ActiveNodeId;
+            _selectedEdgeId = null;
+            if (node.Metadata.IsUnread == true)
+            {
+                node.Metadata.IsUnread = false;
+                await SaveGraphAsync();
+            }
 
-        _selectedNodeId = item.ActiveNodeId;
-        _selectedEdgeId = null;
-        if (node.Metadata.IsUnread == true)
-        {
-            node.Metadata.IsUnread = false;
-            await SaveGraphAsync();
-        }
+            ShowSelectionInspector(node);
+            AddActivity($"Opened {node.Title} from inbox.");
+            UpdateChrome();
+            await SendGraphCommandAsync("selectNode", item.ActiveNodeId);
 
-        ShowSelectionInspector(node);
-        AddActivity($"Opened {node.Title} from inbox.");
-        UpdateChrome();
-        await SendGraphCommandAsync("selectNode", item.ActiveNodeId);
+        });
     }
 
     private async Task FocusThreadNodeAsync(CanvasNode node, string activityMessage)
@@ -7877,78 +8319,90 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void AddInboxThreadToCanvasButton_Click(object sender, RoutedEventArgs e)
+    private void AddInboxThreadToCanvasButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is FrameworkElement { DataContext: ThreadInboxItem item })
+        RunWindowOperation(async lease =>
         {
-            await AddInboxThreadToCanvasAsync(item);
-        }
+            if (sender is FrameworkElement { DataContext: ThreadInboxItem item })
+            {
+                await AddInboxThreadToCanvasAsync(item);
+            }
+
+        });
     }
 
-    private async void MarkInboxThreadReadButton_Click(object sender, RoutedEventArgs e)
+    private void MarkInboxThreadReadButton_Click(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { DataContext: ThreadInboxItem item })
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
-
-        if (TryGetInboxGraphNode(item, out var node))
-        {
-            node.Metadata.IsUnread = node.Metadata.IsUnread != true;
-            await SaveGraphAsync();
-            AddActivity(node.Metadata.IsUnread == true ? $"Marked {node.Title} unread." : $"Marked {node.Title} read.");
-            UpdateChrome();
-            await RenderGraphAsync();
-            return;
-        }
-
-        if (TryGetInboxCatalogThread(item, out var catalogThread))
-        {
-            catalogThread.Node.Metadata.IsUnread = catalogThread.Node.Metadata.IsUnread != true;
-            AddActivity(catalogThread.Node.Metadata.IsUnread == true
-                ? $"Marked {catalogThread.Node.Title} unread."
-                : $"Marked {catalogThread.Node.Title} read.");
-            UpdateChrome();
-        }
-    }
-
-    private async void ArchiveInboxThreadButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is not FrameworkElement { DataContext: ThreadInboxItem item })
-        {
-            return;
-        }
-
-        if (TryGetInboxGraphNode(item, out var node))
-        {
-            if (node.Metadata.IsArchived != true &&
-                !await ConfirmArchiveInboxThreadAsync(node))
+            if (sender is not FrameworkElement { DataContext: ThreadInboxItem item })
             {
                 return;
             }
 
-            node.Metadata.IsArchived = node.Metadata.IsArchived != true;
-            await SaveGraphAsync();
-            AddActivity(node.Metadata.IsArchived == true ? $"Archived {node.Title}." : $"Restored {node.Title}.");
-            UpdateChrome();
-            await RenderGraphAsync();
-            return;
-        }
+            if (TryGetInboxGraphNode(item, out var node))
+            {
+                node.Metadata.IsUnread = node.Metadata.IsUnread != true;
+                await SaveGraphAsync();
+                AddActivity(node.Metadata.IsUnread == true ? $"Marked {node.Title} unread." : $"Marked {node.Title} read.");
+                UpdateChrome();
+                await RenderGraphAsync();
+                return;
+            }
 
-        if (TryGetInboxCatalogThread(item, out var catalogThread))
+            if (TryGetInboxCatalogThread(item, out var catalogThread))
+            {
+                catalogThread.Node.Metadata.IsUnread = catalogThread.Node.Metadata.IsUnread != true;
+                AddActivity(catalogThread.Node.Metadata.IsUnread == true
+                    ? $"Marked {catalogThread.Node.Title} unread."
+                    : $"Marked {catalogThread.Node.Title} read.");
+                UpdateChrome();
+            }
+
+        });
+    }
+
+    private void ArchiveInboxThreadButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
         {
-            if (catalogThread.Node.Metadata.IsArchived != true &&
-                !await ConfirmArchiveInboxThreadAsync(catalogThread.Node))
+            if (sender is not FrameworkElement { DataContext: ThreadInboxItem item })
             {
                 return;
             }
 
-            catalogThread.Node.Metadata.IsArchived = catalogThread.Node.Metadata.IsArchived != true;
-            AddActivity(catalogThread.Node.Metadata.IsArchived == true
-                ? $"Archived {catalogThread.Node.Title}."
-                : $"Restored {catalogThread.Node.Title}.");
-            UpdateChrome();
-        }
+            if (TryGetInboxGraphNode(item, out var node))
+            {
+                if (node.Metadata.IsArchived != true &&
+                    !await ConfirmArchiveInboxThreadAsync(node))
+                {
+                    return;
+                }
+
+                node.Metadata.IsArchived = node.Metadata.IsArchived != true;
+                await SaveGraphAsync();
+                AddActivity(node.Metadata.IsArchived == true ? $"Archived {node.Title}." : $"Restored {node.Title}.");
+                UpdateChrome();
+                await RenderGraphAsync();
+                return;
+            }
+
+            if (TryGetInboxCatalogThread(item, out var catalogThread))
+            {
+                if (catalogThread.Node.Metadata.IsArchived != true &&
+                    !await ConfirmArchiveInboxThreadAsync(catalogThread.Node))
+                {
+                    return;
+                }
+
+                catalogThread.Node.Metadata.IsArchived = catalogThread.Node.Metadata.IsArchived != true;
+                AddActivity(catalogThread.Node.Metadata.IsArchived == true
+                    ? $"Archived {catalogThread.Node.Title}."
+                    : $"Restored {catalogThread.Node.Title}.");
+                UpdateChrome();
+            }
+
+        });
     }
 
     private bool TryGetInboxGraphNode(ThreadInboxItem item, out CanvasNode node)
@@ -7976,72 +8430,92 @@ public sealed partial class MainWindow : Window
         return false;
     }
 
-    private async void OpenSelectedThreadInReaderButton_Click(object sender, RoutedEventArgs e)
+    private void OpenSelectedThreadInReaderButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryGetSelectedThread(out var node))
+            {
+                return;
+            }
 
-        if (node.Metadata.IsUnread == true)
+            if (node.Metadata.IsUnread == true)
+            {
+                node.Metadata.IsUnread = false;
+                await SaveGraphAsync();
+                await RenderGraphAsync();
+            }
+
+            AddThreadToReader(node.Id, openReader: true);
+
+        });
+    }
+
+    private void StopSelectedThreadButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
         {
-            node.Metadata.IsUnread = false;
+            if (!TryGetSelectedThread(out var node))
+            {
+                return;
+            }
+
+            await StopThreadAsync(node, "selection inspector", sender as FrameworkElement);
+
+        });
+    }
+
+    private void MarkSelectedThreadReadButton_Click(object sender, RoutedEventArgs e)
+    {
+        RunWindowOperation(async lease =>
+        {
+            if (!TryGetSelectedThread(out var node))
+            {
+                return;
+            }
+
+            node.Metadata.IsUnread = node.Metadata.IsUnread != true;
             await SaveGraphAsync();
+            AddActivity(node.Metadata.IsUnread == true ? $"Marked {node.Title} unread." : $"Marked {node.Title} read.");
+            SyncSelectionInspector(node);
+            UpdateChrome();
             await RenderGraphAsync();
-        }
 
-        AddThreadToReader(node.Id, openReader: true);
+        });
     }
 
-    private async void StopSelectedThreadButton_Click(object sender, RoutedEventArgs e)
+    private void ArchiveSelectedThreadButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (!TryGetSelectedThread(out var node))
+            {
+                return;
+            }
 
-        await StopThreadAsync(node, "selection inspector", sender as FrameworkElement);
+            if (node.Metadata.IsArchived != true &&
+                !await ConfirmArchiveThreadAsync(node))
+            {
+                return;
+            }
+
+            node.Metadata.IsArchived = node.Metadata.IsArchived != true;
+            await SaveGraphAsync();
+            AddActivity(node.Metadata.IsArchived == true ? $"Archived {node.Title}." : $"Restored {node.Title}.");
+            SyncSelectionInspector(node);
+            UpdateChrome();
+            await RenderGraphAsync();
+
+        });
     }
 
-    private async void MarkSelectedThreadReadButton_Click(object sender, RoutedEventArgs e)
+    private void SaveSelectionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryGetSelectedThread(out var node))
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            await SaveSelectionAsync();
 
-        node.Metadata.IsUnread = node.Metadata.IsUnread != true;
-        await SaveGraphAsync();
-        AddActivity(node.Metadata.IsUnread == true ? $"Marked {node.Title} unread." : $"Marked {node.Title} read.");
-        SyncSelectionInspector(node);
-        UpdateChrome();
-        await RenderGraphAsync();
-    }
-
-    private async void ArchiveSelectedThreadButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (!TryGetSelectedThread(out var node))
-        {
-            return;
-        }
-
-        if (node.Metadata.IsArchived != true &&
-            !await ConfirmArchiveThreadAsync(node))
-        {
-            return;
-        }
-
-        node.Metadata.IsArchived = node.Metadata.IsArchived != true;
-        await SaveGraphAsync();
-        AddActivity(node.Metadata.IsArchived == true ? $"Archived {node.Title}." : $"Restored {node.Title}.");
-        SyncSelectionInspector(node);
-        UpdateChrome();
-        await RenderGraphAsync();
-    }
-
-    private async void SaveSelectionButton_Click(object sender, RoutedEventArgs e)
-    {
-        await SaveSelectionAsync();
+        });
     }
 
     private async Task SaveSelectionAsync()
@@ -8088,26 +8562,34 @@ public sealed partial class MainWindow : Window
         await RenderGraphAsync();
     }
 
-    private async void SelectionTitleBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    private void SelectionTitleBox_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (e.Key != Windows.System.VirtualKey.Enter)
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (e.Key != Windows.System.VirtualKey.Enter)
+            {
+                return;
+            }
 
-        e.Handled = true;
-        await SaveSelectionTitleOrLabelAsync();
+            e.Handled = true;
+            await SaveSelectionTitleOrLabelAsync();
+
+        });
     }
 
-    private async void SelectionPathBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    private void SelectionPathBox_KeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (e.Key != Windows.System.VirtualKey.Enter)
+        RunWindowOperation(async lease =>
         {
-            return;
-        }
+            if (e.Key != Windows.System.VirtualKey.Enter)
+            {
+                return;
+            }
 
-        e.Handled = true;
-        await SaveSelectionFolderPathAsync();
+            e.Handled = true;
+            await SaveSelectionFolderPathAsync();
+
+        });
     }
 
     private async Task SaveSelectionTitleOrLabelAsync()
@@ -8166,49 +8648,53 @@ public sealed partial class MainWindow : Window
         await RenderGraphAsync();
     }
 
-    private async void DeleteSelectionButton_Click(object sender, RoutedEventArgs e)
+    private void DeleteSelectionButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_selectedEdgeId is not null && _graph.ManualEdges.TryGetValue(_selectedEdgeId, out var selectedEdge))
+        RunWindowOperation(async lease =>
         {
-            if (!await ConfirmDeleteLineAsync())
+            if (_selectedEdgeId is not null && _graph.ManualEdges.TryGetValue(_selectedEdgeId, out var selectedEdge))
+            {
+                if (!await ConfirmDeleteLineAsync())
+                {
+                    return;
+                }
+
+                _graph.ManualEdges.Remove(_selectedEdgeId);
+                _selectedEdgeId = null;
+                _pendingLinkSourceNodeId = null;
+                SelectionInspector.Visibility = Visibility.Collapsed;
+                await SaveGraphAsync();
+                AddActivity($"Deleted {EdgeTitle(selectedEdge)}.");
+                await RenderGraphAsync();
+                return;
+            }
+
+            if (_selectedNodeId is null || !_graph.Nodes.TryGetValue(_selectedNodeId, out var node))
             {
                 return;
             }
 
-            _graph.ManualEdges.Remove(_selectedEdgeId);
-            _selectedEdgeId = null;
-            _pendingLinkSourceNodeId = null;
+            if (!await ConfirmDeleteNodeAsync(node))
+            {
+                return;
+            }
+
+            _graph.Nodes.Remove(_selectedNodeId);
+            foreach (var edge in _graph.ManualEdges.Values
+                         .Where(edge => edge.Source == _selectedNodeId || edge.Target == _selectedNodeId)
+                         .Select(edge => edge.Id)
+                         .ToList())
+            {
+                _graph.ManualEdges.Remove(edge);
+            }
+
+            _selectedNodeId = null;
             SelectionInspector.Visibility = Visibility.Collapsed;
             await SaveGraphAsync();
-            AddActivity($"Deleted {EdgeTitle(selectedEdge)}.");
+            AddActivity($"Deleted {node.Title}.");
             await RenderGraphAsync();
-            return;
-        }
 
-        if (_selectedNodeId is null || !_graph.Nodes.TryGetValue(_selectedNodeId, out var node))
-        {
-            return;
-        }
-
-        if (!await ConfirmDeleteNodeAsync(node))
-        {
-            return;
-        }
-
-        _graph.Nodes.Remove(_selectedNodeId);
-        foreach (var edge in _graph.ManualEdges.Values
-                     .Where(edge => edge.Source == _selectedNodeId || edge.Target == _selectedNodeId)
-                     .Select(edge => edge.Id)
-                     .ToList())
-        {
-            _graph.ManualEdges.Remove(edge);
-        }
-
-        _selectedNodeId = null;
-        SelectionInspector.Visibility = Visibility.Collapsed;
-        await SaveGraphAsync();
-        AddActivity($"Deleted {node.Title}.");
-        await RenderGraphAsync();
+        });
     }
 
     private Task<bool> ConfirmArchiveThreadAsync(CanvasNode node)
@@ -8280,14 +8766,18 @@ public sealed partial class MainWindow : Window
         return result == ContentDialogResult.Primary;
     }
 
-    private async void CloseSelectionButton_Click(object sender, RoutedEventArgs e)
+    private void CloseSelectionButton_Click(object sender, RoutedEventArgs e)
     {
-        _selectedNodeId = null;
-        _selectedEdgeId = null;
-        _pendingLinkSourceNodeId = null;
-        SelectionInspector.Visibility = Visibility.Collapsed;
-        ThreadPopover.Visibility = Visibility.Collapsed;
-        await SendGraphCommandAsync("clearSelection");
+        RunWindowOperation(async lease =>
+        {
+            _selectedNodeId = null;
+            _selectedEdgeId = null;
+            _pendingLinkSourceNodeId = null;
+            SelectionInspector.Visibility = Visibility.Collapsed;
+            ThreadPopover.Visibility = Visibility.Collapsed;
+            await SendGraphCommandAsync("clearSelection");
+
+        });
     }
 
     private void SelectionTitleBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -8316,19 +8806,31 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void ZoomOutButton_Click(object sender, RoutedEventArgs e)
+    private void ZoomOutButton_Click(object sender, RoutedEventArgs e)
     {
-        await SendGraphCommandAsync("zoomOut");
+        RunWindowOperation(async lease =>
+        {
+            await SendGraphCommandAsync("zoomOut");
+
+        });
     }
 
-    private async void ZoomInButton_Click(object sender, RoutedEventArgs e)
+    private void ZoomInButton_Click(object sender, RoutedEventArgs e)
     {
-        await SendGraphCommandAsync("zoomIn");
+        RunWindowOperation(async lease =>
+        {
+            await SendGraphCommandAsync("zoomIn");
+
+        });
     }
 
-    private async void ResetViewButton_Click(object sender, RoutedEventArgs e)
+    private void ResetViewButton_Click(object sender, RoutedEventArgs e)
     {
-        await SendGraphCommandAsync("resetView");
+        RunWindowOperation(async lease =>
+        {
+            await SendGraphCommandAsync("resetView");
+
+        });
     }
 
     private string UpsertMachineFromInitialize(Uri endpointUri, AppServerInitializeResult result)
@@ -8442,9 +8944,19 @@ public sealed partial class MainWindow : Window
 
     private async Task RenderGraphAsync()
     {
+        if (_windowLifetime.IsShuttingDown)
+        {
+            return;
+        }
+
         if (!_webViewReady)
         {
             await InitializeGraphViewAsync();
+        }
+
+        if (_windowLifetime.IsShuttingDown)
+        {
+            return;
         }
 
         UpdateChrome();
@@ -8500,11 +9012,26 @@ public sealed partial class MainWindow : Window
         return Task.CompletedTask;
     }
 
-    private async void GraphView_WebMessageReceived(CoreWebView2 sender, CoreWebView2WebMessageReceivedEventArgs args)
+    private void GraphView_WebMessageReceived(CoreWebView2 sender, CoreWebView2WebMessageReceivedEventArgs args)
     {
+        var messageJson = args.WebMessageAsJson;
+        _ = _windowLifetime.TryRunTracked(
+            lease => HandleGraphViewWebMessageAsync(messageJson, lease),
+            out _);
+    }
+
+    private async Task HandleGraphViewWebMessageAsync(
+        string messageJson,
+        WindowLifetimeLease lease)
+    {
+        if (!_windowLifetime.IsCurrent(lease))
+        {
+            return;
+        }
+
         try
         {
-            using var document = JsonDocument.Parse(args.WebMessageAsJson);
+            using var document = JsonDocument.Parse(messageJson);
             if (!document.RootElement.TryGetProperty("type", out var typeElement))
             {
                 return;
@@ -8540,6 +9067,11 @@ public sealed partial class MainWindow : Window
         }
         catch (JsonException exception)
         {
+            if (!_windowLifetime.IsCurrent(lease))
+            {
+                return;
+            }
+
             var message = $"Ignored graph message: {exception.Message}";
             SetStatusStripError(message);
             AddActivity(
@@ -9054,17 +9586,12 @@ public sealed partial class MainWindow : Window
         _readerThreadIds.Remove(node.Id);
         _readerPendingAttachments.Remove(node.Id);
         _readerTranscriptFilters.Remove(node.Id);
-        _threadTranscriptNextCursorsByNodeId.Remove(node.Id);
-        _threadTranscriptErrorsByNodeId.Remove(node.Id);
-        _threadTranscriptLoadPhasesByNodeId.Remove(node.Id);
-        _threadTranscriptLoadingNodeIds.Remove(node.Id);
-        _threadTranscriptLoadingOlderNodeIds.Remove(node.Id);
-        _threadTranscriptLoadedNodeIds.Remove(node.Id);
-        _threadTranscriptAutoLoadAttemptedNodeIds.Remove(node.Id);
-        if (_artifactSourceNodeId == node.Id)
+        _transcriptSessions.Remove(node.Id);
+        if (_artifactCatalog.SourceId == node.Id)
         {
-            _artifactSourceNodeId = null;
+            _artifactCatalog.ClearSource();
             ArtifactsPopover.Visibility = Visibility.Collapsed;
+            CloseArtifactPreview();
         }
 
         _selectedNodeId = null;
@@ -9554,10 +10081,10 @@ public sealed partial class MainWindow : Window
 
         var rows = ReaderTranscriptRows(node);
         var activeCategories = ActiveThreadPopoverTranscriptCategories();
-        var hasThreadPopoverError = _threadTranscriptErrorsByNodeId.TryGetValue(node.Id, out var threadPopoverError) &&
-            !string.IsNullOrWhiteSpace(threadPopoverError);
+        var transcriptSession = _transcriptSessions.Snapshot(node.Id);
+        var hasThreadPopoverError = !string.IsNullOrWhiteSpace(transcriptSession.Error);
         var threadPopoverTransientCounts = TranscriptTransientRows.Count(
-            _threadTranscriptLoadingNodeIds.Contains(node.Id),
+            transcriptSession.IsLoading,
             hasThreadPopoverError);
         _threadPopoverFilters.Clear();
         foreach (var filter in ReaderTranscriptFilterItem.Build(
@@ -9926,27 +10453,41 @@ public sealed partial class MainWindow : Window
             args.Cancel = true;
             SetDraft(current);
         };
-        dialog.PrimaryButtonClick += async (_, args) =>
+        dialog.PrimaryButtonClick += (_, args) =>
         {
             args.Cancel = true;
             var deferral = args.GetDeferral();
-            try
+            if (!RunWindowOperation(async lease =>
             {
-                var saved = await SaveThreadAutomationAsync(new CodexAutomationEdit(
-                    current.Id,
-                    titleBox.Text.Trim(),
-                    promptBox.Text,
-                    SelectedStatus(),
-                    rruleBox.Text.Trim()));
-                SetDraft(saved);
-                AddActivity($"Saved automation for {node.Title}.");
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or CodexAutomationStoreException)
-            {
-                errorText.Text = exception.Message;
-                errorText.Visibility = Visibility.Visible;
-            }
-            finally
+                try
+                {
+                    var saved = await SaveThreadAutomationAsync(new CodexAutomationEdit(
+                        current.Id,
+                        titleBox.Text.Trim(),
+                        promptBox.Text,
+                        SelectedStatus(),
+                        rruleBox.Text.Trim()), lease);
+                    if (_windowLifetime.IsCurrent(lease))
+                    {
+                        SetDraft(saved);
+                        AddActivity($"Saved automation for {node.Title}.");
+                    }
+                }
+                catch (OperationCanceledException) when (lease.CancellationToken.IsCancellationRequested)
+                {
+                }
+                catch (Exception exception) when (
+                    _windowLifetime.IsCurrent(lease) &&
+                    (exception is IOException or UnauthorizedAccessException or CodexAutomationStoreException))
+                {
+                    errorText.Text = exception.Message;
+                    errorText.Visibility = Visibility.Visible;
+                }
+                finally
+                {
+                    deferral.Complete();
+                }
+            }))
             {
                 deferral.Complete();
             }
@@ -9956,10 +10497,16 @@ public sealed partial class MainWindow : Window
         await dialog.ShowAsync();
     }
 
-    private async Task<CodexAutomationSummary> SaveThreadAutomationAsync(CodexAutomationEdit edit)
+    private async Task<CodexAutomationSummary> SaveThreadAutomationAsync(
+        CodexAutomationEdit edit,
+        WindowLifetimeLease lease)
     {
-        var saved = await Task.Run(() => _automationStore.Save(edit));
+        var saved = await Task.Run(
+            () => _automationStore.Save(edit),
+            lease.CancellationToken);
+        lease.CancellationToken.ThrowIfCancellationRequested();
         await RefreshThreadAutomationsAsync(renderAfterChange: false);
+        lease.CancellationToken.ThrowIfCancellationRequested();
         if (SelectedThreadNode() is { } selectedThread &&
             ThreadPopover.Visibility == Visibility.Visible)
         {
@@ -9968,6 +10515,7 @@ public sealed partial class MainWindow : Window
 
         UpdateChrome();
         await RenderGraphAsync();
+        lease.CancellationToken.ThrowIfCancellationRequested();
         return saved;
     }
 
@@ -10107,14 +10655,15 @@ public sealed partial class MainWindow : Window
         IReadOnlyList<ReaderTranscriptRow> rows,
         IReadOnlySet<ReaderTranscriptCategory> activeCategories)
     {
-        var isLoading = _threadTranscriptLoadingNodeIds.Contains(node.Id);
-        var isLoadingOlder = _threadTranscriptLoadingOlderNodeIds.Contains(node.Id);
+        var transcriptSession = _transcriptSessions.Snapshot(node.Id);
+        var isLoading = transcriptSession.IsLoading;
+        var isLoadingOlder = transcriptSession.IsLoadingOlder;
         var showsProgress = activeCategories.Contains(ReaderTranscriptCategory.Progress);
         ThreadPopoverTranscriptLoadingBanner.Visibility = isLoading && showsProgress
             ? Visibility.Visible
             : Visibility.Collapsed;
         ThreadPopoverTranscriptLoadingRing.IsActive = isLoading && showsProgress;
-        var loadPhase = CurrentThreadTranscriptLoadPhase(node, isLoadingOlder);
+        var loadPhase = transcriptSession.EffectiveLoadPhase(HasLoadedThreadTranscript(node));
         var loadPresentation = TranscriptLoadPhasePresentation.Resolve(loadPhase);
         ThreadPopoverTranscriptLoadingIcon.Glyph = loadPresentation.WindowsGlyph;
         ThreadPopoverTranscriptLoadingTitle.Text = loadPresentation.Title;
@@ -10130,9 +10679,7 @@ public sealed partial class MainWindow : Window
             ThreadPopoverTranscriptLoadingDetail,
             TranscriptLoadingRowPresentation.Resolve(HasLoadedThreadTranscript(node) || isLoadingOlder));
 
-        var hasOlderCursor =
-            _threadTranscriptNextCursorsByNodeId.TryGetValue(node.Id, out var nextCursor) &&
-            !string.IsNullOrWhiteSpace(nextCursor);
+        var hasOlderCursor = transcriptSession.HasOlderPage;
         var loadOlderPresentation = LoadOlderMessagesActionPresentation.Resolve(hasOlderCursor, isLoadingOlder);
         ThreadPopoverLoadOlderButton.Visibility = loadOlderPresentation.IsVisible ? Visibility.Visible : Visibility.Collapsed;
         ThreadPopoverLoadOlderButton.IsEnabled = loadOlderPresentation.IsButtonEnabled;
@@ -10158,12 +10705,11 @@ public sealed partial class MainWindow : Window
         ThreadPopoverLoadOlderText.FontSize = loadOlderPresentation.TextFontSize;
 
         var showsSystem = activeCategories.Contains(ReaderTranscriptCategory.System);
-        var hasError = _threadTranscriptErrorsByNodeId.TryGetValue(node.Id, out var errorMessage) &&
-            !string.IsNullOrWhiteSpace(errorMessage);
+        var hasError = !string.IsNullOrWhiteSpace(transcriptSession.Error);
         ThreadPopoverTranscriptErrorBanner.Visibility = hasError && showsSystem
             ? Visibility.Visible
             : Visibility.Collapsed;
-        ThreadPopoverTranscriptErrorText.Text = hasError ? errorMessage! : "";
+        ThreadPopoverTranscriptErrorText.Text = transcriptSession.Error ?? "";
         UseCachedThreadPopoverTranscriptButton.Visibility = HasLoadedThreadTranscript(node)
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -10203,18 +10749,6 @@ public sealed partial class MainWindow : Window
         return presentation.HorizontalAlignment == TranscriptLoadingRowPresentation.CenterAlignment
             ? HorizontalAlignment.Center
             : HorizontalAlignment.Left;
-    }
-
-    private TranscriptLoadPhase CurrentThreadTranscriptLoadPhase(CanvasNode node, bool isLoadingOlder)
-    {
-        if (_threadTranscriptLoadPhasesByNodeId.TryGetValue(node.Id, out var phase))
-        {
-            return phase;
-        }
-
-        return TranscriptLoadPhasePresentation.InitialPhase(
-            isLoadingOlder,
-            HasLoadedThreadTranscript(node));
     }
 
     private static bool HasLoadedThreadTranscript(CanvasNode node)
@@ -10650,8 +11184,10 @@ public sealed partial class MainWindow : Window
         PairQrModuleD.Fill = pairQrBrush;
         PairQrModuleE.Fill = pairQrBrush;
         PairQrModuleF.Fill = pairQrBrush;
+        PairButton.IsEnabled = pairingPresentation.IsEnabled;
         ToolTipService.SetToolTip(PairButton, pairingPresentation.ToolTip);
         AutomationProperties.SetName(PairButton, pairingPresentation.AccessibilityName);
+        AutomationProperties.SetHelpText(PairButton, pairingPresentation.ToolTip);
         var searchPresentation = ToolbarSearchPresentation.Resolve(_threadInboxMode == ThreadInboxModeSearch);
         var searchStroke = BrushFromHex(searchPresentation.StrokeHex);
         SearchButton.Style = ToolbarStyle(searchPresentation.StyleKey);
@@ -10766,21 +11302,21 @@ public sealed partial class MainWindow : Window
         {
             ApplySelectionInspectorLayout(SelectionInspectorLayout.ForNode());
         }
-        if (ArtifactsPopover.Visibility == Visibility.Visible && _artifactSourceNodeId is not null)
+        if (ArtifactsPopover.Visibility == Visibility.Visible && _artifactCatalog.SourceId is { } artifactSourceId)
         {
-            if (_graph.Nodes.TryGetValue(_artifactSourceNodeId, out var artifactNode) &&
+            if (_graph.Nodes.TryGetValue(artifactSourceId, out var artifactNode) &&
                 artifactNode.Kind == NodeKinds.CodexThread)
             {
-                _allThreadArtifactItems.Clear();
-                _allThreadArtifactItems.AddRange(ThreadArtifacts(artifactNode));
+                _artifactCatalog.Replace(artifactNode.Id, ThreadArtifacts(artifactNode));
                 ArtifactsSubtitleText.Text =
-                    $"{artifactNode.Title} - {_allThreadArtifactItems.Count} artifact{(_allThreadArtifactItems.Count == 1 ? "" : "s")}";
+                    $"{artifactNode.Title} - {_artifactCatalog.Count} artifact{(_artifactCatalog.Count == 1 ? "" : "s")}";
                 RefreshArtifactItems();
             }
             else
             {
                 ArtifactsPopover.Visibility = Visibility.Collapsed;
-                _artifactSourceNodeId = null;
+                _artifactCatalog.ClearSource();
+                CloseArtifactPreview();
             }
         }
 
@@ -10972,7 +11508,15 @@ public sealed partial class MainWindow : Window
         return "Add a folder to the workflow";
     }
 
-    private async void ShowCommandFeedback(string message, FrameworkElement? anchor = null)
+    private void ShowCommandFeedback(string message, FrameworkElement? anchor = null)
+    {
+        RunWindowOperation(lease => ShowCommandFeedbackAsync(message, anchor, lease));
+    }
+
+    private async Task ShowCommandFeedbackAsync(
+        string message,
+        FrameworkElement? anchor,
+        WindowLifetimeLease lease)
     {
         var token = ++_commandFeedbackToken;
         CommandFeedbackText.Text = message;
@@ -10980,8 +11524,16 @@ public sealed partial class MainWindow : Window
         CommandFeedbackBubble.Visibility = Visibility.Visible;
         CommandFeedbackBubble.Opacity = 1.0;
 
-        await Task.Delay(2200);
-        if (token != _commandFeedbackToken)
+        try
+        {
+            await Task.Delay(2200, lease.CancellationToken);
+        }
+        catch (OperationCanceledException) when (lease.CancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        if (!_windowLifetime.IsCurrent(lease) || token != _commandFeedbackToken)
         {
             return;
         }
@@ -12220,7 +12772,17 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private async Task RefreshNewThreadModelOptionsForSelectedTargetAsync()
+    private Task RefreshNewThreadModelOptionsForSelectedTargetAsync()
+    {
+        return _windowLifetime.TryRunTracked(
+            RefreshNewThreadModelOptionsForSelectedTargetCoreAsync,
+            out var task)
+            ? task
+            : Task.CompletedTask;
+    }
+
+    private async Task RefreshNewThreadModelOptionsForSelectedTargetCoreAsync(
+        WindowLifetimeLease lease)
     {
         if (NewThreadTargetBox?.SelectedItem is not NodeChoice choice ||
             !_graph.Nodes.TryGetValue(choice.Id, out var targetNode) ||
@@ -12231,7 +12793,7 @@ public sealed partial class MainWindow : Window
 
         _newThreadModelRefreshCancellation?.Cancel();
         _newThreadModelRefreshCancellation?.Dispose();
-        var cancellation = new CancellationTokenSource();
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(lease.CancellationToken);
         _newThreadModelRefreshCancellation = cancellation;
 
         try
@@ -12428,6 +12990,10 @@ public sealed partial class MainWindow : Window
         {
             _readerPendingAttachments.Remove(attachmentID);
         }
+        foreach (var mentionID in _readerMentionSelections.Keys.Except(_readerThreadIds).ToList())
+        {
+            _readerMentionSelections.Remove(mentionID);
+        }
 
         _readerThreads.Clear();
         var tileLayout = MeasureReaderTileLayout();
@@ -12441,12 +13007,11 @@ public sealed partial class MainWindow : Window
                 continue;
             }
 
-            var isLoadingTranscript = _threadTranscriptLoadingNodeIds.Contains(node.Id);
-            var isLoadingOlder = _threadTranscriptLoadingOlderNodeIds.Contains(node.Id);
-            var hasOlderCursor =
-                _threadTranscriptNextCursorsByNodeId.TryGetValue(node.Id, out var nextCursor) &&
-                !string.IsNullOrWhiteSpace(nextCursor);
-            _threadTranscriptErrorsByNodeId.TryGetValue(node.Id, out var transcriptError);
+            var transcriptSession = _transcriptSessions.Snapshot(node.Id);
+            var isLoadingTranscript = transcriptSession.IsLoading;
+            var isLoadingOlder = transcriptSession.IsLoadingOlder;
+            var hasOlderCursor = transcriptSession.HasOlderPage;
+            var transcriptError = transcriptSession.Error;
 
             var iconPresentation = ThreadHeaderIconPresentation.Resolve(LooksLikeSubagent(node));
             _readerThreads.Add(new ReaderThreadItem(
@@ -12688,7 +13253,7 @@ public sealed partial class MainWindow : Window
         }
 
         var hasAttentionRequests = _graph.PendingAttentionRequests.Any(request => AttentionRequestMatchesNode(request, node));
-        var isLoadingTranscript = _threadTranscriptLoadingNodeIds.Contains(node.Id);
+        var isLoadingTranscript = _transcriptSessions.Snapshot(node.Id).IsLoading;
 
         if (node.Metadata.RunStatus == ThreadRunStatuses.Running)
         {
@@ -12848,13 +13413,11 @@ public sealed partial class MainWindow : Window
 
     private void ShowArtifactsForThread(CanvasNode node)
     {
-        _artifactSourceNodeId = node.Id;
-        _artifactFilter = ArtifactFilterAll;
-        _allThreadArtifactItems.Clear();
-        _allThreadArtifactItems.AddRange(ThreadArtifacts(node));
+        _artifactCatalog.SetFilter(ArtifactCatalogFilter.All);
+        _artifactCatalog.Replace(node.Id, ThreadArtifacts(node));
         ArtifactsTitleText.Text = "Artifacts";
         ArtifactsSubtitleText.Text =
-            $"{node.Title} - {_allThreadArtifactItems.Count} artifact{(_allThreadArtifactItems.Count == 1 ? "" : "s")}";
+            $"{node.Title} - {_artifactCatalog.Count} artifact{(_artifactCatalog.Count == 1 ? "" : "s")}";
         ArtifactsPopover.Margin = _isReadingModePresented
             ? new Thickness(0, 72, 24, 0)
             : new Thickness(0, 84, 370, 0);
@@ -12865,13 +13428,13 @@ public sealed partial class MainWindow : Window
     private void RefreshArtifactItems()
     {
         _threadArtifactItems.Clear();
-        foreach (var item in _allThreadArtifactItems.Where(MatchesArtifactFilter))
+        foreach (var item in _artifactCatalog.VisibleItems)
         {
             _threadArtifactItems.Add(item);
         }
 
-        if (_selectedArtifactPreview is not null &&
-            !_threadArtifactItems.Any(item => string.Equals(item.Id, _selectedArtifactPreview.Id, StringComparison.Ordinal)))
+        if (_artifactCatalog.Selected is null &&
+            ArtifactPreviewPopover.Visibility == Visibility.Visible)
         {
             CloseArtifactPreview();
         }
@@ -12882,29 +13445,18 @@ public sealed partial class MainWindow : Window
         UpdateArtifactFilterButtons();
     }
 
-    private bool MatchesArtifactFilter(ThreadArtifactItem item)
-    {
-        return _artifactFilter switch
-        {
-            ArtifactFilterImages => item.KindKey == ThreadArtifactItem.KindImage,
-            ArtifactFilterFiles => item.KindKey == ThreadArtifactItem.KindFile,
-            ArtifactFilterDiffs => item.KindKey == ThreadArtifactItem.KindDiff,
-            _ => true
-        };
-    }
-
     private void SetArtifactFilter(string filter)
     {
-        _artifactFilter = filter;
+        _artifactCatalog.SetFilter(filter);
         RefreshArtifactItems();
     }
 
     private void UpdateArtifactFilterButtons()
     {
-        SetArtifactFilterButton(ArtifactFilterAllButton, _artifactFilter == ArtifactFilterAll);
-        SetArtifactFilterButton(ArtifactFilterImagesButton, _artifactFilter == ArtifactFilterImages);
-        SetArtifactFilterButton(ArtifactFilterFilesButton, _artifactFilter == ArtifactFilterFiles);
-        SetArtifactFilterButton(ArtifactFilterDiffsButton, _artifactFilter == ArtifactFilterDiffs);
+        SetArtifactFilterButton(ArtifactFilterAllButton, _artifactCatalog.Filter == ArtifactCatalogFilter.All);
+        SetArtifactFilterButton(ArtifactFilterImagesButton, _artifactCatalog.Filter == ArtifactCatalogFilter.Images);
+        SetArtifactFilterButton(ArtifactFilterFilesButton, _artifactCatalog.Filter == ArtifactCatalogFilter.Files);
+        SetArtifactFilterButton(ArtifactFilterDiffsButton, _artifactCatalog.Filter == ArtifactCatalogFilter.Diffs);
     }
 
     private static void SetArtifactFilterButton(Button button, bool isActive)
@@ -12916,7 +13468,11 @@ public sealed partial class MainWindow : Window
 
     private void ShowArtifactPreview(ThreadArtifactItem item)
     {
-        _selectedArtifactPreview = item;
+        if (!_artifactCatalog.Select(item))
+        {
+            return;
+        }
+
         ArtifactPreviewTitleText.Text = item.Title;
         ArtifactPreviewSubtitleText.Text = item.Subtitle;
         ArtifactPreviewIcon.Glyph = item.KindGlyph;
@@ -12934,7 +13490,8 @@ public sealed partial class MainWindow : Window
         ArtifactPreviewDiffScrollViewer.Visibility = Visibility.Collapsed;
         ArtifactPreviewTextScrollViewer.Visibility = Visibility.Visible;
 
-        if (item.KindKey == ThreadArtifactItem.KindImage && TryGetArtifactImageUri(item, out var imageUri))
+        if (item.KindKey == ThreadArtifactItem.KindImage &&
+            ArtifactPreviewLocation.TryResolve(item.DisplayPath, out var imageUri))
         {
             ArtifactPreviewImage.Source = new BitmapImage(imageUri);
             ArtifactPreviewSubtitleText.Text = item.DisplayPath ?? item.Subtitle;
@@ -12959,40 +13516,10 @@ public sealed partial class MainWindow : Window
 
     private void CloseArtifactPreview()
     {
-        _selectedArtifactPreview = null;
+        _artifactCatalog.ClearSelection();
         ArtifactPreviewImage.Source = null;
         _artifactPreviewDiffLines.Clear();
         ArtifactPreviewPopover.Visibility = Visibility.Collapsed;
-    }
-
-    private static bool TryGetArtifactImageUri(ThreadArtifactItem item, out Uri uri)
-    {
-        var path = item.DisplayPath;
-        if (!string.IsNullOrWhiteSpace(path) &&
-            Uri.TryCreate(path, UriKind.Absolute, out var candidateUri))
-        {
-            if (candidateUri.IsFile && File.Exists(candidateUri.LocalPath))
-            {
-                uri = candidateUri;
-                return true;
-            }
-
-            if (candidateUri.Scheme is "http" or "https")
-            {
-                uri = candidateUri;
-                return true;
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(path) &&
-            File.Exists(path))
-        {
-            uri = new Uri(path);
-            return true;
-        }
-
-        uri = new Uri("about:blank");
-        return false;
     }
 
     private void UpdateThreadInbox()
@@ -13089,7 +13616,7 @@ public sealed partial class MainWindow : Window
         {
             var staleHoverId = _hoveredInboxNodeId;
             _hoveredInboxNodeId = null;
-            _ = SendGraphCommandAsync("clearHighlight", staleHoverId);
+            RunWindowOperation(_ => SendGraphCommandAsync("clearHighlight", staleHoverId));
         }
 
         var count = _threadInboxItems.Count;
@@ -14868,12 +15395,6 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private sealed record MentionCatalogContext(
-        string CacheKey,
-        string? Cwd,
-        bool IncludeLocalFiles,
-        AppServerEndpoint? Endpoint);
-
     private void UpdateNewThreadMentionSuggestions()
     {
         if (NewThreadMentionPanel is null || NewThreadPromptBox is null)
@@ -14884,7 +15405,9 @@ public sealed partial class MainWindow : Window
         UpdateMentionSuggestionPanel(
             NewThreadPromptBox.Text,
             _newThreadMentionSuggestions,
+            _newThreadMentionSelection,
             NewThreadMentionPanel,
+            consumerId: "new-thread",
             excludedThreadNodeId: null,
             ownerThreadId: null,
             CurrentNewThreadMentionContext());
@@ -14892,6 +15415,13 @@ public sealed partial class MainWindow : Window
 
     private void ClearNewThreadMentionSuggestions()
     {
+        _newThreadMentionSelection.Reset();
+        HideNewThreadMentionSuggestions();
+    }
+
+    private void HideNewThreadMentionSuggestions()
+    {
+        _mentionCatalogSession.ActivateContext("new-thread", null);
         _newThreadMentionSuggestions.Clear();
         if (NewThreadMentionPanel is not null)
         {
@@ -14915,7 +15445,9 @@ public sealed partial class MainWindow : Window
         UpdateMentionSuggestionPanel(
             ThreadPopoverDraftBox.Text,
             _threadPopoverMentionSuggestions,
+            _threadPopoverMentionSelection,
             ThreadPopoverMentionPanel,
+            consumerId: "thread-popover",
             excludedThreadNodeId: node.Id,
             ownerThreadId: null,
             MentionContextForThreadNode(node));
@@ -14923,6 +15455,13 @@ public sealed partial class MainWindow : Window
 
     private void ClearThreadPopoverMentionSuggestions()
     {
+        _threadPopoverMentionSelection.Reset();
+        HideThreadPopoverMentionSuggestions();
+    }
+
+    private void HideThreadPopoverMentionSuggestions()
+    {
+        _mentionCatalogSession.ActivateContext("thread-popover", null);
         _threadPopoverMentionSuggestions.Clear();
         if (ThreadPopoverMentionPanel is not null)
         {
@@ -14932,9 +15471,19 @@ public sealed partial class MainWindow : Window
 
     private void UpdateReaderMentionSuggestions(ReaderThreadItem item, string text)
     {
+        var selection = ReaderMentionSelection(item.Id);
         item.MentionSuggestions.Clear();
         if (!item.IsComposerEnabled || !TryActiveMention(text, out _))
         {
+            _mentionCatalogSession.ActivateContext($"reader:{item.Id}", null);
+            selection.Reset();
+            item.MentionPanelVisibility = Visibility.Collapsed;
+            return;
+        }
+
+        if (!selection.ActivateQuery(text))
+        {
+            _mentionCatalogSession.ActivateContext($"reader:{item.Id}", null);
             item.MentionPanelVisibility = Visibility.Collapsed;
             return;
         }
@@ -14944,6 +15493,7 @@ public sealed partial class MainWindow : Window
             : null;
         foreach (var suggestion in MentionSuggestionsForText(
             text,
+            consumerId: $"reader:{item.Id}",
             excludedThreadNodeId: item.Id,
             ownerThreadId: item.Id,
             context))
@@ -14951,31 +15501,75 @@ public sealed partial class MainWindow : Window
             item.MentionSuggestions.Add(suggestion);
         }
 
+        selection.UpdateSuggestionCount(item.MentionSuggestions.Count);
+        ApplyMentionSelectionVisuals(selection, item.MentionSuggestions);
         item.MentionPanelVisibility = item.MentionSuggestions.Count > 0
             ? Visibility.Visible
             : Visibility.Collapsed;
     }
 
-    private static void ClearReaderMentionSuggestions(ReaderThreadItem item)
+    private void ClearReaderMentionSuggestions(ReaderThreadItem item)
     {
+        ReaderMentionSelection(item.Id).Reset();
+        HideReaderMentionSuggestions(item);
+    }
+
+    private void HideReaderMentionSuggestions(ReaderThreadItem item)
+    {
+        _mentionCatalogSession.ActivateContext($"reader:{item.Id}", null);
         item.MentionSuggestions.Clear();
         item.MentionPanelVisibility = Visibility.Collapsed;
+    }
+
+    private MentionSelectionController ReaderMentionSelection(string threadId)
+    {
+        if (!_readerMentionSelections.TryGetValue(threadId, out var selection))
+        {
+            selection = new MentionSelectionController();
+            _readerMentionSelections[threadId] = selection;
+        }
+
+        return selection;
     }
 
     private void UpdateMentionSuggestionPanel(
         string text,
         ObservableCollection<MentionSuggestionItem> suggestions,
+        MentionSelectionController selection,
         FrameworkElement panel,
+        string consumerId,
         string? excludedThreadNodeId,
         string? ownerThreadId,
         MentionCatalogContext? context)
     {
         suggestions.Clear();
-        foreach (var suggestion in MentionSuggestionsForText(text, excludedThreadNodeId, ownerThreadId, context))
+        if (!TryActiveMention(text, out _))
+        {
+            selection.Reset();
+            _mentionCatalogSession.ActivateContext(consumerId, null);
+            panel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        if (!selection.ActivateQuery(text))
+        {
+            _mentionCatalogSession.ActivateContext(consumerId, null);
+            panel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        foreach (var suggestion in MentionSuggestionsForText(
+                     text,
+                     consumerId,
+                     excludedThreadNodeId,
+                     ownerThreadId,
+                     context))
         {
             suggestions.Add(suggestion);
         }
 
+        selection.UpdateSuggestionCount(suggestions.Count);
+        ApplyMentionSelectionVisuals(selection, suggestions);
         panel.Visibility = suggestions.Count > 0
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -14983,18 +15577,21 @@ public sealed partial class MainWindow : Window
 
     private List<MentionSuggestionItem> MentionSuggestionsForText(
         string text,
+        string consumerId,
         string? excludedThreadNodeId,
         string? ownerThreadId,
         MentionCatalogContext? context)
     {
         if (!TryActiveMention(text, out var mention))
         {
+            _mentionCatalogSession.ActivateContext(consumerId, null);
             return [];
         }
 
+        _mentionCatalogSession.ActivateContext(consumerId, context);
         if (context is not null)
         {
-            QueueMentionCatalogRefresh(context);
+            _ = _mentionCatalogSession.EnsureRefreshedAsync(context);
         }
 
         var query = mention.Query.Trim();
@@ -15070,59 +15667,10 @@ public sealed partial class MainWindow : Window
         MentionCatalogContext? context,
         string? ownerThreadId)
     {
-        IReadOnlyList<MentionCatalogCandidate> candidates = context is not null &&
-            _mentionCatalogsByContextKey.TryGetValue(context.CacheKey, out var cached)
-                ? cached
-                : new[] { MentionCatalog.WorkflowBridgeCandidate };
+        IReadOnlyList<MentionCatalogCandidate> candidates = context is null
+            ? [MentionCatalog.WorkflowBridgeCandidate]
+            : _mentionCatalogSession.Candidates(context);
         return candidates.Select(candidate => MentionSuggestionItem.Catalog(candidate, ownerThreadId));
-    }
-
-    private void QueueMentionCatalogRefresh(MentionCatalogContext context)
-    {
-        if (_mentionCatalogsByContextKey.ContainsKey(context.CacheKey) ||
-            !_mentionCatalogRefreshesInFlight.Add(context.CacheKey))
-        {
-            return;
-        }
-
-        _ = RefreshMentionCatalogAsync(context);
-    }
-
-    private async Task RefreshMentionCatalogAsync(MentionCatalogContext context)
-    {
-        try
-        {
-            var candidates = new List<MentionCatalogCandidate>
-            {
-                MentionCatalog.WorkflowBridgeCandidate
-            };
-
-            if (context.IncludeLocalFiles && !string.IsNullOrWhiteSpace(context.Cwd))
-            {
-                var cwd = context.Cwd;
-                candidates.AddRange(await Task.Run(() => MentionCatalog.LocalFileMentionCandidates(cwd)));
-            }
-
-            if (context.Endpoint is not null)
-            {
-                candidates.AddRange(await new AppServerClient()
-                    .ListMentionCandidatesAsync(context.Endpoint, context.Cwd));
-            }
-
-            _mentionCatalogsByContextKey[context.CacheKey] = MentionCatalog.UniqueCandidates(candidates)
-                .OrderBy(candidate => MentionCatalog.SortPriority(candidate.Kind))
-                .ThenBy(candidate => candidate.Title, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-        }
-        catch
-        {
-            _mentionCatalogsByContextKey[context.CacheKey] = [MentionCatalog.WorkflowBridgeCandidate];
-        }
-        finally
-        {
-            _mentionCatalogRefreshesInFlight.Remove(context.CacheKey);
-            RefreshVisibleMentionSuggestions();
-        }
     }
 
     private void RefreshVisibleMentionSuggestions()
@@ -15317,8 +15865,12 @@ public sealed partial class MainWindow : Window
 
 public readonly record struct ActiveMentionToken(char Trigger, string Query, int StartIndex);
 
-public sealed class MentionSuggestionItem
+public sealed class MentionSuggestionItem : INotifyPropertyChanged
 {
+    private bool _isKeyboardSelected;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
     public char Trigger { get; set; } = '@';
 
     public string Label { get; set; } = "";
@@ -15336,6 +15888,29 @@ public sealed class MentionSuggestionItem
     public SolidColorBrush ForegroundBrush { get; set; } = MentionBrush("#A7B0BF");
 
     public int SortPriority { get; set; }
+
+    public bool IsKeyboardSelected
+    {
+        get => _isKeyboardSelected;
+        set
+        {
+            if (_isKeyboardSelected == value)
+            {
+                return;
+            }
+
+            _isKeyboardSelected = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsKeyboardSelected)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(RowBackgroundBrush)));
+        }
+    }
+
+    public string AccessibilityLabel => string.IsNullOrWhiteSpace(Subtitle)
+        ? Title
+        : $"{Title}, {Subtitle}";
+
+    public SolidColorBrush RowBackgroundBrush =>
+        MentionBrush(IsKeyboardSelected ? "#260A84FF" : "#00FFFFFF");
 
     public Thickness RowPadding =>
         new(
@@ -16988,1034 +17563,6 @@ public static class RecoveryStepStatus
     public const string Passed = "passed";
     public const string Warning = "warning";
     public const string Failed = "failed";
-}
-
-public sealed class ReaderThreadItem : INotifyPropertyChanged
-{
-    private string _draftText = "";
-    private string _attachmentErrorText = "";
-    private Visibility _mentionPanelVisibility = Visibility.Collapsed;
-    private double _tileWidth = 430;
-    private double _tileHeight = 430;
-
-    public ReaderThreadItem()
-    {
-    }
-
-    public event PropertyChangedEventHandler? PropertyChanged;
-
-    public ReaderThreadItem(
-        string id,
-        string title,
-        string subtitle,
-        string threadId,
-        string? model,
-        string? effort,
-        string approval,
-        string sandbox,
-        string status,
-        bool isUnread,
-        StopTurnActionAvailability stopAvailability,
-        string threadKindText,
-        string threadKindGlyph,
-        SolidColorBrush threadKindBrush,
-        SolidColorBrush threadKindBackgroundBrush,
-        string headerGlyph,
-        bool headerUsesThreadPairIcon,
-        SolidColorBrush headerIconBrush,
-        SolidColorBrush headerIconBackgroundBrush,
-        string liveStateGlyph,
-        string liveStateText,
-        SolidColorBrush liveStateBrush,
-        List<ReaderTranscriptRow> messages,
-        IReadOnlySet<ReaderTranscriptCategory> activeCategories,
-        ObservableCollection<ComposerAttachmentItem> pendingAttachments,
-        bool isLoadingTranscript,
-        bool isLoadingOlder,
-        bool hasOlderCursor,
-        string? transcriptError,
-        bool hasLoadedTranscript,
-        double tileWidth,
-        double tileHeight)
-    {
-        Id = id;
-        Title = title;
-        Subtitle = subtitle;
-        ThreadIDLabel = threadId;
-        var composerMetadata = ThreadComposerMetadataPresentation.Resolve(model, effort);
-        Model = composerMetadata.ModelText;
-        Effort = composerMetadata.EffortText;
-        ComposerMetadataVisibility = composerMetadata.ShowsMetadataRow
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        ModelChipVisibility = composerMetadata.ShowsModel ? Visibility.Visible : Visibility.Collapsed;
-        EffortChipVisibility = composerMetadata.ShowsEffort ? Visibility.Visible : Visibility.Collapsed;
-        Approval = approval;
-        Sandbox = sandbox;
-        ThreadKindText = threadKindText;
-        ThreadKindGlyph = threadKindGlyph;
-        ThreadKindBrush = threadKindBrush;
-        ThreadKindBackgroundBrush = threadKindBackgroundBrush;
-        HeaderGlyph = headerGlyph;
-        HeaderUsesThreadPairIcon = headerUsesThreadPairIcon;
-        HeaderIconBrush = headerIconBrush;
-        HeaderIconBackgroundBrush = headerIconBackgroundBrush;
-        var headerIconPresentation = ThreadHeaderIconPresentation.Resolve(!headerUsesThreadPairIcon);
-        HeaderSurfaceSize = headerIconPresentation.HeaderSurfaceSize;
-        HeaderSurfaceCornerRadius = new CornerRadius(headerIconPresentation.HeaderSurfaceCornerRadius);
-        HeaderIconGridWidth = headerIconPresentation.HeaderIconGridWidth;
-        HeaderIconGridHeight = headerIconPresentation.HeaderIconGridHeight;
-        HeaderGlyphFontSize = headerIconPresentation.HeaderGlyphFontSize;
-        HeaderPairBackGlyphFontSize = headerIconPresentation.HeaderPairBackGlyphFontSize;
-        HeaderPairFrontGlyphFontSize = headerIconPresentation.HeaderPairFrontGlyphFontSize;
-        HeaderPairBackOpacity = headerIconPresentation.HeaderPairBackOpacity;
-        var shellPresentation = ThreadPopoverShellPresentation.ResolveReaderTile();
-        HeaderColumnSpacing = shellPresentation.HeaderColumnSpacing;
-        HeaderActionSpacing = shellPresentation.HeaderActionSpacing;
-        HeaderControlsMargin = new Thickness(shellPresentation.HeaderControlsLeftInset, 0, 0, 0);
-        LiveStateGlyph = liveStateGlyph;
-        LiveStateText = liveStateText;
-        LiveStateBrush = liveStateBrush;
-        var statusPresentation = ThreadStatusPresentation.Resolve(status, isUnread);
-        var stopPresentation = StopTurnActionPresentation.Resolve();
-        StatusText = statusPresentation.Text;
-        StatusGlyph = statusPresentation.Glyph;
-        StatusForegroundBrush = ReaderBrush(statusPresentation.ForegroundHex);
-        StatusBackgroundBrush = ReaderBrush(statusPresentation.BackgroundHex);
-        StatusBorderBrush = ReaderBrush(statusPresentation.BorderHex);
-        StatusPillBorderThickness = new Thickness(statusPresentation.BorderThickness);
-        StatusPillPadding = new Thickness(
-            statusPresentation.HorizontalPadding,
-            statusPresentation.VerticalPadding,
-            statusPresentation.HorizontalPadding,
-            statusPresentation.VerticalPadding);
-        StatusPillCornerRadius = new CornerRadius(statusPresentation.CornerRadius);
-        StatusPillMinWidth = statusPresentation.MinWidth;
-        StatusIconFontSize = statusPresentation.IconFontSize;
-        StatusTextFontSize = statusPresentation.TextFontSize;
-        StopButtonGlyph = stopAvailability.WindowsGlyph;
-        StopButtonForegroundBrush = ReaderBrush(stopPresentation.ForegroundHex);
-        StopButtonBackgroundBrush = ReaderBrush(stopPresentation.BackgroundHex);
-        StopButtonBorderBrush = ReaderBrush(stopPresentation.BorderHex);
-        CanStopTurn = stopAvailability.CanInvoke;
-        StopButtonIsEnabled = stopAvailability.IsButtonEnabled;
-        StopButtonVisibility = stopAvailability.IsVisible ? Visibility.Visible : Visibility.Collapsed;
-        StopButtonOpacity = stopAvailability.Opacity;
-        StopButtonTooltip = stopAvailability.ToolTip;
-        StopButtonAccessibilityName = stopAvailability.AccessibilityName;
-        StopButtonAccessibilityHint = stopAvailability.AccessibilityHint;
-        IsComposerEnabled = status != ThreadRunStatuses.Running;
-        PendingAttachments = pendingAttachments;
-        SendButtonGlyph = ThreadSendActionPresentation.WindowsGlyph;
-        PendingAttachments.CollectionChanged += (_, _) => NotifySendActionChanged();
-        IsTranscriptLoading = isLoadingTranscript;
-        IsTranscriptLoadingOlder = isLoadingOlder;
-        TranscriptLoadingVisibility = isLoadingTranscript &&
-            activeCategories.Contains(ReaderTranscriptCategory.Progress)
-                ? Visibility.Visible
-                : Visibility.Collapsed;
-        var loadingPresentation = TranscriptLoadPhasePresentation.Resolve(
-            TranscriptLoadPhasePresentation.InitialPhase(isLoadingOlder, hasLoadedTranscript));
-        var loadingRowPresentation = TranscriptLoadingRowPresentation.Resolve(hasLoadedTranscript || isLoadingOlder);
-        TranscriptLoadingGlyph = loadingPresentation.WindowsGlyph;
-        TranscriptLoadingTitle = loadingPresentation.Title;
-        TranscriptLoadingDetail = loadingPresentation.Detail;
-        TranscriptLoadingPadding = new Thickness(loadingRowPresentation.Padding);
-        TranscriptLoadingMargin = new Thickness(0, loadingRowPresentation.VerticalMargin, 0, loadingRowPresentation.VerticalMargin);
-        TranscriptLoadingHorizontalAlignment = LoadingRowHorizontalAlignment(loadingRowPresentation);
-        TranscriptLoadingBackgroundBrush = ReaderBrush(loadingRowPresentation.BackgroundHex);
-        TranscriptLoadingBorderBrush = ReaderBrush(loadingRowPresentation.BorderHex);
-        var loadOlderPresentation = LoadOlderMessagesActionPresentation.Resolve(hasOlderCursor, isLoadingOlder);
-        LoadOlderButtonVisibility = loadOlderPresentation.IsVisible ? Visibility.Visible : Visibility.Collapsed;
-        IsLoadOlderEnabled = loadOlderPresentation.IsButtonEnabled;
-        LoadOlderButtonOpacity = loadOlderPresentation.Opacity;
-        LoadOlderButtonTooltip = loadOlderPresentation.ToolTip;
-        LoadOlderAccessibilityHint = loadOlderPresentation.AccessibilityHint;
-        LoadOlderProgressVisibility = loadOlderPresentation.ShowsProgress ? Visibility.Visible : Visibility.Collapsed;
-        LoadOlderIconVisibility = !loadOlderPresentation.ShowsProgress && loadOlderPresentation.ShowsIdleIcon
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        LoadOlderButtonText = loadOlderPresentation.ButtonText;
-        var hasTranscriptError = !string.IsNullOrWhiteSpace(transcriptError);
-        var transientCounts = TranscriptTransientRows.Count(isLoadingTranscript, hasTranscriptError);
-        TranscriptErrorText = transcriptError ?? "";
-        TranscriptErrorVisibility = hasTranscriptError &&
-            activeCategories.Contains(ReaderTranscriptCategory.System)
-                ? Visibility.Visible
-                : Visibility.Collapsed;
-        UseCachedTranscriptVisibility = hasLoadedTranscript ? Visibility.Visible : Visibility.Collapsed;
-        Filters = ReaderTranscriptFilterItem.Build(
-            id,
-            messages,
-            activeCategories,
-            additionalProgressCount: transientCounts.ProgressCount,
-            additionalSystemCount: transientCounts.SystemCount);
-        Messages = messages
-            .Where(row => row.MatchesAnyCategory(activeCategories))
-            .ToList();
-        var categories = OrderedTranscriptCategories();
-        var selectedCategories = categories.Where(activeCategories.Contains).ToList();
-        var isShowingAllRows = selectedCategories.Count == categories.Length;
-        FilterSummaryText = isShowingAllRows
-            ? "All rows"
-            : selectedCategories.Count > 2
-                ? $"{selectedCategories.Count} filters"
-                : string.Join(", ", selectedCategories.Select(CompactTitleFor));
-        FilterDetailText = isShowingAllRows
-            ? "Messages, progress, thoughts, tools, artifacts, approvals, events"
-            : string.Join(", ", selectedCategories.Select(TitleFor));
-        FilterDetailBrush = ReaderBrush(TranscriptFilterPresentation.DetailForegroundHex(isShowingAllRows));
-        ResetFiltersVisibility = isShowingAllRows ? Visibility.Collapsed : Visibility.Visible;
-        MessageFilterMenuText = MenuTitleFor(
-            ReaderTranscriptCategory.Message,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount);
-        ProgressFilterMenuText = MenuTitleFor(
-            ReaderTranscriptCategory.Progress,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount);
-        ThoughtFilterMenuText = MenuTitleFor(
-            ReaderTranscriptCategory.Thought,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount);
-        ToolFilterMenuText = MenuTitleFor(
-            ReaderTranscriptCategory.Tool,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount);
-        ArtifactFilterMenuText = MenuTitleFor(
-            ReaderTranscriptCategory.Artifact,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount);
-        ApprovalFilterMenuText = MenuTitleFor(
-            ReaderTranscriptCategory.Approval,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount);
-        SystemFilterMenuText = MenuTitleFor(
-            ReaderTranscriptCategory.System,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount);
-        IsMessageFilterActive = activeCategories.Contains(ReaderTranscriptCategory.Message);
-        IsProgressFilterActive = activeCategories.Contains(ReaderTranscriptCategory.Progress);
-        IsThoughtFilterActive = activeCategories.Contains(ReaderTranscriptCategory.Thought);
-        IsToolFilterActive = activeCategories.Contains(ReaderTranscriptCategory.Tool);
-        IsArtifactFilterActive = activeCategories.Contains(ReaderTranscriptCategory.Artifact);
-        IsApprovalFilterActive = activeCategories.Contains(ReaderTranscriptCategory.Approval);
-        IsSystemFilterActive = activeCategories.Contains(ReaderTranscriptCategory.System);
-        FilteredEmptyVisibility = messages.Count + transientCounts.TotalCount > 0 &&
-            Messages.Count == 0 &&
-            TranscriptErrorVisibility != Visibility.Visible &&
-            TranscriptLoadingVisibility != Visibility.Visible
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        var artifactCount = messages.Count(row => row.MatchesCategory(ReaderTranscriptCategory.Artifact));
-        HasArtifacts = artifactCount > 0;
-        ArtifactButtonTooltip = artifactCount == 0
-            ? ArtifactsActionPresentation.UnavailableReason
-            : $"{artifactCount} artifact{(artifactCount == 1 ? "" : "s")}";
-        ArtifactButtonOpacity = artifactCount == 0
-            ? ArtifactsActionPresentation.UnavailableOpacity
-            : 1.0;
-        ArtifactButtonAccessibilityHint = artifactCount == 0
-            ? ArtifactsActionPresentation.UnavailableReason
-            : "";
-        MessageCountText = $"{messages.Count(row => row.MatchesCategory(ReaderTranscriptCategory.Message))} messages";
-        ProgressCountText = $"{CountFor(
-            ReaderTranscriptCategory.Progress,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount)} progress";
-        ThoughtCountText = $"{messages.Count(row => row.MatchesCategory(ReaderTranscriptCategory.Thought))} thoughts";
-        ToolCountText = $"{messages.Count(row => row.MatchesCategory(ReaderTranscriptCategory.Tool))} tools";
-        ArtifactCountText = $"{messages.Count(row => row.MatchesCategory(ReaderTranscriptCategory.Artifact))} artifacts";
-        ApprovalCountText = $"{messages.Count(row => row.MatchesCategory(ReaderTranscriptCategory.Approval))} approvals";
-        SystemCountText = $"{CountFor(
-            ReaderTranscriptCategory.System,
-            messages,
-            transientCounts.ProgressCount,
-            transientCounts.SystemCount)} events";
-        ComposerHintText = ComposerHint(composerMetadata, sandbox);
-        TileWidth = tileWidth;
-        TileHeight = tileHeight;
-    }
-
-    public string Id { get; set; } = "";
-
-    public string Title { get; set; } = "";
-
-    public string Subtitle { get; set; } = "";
-
-    public string ThreadKindText { get; set; } = "Thread";
-
-    public string ThreadKindGlyph { get; set; } = "\uE8F2";
-
-    public SolidColorBrush ThreadKindBrush { get; set; } = ReaderBrush("#A7B0BF");
-
-    public SolidColorBrush ThreadKindBackgroundBrush { get; set; } = ReaderBrush(ThreadHeaderIconPresentation.ThreadKindBackgroundHex);
-
-    public SolidColorBrush HeaderIconBrush { get; set; } = ReaderBrush("#0A84FF");
-
-    public SolidColorBrush HeaderIconBackgroundBrush { get; set; } = ReaderBrush(ThreadHeaderIconPresentation.ThreadHeaderBackgroundHex);
-
-    public string HeaderGlyph { get; set; } = ThreadHeaderIconPresentation.ThreadGlyph;
-
-    public bool HeaderUsesThreadPairIcon { get; set; }
-
-    public Visibility HeaderGlyphVisibility => HeaderUsesThreadPairIcon ? Visibility.Collapsed : Visibility.Visible;
-
-    public Visibility HeaderThreadPairIconVisibility => HeaderUsesThreadPairIcon ? Visibility.Visible : Visibility.Collapsed;
-
-    public double HeaderSurfaceSize { get; set; } = ThreadHeaderIconPresentation.HeaderSurfaceSize;
-
-    public CornerRadius HeaderSurfaceCornerRadius { get; set; } = new(ThreadHeaderIconPresentation.HeaderSurfaceCornerRadius);
-
-    public double HeaderIconGridWidth { get; set; } = ThreadHeaderIconPresentation.HeaderIconGridWidth;
-
-    public double HeaderIconGridHeight { get; set; } = ThreadHeaderIconPresentation.HeaderIconGridHeight;
-
-    public double HeaderGlyphFontSize { get; set; } = ThreadHeaderIconPresentation.HeaderGlyphFontSize;
-
-    public double HeaderPairBackGlyphFontSize { get; set; } = ThreadHeaderIconPresentation.HeaderPairBackGlyphFontSize;
-
-    public double HeaderPairFrontGlyphFontSize { get; set; } = ThreadHeaderIconPresentation.HeaderPairFrontGlyphFontSize;
-
-    public double HeaderPairBackOpacity { get; set; } = ThreadHeaderIconPresentation.HeaderPairBackOpacity;
-
-    public double HeaderColumnSpacing { get; set; } = ThreadPopoverShellPresentation.HeaderColumnSpacing;
-
-    public double HeaderActionSpacing { get; set; } = ThreadPopoverShellPresentation.HeaderActionSpacing;
-
-    public Thickness HeaderControlsMargin { get; set; } =
-        new(ThreadPopoverShellPresentation.HeaderControlsLeftInset, 0, 0, 0);
-
-    private static ThreadHeaderActionPresentationSnapshot HeaderActionPresentation =>
-        ThreadHeaderActionPresentation.Resolve();
-
-    public double HeaderActionButtonSize => HeaderActionPresentation.HitTargetSize;
-
-    public double HeaderActionIconFontSize => HeaderActionPresentation.IconFontSize;
-
-    public Thickness HeaderActionButtonBorderThickness =>
-        new(HeaderActionPresentation.BorderThickness);
-
-    public SolidColorBrush HeaderActionButtonBackgroundBrush =>
-        ReaderBrush(HeaderActionPresentation.BackgroundHex);
-
-    public SolidColorBrush HeaderActionForegroundBrush =>
-        ReaderBrush(HeaderActionPresentation.ForegroundHex);
-
-    public string RefreshButtonGlyph => HeaderActionPresentation.RefreshWindowsGlyph;
-
-    public string RefreshButtonToolTip => HeaderActionPresentation.RefreshToolTip;
-
-    public string RefreshButtonAccessibilityName => HeaderActionPresentation.RefreshAccessibilityName;
-
-    public string CloseButtonGlyph => HeaderActionPresentation.CloseWindowsGlyph;
-
-    public string CloseButtonToolTip => HeaderActionPresentation.CloseToolTip;
-
-    public string CloseButtonAccessibilityName => HeaderActionPresentation.CloseAccessibilityName;
-
-    private static ArtifactsActionPresentationSnapshot HeaderArtifactsPresentation =>
-        ArtifactsActionPresentation.Resolve();
-
-    public double ArtifactButtonIconSize => HeaderArtifactsPresentation.ActionIconSize;
-
-    public double ArtifactButtonStrokeThickness => HeaderArtifactsPresentation.StrokeThickness;
-
-    public SolidColorBrush ArtifactButtonForegroundBrush =>
-        ReaderBrush(HeaderArtifactsPresentation.ActionForegroundHex);
-
-    public string ThreadIDLabel { get; set; } = "";
-
-    private static ThreadHeaderIdentityActionPresentationSnapshot HeaderIdentityPresentation =>
-        ThreadHeaderIdentityActionPresentation.Resolve();
-
-    public double RenameButtonSize => HeaderIdentityPresentation.RenameHitTargetSize;
-
-    public double RenameButtonIconFontSize => HeaderIdentityPresentation.RenameIconFontSize;
-
-    public string RenameButtonGlyph => HeaderIdentityPresentation.RenameWindowsGlyph;
-
-    public string RenameButtonToolTip => HeaderIdentityPresentation.RenameToolTip;
-
-    public string RenameButtonAccessibilityName => HeaderIdentityPresentation.RenameAccessibilityName;
-
-    public double CopyThreadIdButtonSize => HeaderIdentityPresentation.CopyHitTargetSize;
-
-    public double CopyThreadIdButtonIconFontSize => HeaderIdentityPresentation.CopyIconFontSize;
-
-    public string CopyThreadIdButtonGlyph => HeaderIdentityPresentation.CopyWindowsGlyph;
-
-    public string CopyThreadIdButtonToolTip => HeaderIdentityPresentation.CopyToolTip;
-
-    public string CopyThreadIdButtonAccessibilityName => HeaderIdentityPresentation.CopyAccessibilityName;
-
-    public Thickness IdentityActionButtonBorderThickness =>
-        new(HeaderIdentityPresentation.BorderThickness);
-
-    public SolidColorBrush IdentityActionButtonBackgroundBrush =>
-        ReaderBrush(HeaderIdentityPresentation.BackgroundHex);
-
-    public SolidColorBrush RenameButtonForegroundBrush =>
-        ReaderBrush(HeaderIdentityPresentation.RenameForegroundHex);
-
-    public SolidColorBrush CopyThreadIdButtonForegroundBrush =>
-        ReaderBrush(HeaderIdentityPresentation.CopyForegroundHex);
-
-    private static ThreadComposerAttachmentToolbarPresentationSnapshot AttachmentToolbarPresentation =>
-        ThreadComposerAttachmentToolbarPresentation.Resolve();
-
-    public double AttachmentToolbarSpacing => AttachmentToolbarPresentation.ToolbarSpacing;
-
-    public double AttachmentToolbarButtonSize => AttachmentToolbarPresentation.ButtonSize;
-
-    public double AttachmentToolbarIconFontSize => AttachmentToolbarPresentation.IconFontSize;
-
-    public Thickness AttachmentToolbarButtonBorderThickness =>
-        new(AttachmentToolbarPresentation.BorderThickness);
-
-    public SolidColorBrush AttachmentToolbarButtonBackgroundBrush =>
-        ReaderBrush(AttachmentToolbarPresentation.BackgroundHex);
-
-    public SolidColorBrush AttachmentToolbarForegroundBrush =>
-        ReaderBrush(AttachmentToolbarPresentation.ForegroundHex);
-
-    public double AttachmentToolbarCountFontSize => AttachmentToolbarPresentation.CountFontSize;
-
-    public SolidColorBrush AttachmentToolbarCountForegroundBrush =>
-        ReaderBrush(AttachmentToolbarPresentation.CountForegroundHex);
-
-    public string AttachButtonGlyph => AttachmentToolbarPresentation.AttachWindowsGlyph;
-
-    public string AttachButtonToolTip => AttachmentToolbarPresentation.AttachToolTip;
-
-    public string AttachButtonAccessibilityName => AttachmentToolbarPresentation.AttachAccessibilityName;
-
-    public string PasteButtonGlyph => AttachmentToolbarPresentation.PasteWindowsGlyph;
-
-    public string PasteButtonToolTip => AttachmentToolbarPresentation.PasteToolTip;
-
-    public string PasteButtonAccessibilityName => AttachmentToolbarPresentation.PasteAccessibilityName;
-
-    public string LiveStateGlyph { get; set; } = "\uE823";
-
-    public string LiveStateText { get; set; } = "Idle";
-
-    public SolidColorBrush LiveStateBrush { get; set; } =
-        ReaderBrush(ThreadLiveStatePresentation.SecondaryHex);
-
-    public string Model { get; set; } = "";
-
-    public string Effort { get; set; } = "";
-
-    public Visibility ComposerMetadataVisibility { get; set; } = Visibility.Collapsed;
-
-    public Visibility ModelChipVisibility { get; set; } = Visibility.Collapsed;
-
-    public Visibility EffortChipVisibility { get; set; } = Visibility.Collapsed;
-
-    public string Approval { get; set; } = "";
-
-    public string Sandbox { get; set; } = "";
-
-    public string StatusText { get; set; } = "";
-
-    public string StatusGlyph { get; set; } = "\uEA3A";
-
-    public SolidColorBrush StatusForegroundBrush { get; set; } = ReaderBrush("#A7B0BF");
-
-    public SolidColorBrush StatusBackgroundBrush { get; set; } = ReaderBrush("#1CA7B0BF");
-
-    public SolidColorBrush StatusBorderBrush { get; set; } = ReaderBrush(ThreadStatusPresentation.BorderlessHex);
-
-    public Thickness StatusPillBorderThickness { get; set; } = new(ThreadStatusPresentation.PillBorderThickness);
-
-    public Thickness StatusPillPadding { get; set; } = new(
-        ThreadStatusPresentation.PillHorizontalPadding,
-        ThreadStatusPresentation.PillVerticalPadding,
-        ThreadStatusPresentation.PillHorizontalPadding,
-        ThreadStatusPresentation.PillVerticalPadding);
-
-    public CornerRadius StatusPillCornerRadius { get; set; } = new(ThreadStatusPresentation.PillCornerRadius);
-
-    public double StatusPillMinWidth { get; set; } = ThreadStatusPresentation.PillMinWidth;
-
-    public double StatusIconFontSize { get; set; } = ThreadStatusPresentation.PillIconFontSize;
-
-    public double StatusTextFontSize { get; set; } = ThreadStatusPresentation.PillTextFontSize;
-
-    public bool CanStopTurn { get; set; }
-
-    public bool StopButtonIsEnabled { get; set; }
-
-    public Visibility StopButtonVisibility { get; set; } = Visibility.Collapsed;
-
-    public double StopButtonOpacity { get; set; } = StopTurnActionPresentation.AvailableOpacity;
-
-    public string StopButtonTooltip { get; set; } = StopTurnActionPresentation.ToolTip;
-
-    public string StopButtonAccessibilityName { get; set; } = StopTurnActionPresentation.AccessibilityName;
-
-    public string StopButtonAccessibilityHint { get; set; } = "";
-
-    public string StopButtonGlyph { get; set; } = StopTurnActionPresentation.WindowsGlyph;
-
-    public SolidColorBrush StopButtonForegroundBrush { get; set; } = ReaderBrush(StopTurnActionPresentation.ForegroundHex);
-
-    public SolidColorBrush StopButtonBackgroundBrush { get; set; } = ReaderBrush(StopTurnActionPresentation.BackgroundHex);
-
-    public SolidColorBrush StopButtonBorderBrush { get; set; } = ReaderBrush(StopTurnActionPresentation.BorderHex);
-
-    public bool IsComposerEnabled { get; set; } = true;
-
-    public string SendButtonGlyph { get; set; } = ThreadSendActionPresentation.WindowsGlyph;
-
-    public string SendButtonTooltip => SendAvailability.UnavailableReason ?? ThreadSendActionPresentation.ToolTip;
-
-    public double SendButtonOpacity => SendAvailability.Opacity;
-
-    public string SendButtonAccessibilityHint => SendAvailability.UnavailableReason ?? "";
-
-    public bool HasArtifacts { get; set; }
-
-    public string ArtifactButtonTooltip { get; set; } = ArtifactsActionPresentation.UnavailableReason;
-
-    public double ArtifactButtonOpacity { get; set; } = ArtifactsActionPresentation.UnavailableOpacity;
-
-    public string ArtifactButtonAccessibilityHint { get; set; } = ArtifactsActionPresentation.UnavailableReason;
-
-    public ObservableCollection<ComposerAttachmentItem> PendingAttachments { get; set; } = [];
-
-    public string PendingAttachmentSummaryText =>
-        ThreadAttachmentFeedbackPresentation.CountText(PendingAttachments.Count);
-
-    public Visibility PendingAttachmentSummaryVisibility =>
-        string.IsNullOrWhiteSpace(PendingAttachmentSummaryText) ? Visibility.Collapsed : Visibility.Visible;
-
-    public bool IsTranscriptLoading { get; set; }
-
-    public bool IsTranscriptLoadingOlder { get; set; }
-
-    public Visibility TranscriptLoadingVisibility { get; set; } = Visibility.Collapsed;
-
-    public string TranscriptLoadingGlyph { get; set; } = TranscriptLoadPhasePresentation.LoadingHistoryGlyph;
-
-    public string TranscriptLoadingTitle { get; set; } = "Loading message history";
-
-    public string TranscriptLoadingDetail { get; set; } = "Waiting on thread history from Codex App Server.";
-
-    public Thickness TranscriptLoadingPadding { get; set; } =
-        new(TranscriptLoadingRowPresentation.RegularPadding);
-
-    public Thickness TranscriptLoadingMargin { get; set; } =
-        new(0, TranscriptLoadingRowPresentation.InitialVerticalMargin, 0, TranscriptLoadingRowPresentation.InitialVerticalMargin);
-
-    public HorizontalAlignment TranscriptLoadingHorizontalAlignment { get; set; } = HorizontalAlignment.Center;
-
-    public SolidColorBrush TranscriptLoadingBackgroundBrush { get; set; } =
-        ReaderBrush(TranscriptLoadingRowPresentation.RegularBackgroundHex);
-
-    public SolidColorBrush TranscriptLoadingBorderBrush { get; set; } =
-        ReaderBrush(TranscriptLoadingRowPresentation.RegularBorderHex);
-
-    private TranscriptLoadingRowPresentationSnapshot TranscriptLoadingPresentation =>
-        TranscriptLoadingRowPresentation.Resolve(TranscriptLoadingHorizontalAlignment != HorizontalAlignment.Center);
-
-    public double TranscriptLoadingOuterColumnSpacing =>
-        TranscriptLoadingPresentation.OuterColumnSpacing;
-
-    public double TranscriptLoadingProgressRingSize =>
-        TranscriptLoadingPresentation.ProgressRingSize;
-
-    public Thickness TranscriptLoadingProgressRingMargin =>
-        new(0, TranscriptLoadingPresentation.ProgressRingTopMargin, 0, 0);
-
-    public double TranscriptLoadingContentSpacing =>
-        TranscriptLoadingPresentation.ContentSpacing;
-
-    public double TranscriptLoadingHeaderSpacing =>
-        TranscriptLoadingPresentation.HeaderSpacing;
-
-    public double TranscriptLoadingLabelIconFontSize =>
-        TranscriptLoadingPresentation.LabelIconFontSize;
-
-    public double TranscriptLoadingTitleFontSize =>
-        TranscriptLoadingPresentation.TitleFontSize;
-
-    public double TranscriptLoadingDetailFontSize =>
-        TranscriptLoadingPresentation.DetailFontSize;
-
-    public int TranscriptLoadingDetailMaxLines =>
-        TranscriptLoadingPresentation.DetailMaxLines;
-
-    public Visibility LoadOlderButtonVisibility { get; set; } = Visibility.Collapsed;
-
-    public bool IsLoadOlderEnabled { get; set; }
-
-    public double LoadOlderButtonOpacity { get; set; } = LoadOlderMessagesActionPresentation.AvailableOpacity;
-
-    public string LoadOlderButtonTooltip { get; set; } = LoadOlderMessagesActionPresentation.ToolTip;
-
-    public string LoadOlderAccessibilityHint { get; set; } = "";
-
-    public double LoadOlderButtonMinHeight => LoadOlderMessagesActionPresentation.ButtonMinHeight;
-
-    public Thickness LoadOlderButtonPadding => new(
-        LoadOlderMessagesActionPresentation.ButtonHorizontalPadding,
-        LoadOlderMessagesActionPresentation.ButtonVerticalPadding,
-        LoadOlderMessagesActionPresentation.ButtonHorizontalPadding,
-        LoadOlderMessagesActionPresentation.ButtonVerticalPadding);
-
-    public double LoadOlderContentSpacing => LoadOlderMessagesActionPresentation.ContentSpacing;
-
-    public double LoadOlderProgressRingSize => LoadOlderMessagesActionPresentation.ProgressRingSize;
-
-    public double LoadOlderIdleIconFontSize => LoadOlderMessagesActionPresentation.IdleIconFontSize;
-
-    public double LoadOlderTextFontSize => LoadOlderMessagesActionPresentation.TextFontSize;
-
-    public Visibility LoadOlderProgressVisibility { get; set; } = Visibility.Collapsed;
-
-    public Visibility LoadOlderIconVisibility { get; set; } = Visibility.Collapsed;
-
-    public string LoadOlderButtonText { get; set; } = "Show older messages";
-
-    public Visibility TranscriptErrorVisibility { get; set; } = Visibility.Collapsed;
-
-    public string TranscriptErrorText { get; set; } = "";
-
-    public Visibility UseCachedTranscriptVisibility { get; set; } = Visibility.Collapsed;
-
-    private static TranscriptErrorPresentationSnapshot ErrorPresentation =>
-        TranscriptErrorPresentation.Resolve();
-
-    public string TranscriptErrorGlyph => ErrorPresentation.WindowsGlyph;
-
-    public string TranscriptErrorTitle => ErrorPresentation.Title;
-
-    public string TranscriptErrorRetryLabel => ErrorPresentation.RetryLabel;
-
-    public string TranscriptErrorUseCachedLabel => ErrorPresentation.UseCachedLabel;
-
-    public Thickness TranscriptErrorPadding => new(ErrorPresentation.Padding);
-
-    public CornerRadius TranscriptErrorCornerRadius => new(ErrorPresentation.CornerRadius);
-
-    public Thickness TranscriptErrorBorderThickness => new(ErrorPresentation.BorderThickness);
-
-    public double TranscriptErrorContentSpacing => ErrorPresentation.ContentSpacing;
-
-    public double TranscriptErrorHeaderColumnSpacing => ErrorPresentation.HeaderColumnSpacing;
-
-    public double TranscriptErrorTextStackSpacing => ErrorPresentation.TextStackSpacing;
-
-    public double TranscriptErrorActionSpacing => ErrorPresentation.ActionSpacing;
-
-    public Thickness TranscriptErrorIconMargin => new(0, ErrorPresentation.IconTopMargin, 0, 0);
-
-    public double TranscriptErrorIconFontSize => ErrorPresentation.IconFontSize;
-
-    public double TranscriptErrorTitleFontSize => ErrorPresentation.TitleFontSize;
-
-    public double TranscriptErrorDetailFontSize => ErrorPresentation.DetailFontSize;
-
-    public Thickness TranscriptErrorButtonPadding => new(
-        ErrorPresentation.ButtonHorizontalPadding,
-        ErrorPresentation.ButtonVerticalPadding,
-        ErrorPresentation.ButtonHorizontalPadding,
-        ErrorPresentation.ButtonVerticalPadding);
-
-    public double TranscriptErrorButtonFontSize => ErrorPresentation.ButtonFontSize;
-
-    public int TranscriptErrorDetailMaxLines => ErrorPresentation.DetailMaxLines;
-
-    public SolidColorBrush TranscriptErrorBackgroundBrush => ReaderBrush(ErrorPresentation.BackgroundHex);
-
-    public SolidColorBrush TranscriptErrorBorderBrush => ReaderBrush(ErrorPresentation.BorderHex);
-
-    public SolidColorBrush TranscriptErrorIconBrush => ReaderBrush(ErrorPresentation.IconForegroundHex);
-
-    public SolidColorBrush TranscriptErrorTitleBrush => ReaderBrush(ErrorPresentation.TitleForegroundHex);
-
-    public SolidColorBrush TranscriptErrorDetailBrush => ReaderBrush(ErrorPresentation.DetailForegroundHex);
-
-    public List<ReaderTranscriptRow> Messages { get; set; } = [];
-
-    public Visibility FilteredEmptyVisibility { get; set; } = Visibility.Collapsed;
-
-    private static TranscriptFilterPresentationSnapshot FilterPresentation =>
-        TranscriptFilterPresentation.Resolve();
-
-    private static TranscriptFilteredEmptyStatePresentationSnapshot FilteredEmptyPresentation =>
-        TranscriptFilteredEmptyStatePresentation.Resolve();
-
-    public Thickness FilterBarPadding => new(
-        FilterPresentation.BarHorizontalPadding,
-        FilterPresentation.BarVerticalPadding,
-        FilterPresentation.BarHorizontalPadding,
-        FilterPresentation.BarVerticalPadding);
-
-    public double FilterBarColumnSpacing => FilterPresentation.BarColumnSpacing;
-
-    public Thickness FilterButtonPadding => new(
-        FilterPresentation.ButtonHorizontalPadding,
-        FilterPresentation.ButtonVerticalPadding,
-        FilterPresentation.ButtonHorizontalPadding,
-        FilterPresentation.ButtonVerticalPadding);
-
-    public CornerRadius FilterButtonCornerRadius => new(FilterPresentation.ButtonCornerRadius);
-
-    public double FilterButtonContentSpacing => FilterPresentation.ButtonContentSpacing;
-
-    public double FilterSummaryFontSize => FilterPresentation.SummaryFontSize;
-
-    public double FilterDetailFontSize => FilterPresentation.DetailFontSize;
-
-    public double FilterResetButtonSize => FilterPresentation.ResetButtonSize;
-
-    public double FilterResetIconFontSize => FilterPresentation.ResetIconFontSize;
-
-    public Thickness FilteredEmptyMargin => new(0);
-
-    public Thickness FilteredEmptyPadding => new(FilteredEmptyPresentation.Padding);
-
-    public CornerRadius FilteredEmptyCornerRadius => new(FilteredEmptyPresentation.CornerRadius);
-
-    public Thickness FilteredEmptyBorderThickness => new(FilteredEmptyPresentation.BorderThickness);
-
-    public SolidColorBrush FilteredEmptyBackgroundBrush =>
-        ReaderBrush(FilteredEmptyPresentation.BackgroundHex);
-
-    public SolidColorBrush FilteredEmptyBorderBrush =>
-        ReaderBrush(FilteredEmptyPresentation.BorderHex);
-
-    public SolidColorBrush FilteredEmptyForegroundBrush =>
-        ReaderBrush(FilteredEmptyPresentation.ForegroundHex);
-
-    public double FilteredEmptyContentSpacing => FilteredEmptyPresentation.ContentSpacing;
-
-    public double FilteredEmptyIconSize => FilteredEmptyPresentation.IconSize;
-
-    public string FilteredEmptyTitle => FilteredEmptyPresentation.Title;
-
-    public double FilteredEmptyTitleFontSize => FilteredEmptyPresentation.TitleFontSize;
-
-    public Thickness FilteredEmptyResetButtonPadding => new(
-        FilteredEmptyPresentation.ButtonHorizontalPadding,
-        FilteredEmptyPresentation.ButtonVerticalPadding,
-        FilteredEmptyPresentation.ButtonHorizontalPadding,
-        FilteredEmptyPresentation.ButtonVerticalPadding);
-
-    public double FilteredEmptyResetButtonContentSpacing =>
-        FilteredEmptyPresentation.ButtonContentSpacing;
-
-    public string FilteredEmptyResetButtonGlyph =>
-        FilteredEmptyPresentation.ButtonWindowsGlyph;
-
-    public double FilteredEmptyResetButtonIconFontSize =>
-        FilteredEmptyPresentation.ButtonIconFontSize;
-
-    public string FilteredEmptyResetButtonText =>
-        FilteredEmptyPresentation.ButtonText;
-
-    public double FilteredEmptyResetButtonTextFontSize =>
-        FilteredEmptyPresentation.ButtonTextFontSize;
-
-    public List<ReaderTranscriptFilterItem> Filters { get; set; } = [];
-
-    public string FilterSummaryText { get; set; } = "All rows";
-
-    public string FilterDetailText { get; set; } = "Messages, progress, thoughts, tools, artifacts, approvals, events";
-
-    public SolidColorBrush FilterDetailBrush { get; set; } =
-        ReaderBrush(TranscriptFilterPresentation.DetailForegroundHex(isShowingAllRows: true));
-
-    public Visibility ResetFiltersVisibility { get; set; } = Visibility.Collapsed;
-
-    public string MessageFilterMenuText { get; set; } = "Messages (0)";
-
-    public string ProgressFilterMenuText { get; set; } = "Progress (0)";
-
-    public string ThoughtFilterMenuText { get; set; } = "Thoughts (0)";
-
-    public string ToolFilterMenuText { get; set; } = "Tools (0)";
-
-    public string ArtifactFilterMenuText { get; set; } = "Artifacts (0)";
-
-    public string ApprovalFilterMenuText { get; set; } = "Approvals (0)";
-
-    public string SystemFilterMenuText { get; set; } = "System (0)";
-
-    public bool IsMessageFilterActive { get; set; } = true;
-
-    public bool IsProgressFilterActive { get; set; } = true;
-
-    public bool IsThoughtFilterActive { get; set; } = true;
-
-    public bool IsToolFilterActive { get; set; } = true;
-
-    public bool IsArtifactFilterActive { get; set; } = true;
-
-    public bool IsApprovalFilterActive { get; set; } = true;
-
-    public bool IsSystemFilterActive { get; set; } = true;
-
-    public string MessageCountText { get; set; } = "0 messages";
-
-    public string ProgressCountText { get; set; } = "0 progress";
-
-    public string ThoughtCountText { get; set; } = "0 thoughts";
-
-    public string ToolCountText { get; set; } = "0 tools";
-
-    public string ArtifactCountText { get; set; } = "0 artifacts";
-
-    public string ApprovalCountText { get; set; } = "0 approvals";
-
-    public string SystemCountText { get; set; } = "0 events";
-
-    public string ComposerHintText { get; set; } = "";
-
-    public Visibility AttachmentErrorVisibility => string.IsNullOrWhiteSpace(AttachmentErrorText)
-        ? Visibility.Collapsed
-        : Visibility.Visible;
-
-    public string AttachmentErrorText
-    {
-        get => _attachmentErrorText;
-        set
-        {
-            var next = string.IsNullOrWhiteSpace(value) ? "" : value.Trim();
-            if (string.Equals(_attachmentErrorText, next, StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            _attachmentErrorText = next;
-            OnPropertyChanged(nameof(AttachmentErrorText));
-            OnPropertyChanged(nameof(AttachmentErrorVisibility));
-        }
-    }
-
-    public ObservableCollection<MentionSuggestionItem> MentionSuggestions { get; set; } = [];
-
-    public Visibility MentionPanelVisibility
-    {
-        get => _mentionPanelVisibility;
-        set
-        {
-            if (_mentionPanelVisibility == value)
-            {
-                return;
-            }
-
-            _mentionPanelVisibility = value;
-            OnPropertyChanged(nameof(MentionPanelVisibility));
-        }
-    }
-
-    public string DraftText
-    {
-        get => _draftText;
-        set
-        {
-            if (string.Equals(_draftText, value, StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            _draftText = value;
-            OnPropertyChanged(nameof(DraftText));
-            NotifySendActionChanged();
-        }
-    }
-
-    public double TileWidth
-    {
-        get => _tileWidth;
-        set
-        {
-            if (Math.Abs(_tileWidth - value) < 0.5)
-            {
-                return;
-            }
-
-            _tileWidth = value;
-            OnPropertyChanged(nameof(TileWidth));
-        }
-    }
-
-    public double TileHeight
-    {
-        get => _tileHeight;
-        set
-        {
-            if (Math.Abs(_tileHeight - value) < 0.5)
-            {
-                return;
-            }
-
-            _tileHeight = value;
-            OnPropertyChanged(nameof(TileHeight));
-        }
-    }
-
-    private static ThreadPopoverShellPresentationSnapshot ShellPresentation =>
-        ThreadPopoverShellPresentation.ResolveReaderTile();
-
-    public SolidColorBrush ShellBorderBrush => ReaderBrush(ShellPresentation.BorderHex);
-
-    public Thickness ShellBorderThickness => new(ShellPresentation.BorderThickness);
-
-    public CornerRadius ShellCornerRadius => new(ShellPresentation.CornerRadius);
-
-    public Vector3 ShellTranslation => new(0, 0, (float)ShellPresentation.ShadowTranslationZ);
-
-    private void OnPropertyChanged(string propertyName)
-    {
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-    }
-
-    private ThreadSendActionAvailability SendAvailability =>
-        ThreadSendActionPresentation.Availability(
-            isAwaitingResponse: !IsComposerEnabled,
-            isSubmitting: false,
-            draft: DraftText,
-            pendingAttachmentCount: PendingAttachments.Count);
-
-    private void NotifySendActionChanged()
-    {
-        OnPropertyChanged(nameof(SendButtonTooltip));
-        OnPropertyChanged(nameof(SendButtonOpacity));
-        OnPropertyChanged(nameof(SendButtonAccessibilityHint));
-        OnPropertyChanged(nameof(PendingAttachmentSummaryText));
-        OnPropertyChanged(nameof(PendingAttachmentSummaryVisibility));
-    }
-
-    private static ReaderTranscriptCategory[] OrderedTranscriptCategories()
-    {
-        return
-        [
-            ReaderTranscriptCategory.Message,
-            ReaderTranscriptCategory.Progress,
-            ReaderTranscriptCategory.Thought,
-            ReaderTranscriptCategory.Tool,
-            ReaderTranscriptCategory.Artifact,
-            ReaderTranscriptCategory.Approval,
-            ReaderTranscriptCategory.System
-        ];
-    }
-
-    private static string MenuTitleFor(
-        ReaderTranscriptCategory category,
-        IReadOnlyList<ReaderTranscriptRow> rows,
-        int additionalProgressCount = 0,
-        int additionalSystemCount = 0)
-    {
-        return $"{TitleFor(category)} ({CountFor(category, rows, additionalProgressCount, additionalSystemCount)})";
-    }
-
-    private static int CountFor(
-        ReaderTranscriptCategory category,
-        IReadOnlyList<ReaderTranscriptRow> rows,
-        int additionalProgressCount = 0,
-        int additionalSystemCount = 0)
-    {
-        var count = rows.Count(row => row.MatchesCategory(category));
-        if (category == ReaderTranscriptCategory.Progress)
-        {
-            count += additionalProgressCount;
-        }
-        else if (category == ReaderTranscriptCategory.System)
-        {
-            count += additionalSystemCount;
-        }
-
-        return count;
-    }
-
-    private static string ComposerHint(
-        ThreadComposerMetadataPresentationSnapshot metadata,
-        string sandbox)
-    {
-        var parts = new List<string>();
-        if (metadata.ShowsModel)
-        {
-            parts.Add(metadata.ModelText);
-        }
-
-        if (metadata.ShowsEffort)
-        {
-            parts.Add(metadata.EffortText);
-        }
-
-        if (!string.IsNullOrWhiteSpace(sandbox))
-        {
-            parts.Add(sandbox.Trim());
-        }
-
-        return string.Join(" / ", parts);
-    }
-
-    private static string TitleFor(ReaderTranscriptCategory category)
-    {
-        return TranscriptCategoryPresentation.Resolve(CategoryKeyFor(category)).Title;
-    }
-
-    private static string CompactTitleFor(ReaderTranscriptCategory category)
-    {
-        return TranscriptCategoryPresentation.Resolve(CategoryKeyFor(category)).CompactTitle;
-    }
-
-    private static string CategoryKeyFor(ReaderTranscriptCategory category)
-    {
-        return category switch
-        {
-            ReaderTranscriptCategory.Message => TranscriptCategoryPresentation.KeyMessages,
-            ReaderTranscriptCategory.Progress => TranscriptCategoryPresentation.KeyProgress,
-            ReaderTranscriptCategory.Thought => TranscriptCategoryPresentation.KeyThoughts,
-            ReaderTranscriptCategory.Tool => TranscriptCategoryPresentation.KeyTools,
-            ReaderTranscriptCategory.Artifact => TranscriptCategoryPresentation.KeyArtifacts,
-            ReaderTranscriptCategory.Approval => TranscriptCategoryPresentation.KeyApprovals,
-            _ => TranscriptCategoryPresentation.KeySystem
-        };
-    }
-
-    private static SolidColorBrush ReaderBrush(string hex)
-    {
-        var value = hex.TrimStart('#');
-        var alpha = (byte)255;
-        if (value.Length == 8)
-        {
-            byte.TryParse(value[..2], System.Globalization.NumberStyles.HexNumber, null, out alpha);
-            value = value[2..];
-        }
-
-        if (value.Length != 6 ||
-            !byte.TryParse(value[..2], System.Globalization.NumberStyles.HexNumber, null, out var red) ||
-            !byte.TryParse(value[2..4], System.Globalization.NumberStyles.HexNumber, null, out var green) ||
-            !byte.TryParse(value[4..6], System.Globalization.NumberStyles.HexNumber, null, out var blue))
-        {
-            return new SolidColorBrush(Colors.Gray);
-        }
-
-        return new SolidColorBrush(Windows.UI.Color.FromArgb(alpha, red, green, blue));
-    }
-
-    private static HorizontalAlignment LoadingRowHorizontalAlignment(
-        TranscriptLoadingRowPresentationSnapshot presentation)
-    {
-        return presentation.HorizontalAlignment == TranscriptLoadingRowPresentation.CenterAlignment
-            ? HorizontalAlignment.Center
-            : HorizontalAlignment.Left;
-    }
 }
 
 public sealed class ReaderTranscriptFilterItem

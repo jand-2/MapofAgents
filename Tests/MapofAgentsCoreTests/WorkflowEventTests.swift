@@ -29,7 +29,11 @@ func localStorePersistsWorkflowEvents() async throws {
 func localStorePersistsRelayEndpoints() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("mapofagents-relay-store-tests-\(UUID().uuidString)", isDirectory: true)
-    let store = LocalControlRoomStore(paths: ApplicationPaths(applicationSupportDirectory: directory))
+    let vault = TestRelayCredentialVault()
+    let store = LocalControlRoomStore(
+        paths: ApplicationPaths(applicationSupportDirectory: directory),
+        relayCredentialVault: vault
+    )
     let endpoint = AppServerRelayEndpoint(
         id: HostID(rawValue: "relay-a"),
         name: "Relay A",
@@ -45,9 +49,74 @@ func localStorePersistsRelayEndpoints() async throws {
     )
 
     #expect(raw.contains("secret") == false)
-    #expect(raw.contains("__redacted__"))
+    #expect(raw.contains("__redacted__") == false)
+    #expect(raw.contains("relay:relay-a"))
     #expect(restoredEndpoints.first?.id == endpoint.id)
-    #expect(restoredEndpoints.first?.bearerToken == nil)
+    #expect(restoredEndpoints.first?.bearerToken == "secret")
+
+    try await store.saveRelayEndpoints([])
+    #expect(vault.credential(for: "relay:relay-a") == nil)
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func localStoreMigratesLegacyPlaintextRelayCredentialToVault() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-relay-migration-tests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let endpointFile = directory.appendingPathComponent("relay-endpoints.json")
+    try Data(
+        """
+        [{"id":"legacy-relay","name":"Legacy Relay","url":"wss://mac.example.test/app-server","bearerToken":"legacy-secret"}]
+        """.utf8
+    ).write(to: endpointFile, options: [.atomic])
+    let vault = TestRelayCredentialVault()
+    let store = LocalControlRoomStore(
+        paths: ApplicationPaths(applicationSupportDirectory: directory),
+        relayCredentialVault: vault
+    )
+
+    let endpoints = try await store.loadRelayEndpoints()
+    let sanitized = try String(contentsOf: endpointFile, encoding: .utf8)
+
+    #expect(endpoints.first?.bearerToken == "legacy-secret")
+    #expect(vault.credential(for: "relay:legacy-relay") == "legacy-secret")
+    #expect(sanitized.contains("legacy-secret") == false)
+    #expect(sanitized.contains("credentialReference"))
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func relayEndpointRemovalJournalsAndRetriesKeychainCleanup() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-relay-delete-rollback-tests-\(UUID().uuidString)", isDirectory: true)
+    let vault = TestRelayCredentialVault()
+    let store = LocalControlRoomStore(
+        paths: ApplicationPaths(applicationSupportDirectory: directory),
+        relayCredentialVault: vault
+    )
+    let endpoint = AppServerRelayEndpoint(
+        id: HostID(rawValue: "relay-delete"),
+        name: "Relay Delete",
+        url: try #require(URL(string: "wss://mac.example.test/app-server")),
+        bearerToken: "credential-to-retain"
+    )
+    try await store.saveRelayEndpoints([endpoint])
+    vault.failNextDelete(reference: "relay:relay-delete")
+
+    try await store.saveRelayEndpoints([])
+    #expect(vault.credential(for: "relay:relay-delete") == "credential-to-retain")
+    #expect(FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent("relay-credential-recovery.json").path
+    ))
+
+    #expect(try await store.loadRelayEndpoints().isEmpty)
+    #expect(FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent("relay-credential-recovery.json").path
+    ) == false)
+    #expect(vault.credential(for: "relay:relay-delete") == nil)
 
     try? FileManager.default.removeItem(at: directory)
 }
@@ -444,6 +513,68 @@ func workflowHookEventParserMapsSharedFolderCreatedFixture() async throws {
 func workflowHookEventParserIgnoresUnknownLines() async throws {
     #expect(WorkflowHookEventParser.workflowEvent(from: "not json", defaultHostID: HostID(rawValue: "local")) == nil)
     #expect(WorkflowHookEventParser.workflowEvent(from: "{\"event\":\"noise\"}", defaultHostID: HostID(rawValue: "local")) == nil)
+}
+
+@Test
+@MainActor
+func workflowHookEventFileBridgeSecuresFileAndReadsAcrossRotation() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-hook-bridge-rotation-tests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let eventFile = directory.appendingPathComponent("hook-events.jsonl")
+    let recorder = WorkflowHookEventRecorder()
+    let bridge = WorkflowHookEventFileBridge(
+        eventFileURL: eventFile,
+        defaultHostID: HostID(rawValue: "local"),
+        pollInterval: .milliseconds(200)
+    )
+    let task = bridge.start(replayExistingEvents: false) { events in
+        recorder.events.append(contentsOf: events)
+    }
+    defer { task.cancel() }
+
+    for _ in 0..<50 where !FileManager.default.fileExists(atPath: eventFile.path) {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(FileManager.default.fileExists(atPath: eventFile.path))
+
+    let firstLine = #"{"id":"first","source":"codex-hook","type":"turn.completed","method":"turn/completed","summary":"Turn completed","hostID":"local","threadID":"thread-1","createdAt":"2026-05-28T10:15:30Z"}"# + "\n"
+    let handle = try FileHandle(forWritingTo: eventFile)
+    try handle.seekToEnd()
+    try handle.write(contentsOf: Data(firstLine.utf8))
+    try handle.close()
+
+    let oldestRotatedFile = URL(fileURLWithPath: eventFile.path + ".2")
+    try FileManager.default.moveItem(at: eventFile, to: oldestRotatedFile)
+    let secondLine = #"{"id":"second","source":"codex-hook","type":"turn.completed","method":"turn/completed","summary":"Turn completed","hostID":"local","threadID":"thread-2","createdAt":"2026-05-28T10:15:31Z"}"# + "\n"
+    let newestRotatedFile = URL(fileURLWithPath: eventFile.path + ".1")
+    #expect(FileManager.default.createFile(
+        atPath: newestRotatedFile.path,
+        contents: Data(secondLine.utf8),
+        attributes: [.posixPermissions: 0o600]
+    ))
+    let thirdLine = #"{"id":"third","source":"codex-hook","type":"turn.completed","method":"turn/completed","summary":"Turn completed","hostID":"local","threadID":"thread-3","createdAt":"2026-05-28T10:15:32Z"}"# + "\n"
+    #expect(FileManager.default.createFile(
+        atPath: eventFile.path,
+        contents: Data(thirdLine.utf8),
+        attributes: [.posixPermissions: 0o644]
+    ))
+
+    for _ in 0..<100 where recorder.events.count < 3 {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+
+    #expect(recorder.events.map(\.threadID) == ["thread-1", "thread-2", "thread-3"])
+    let attributes = try FileManager.default.attributesOfItem(atPath: eventFile.path)
+    let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
+    #expect(permissions.intValue & 0o777 == 0o600)
+}
+
+@MainActor
+private final class WorkflowHookEventRecorder {
+    var events: [WorkflowEvent] = []
 }
 
 @Test

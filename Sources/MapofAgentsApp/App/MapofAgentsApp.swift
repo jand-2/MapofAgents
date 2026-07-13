@@ -2,10 +2,14 @@ import SwiftUI
 
 @main
 struct MapofAgentsApp: App {
+    #if os(macOS)
+    @State private var appSession = MapofAgentsAppSession()
+    #endif
+
     var body: some Scene {
         #if os(macOS)
-        WindowGroup {
-            RootView()
+        Window("MapofAgents", id: "main") {
+            RootView(session: appSession)
                 .frame(minWidth: 980, minHeight: 640)
         }
         .windowStyle(.titleBar)

@@ -415,30 +415,80 @@ public final class WorkflowHookEventFileBridge: @unchecked Sendable {
         onEvents: @escaping @MainActor @Sendable ([WorkflowEvent]) -> Void
     ) -> Task<Void, Never> {
         Task {
-            prepareEventFile()
+            guard prepareEventFile() else {
+                return
+            }
+            var fileIdentity = Self.fileIdentity(eventFileURL)
             var offset = replayExistingEvents ? 0 : Self.fileSize(eventFileURL)
-            var pendingLine = ""
+            var pendingData = Data()
 
             while !Task.isCancelled {
+                guard prepareEventFile() else {
+                    try? await Task.sleep(for: pollInterval)
+                    continue
+                }
+
+                var events: [WorkflowEvent] = []
+                let currentIdentity = Self.fileIdentity(eventFileURL)
+                if currentIdentity != fileIdentity {
+                    if let fileIdentity,
+                       let rotation = Self.rotatedFileLocation(
+                           for: eventFileURL,
+                           matching: fileIdentity
+                       ) {
+                        if let rotatedEvents = try? Self.drainAppendedData(
+                            from: rotation.url,
+                            offset: &offset,
+                            pendingData: &pendingData,
+                            defaultHostID: defaultHostID
+                        ) {
+                            events.append(contentsOf: rotatedEvents)
+                        }
+                        pendingData.removeAll(keepingCapacity: true)
+
+                        // If more than one rotation happened between polls, the
+                        // files between the old inode and `.1` are entirely new.
+                        if rotation.index > 1 {
+                            for index in stride(from: rotation.index - 1, through: 1, by: -1) {
+                                let intermediateURL = Self.rotatedFileURL(for: eventFileURL, index: index)
+                                var intermediateOffset: UInt64 = 0
+                                if let intermediateEvents = try? Self.drainAppendedData(
+                                    from: intermediateURL,
+                                    offset: &intermediateOffset,
+                                    pendingData: &pendingData,
+                                    defaultHostID: defaultHostID
+                                ) {
+                                    events.append(contentsOf: intermediateEvents)
+                                }
+                                pendingData.removeAll(keepingCapacity: true)
+                            }
+                        }
+                    }
+
+                    // A rotated file always starts a new JSONL record boundary.
+                    // The producer writes complete lines while holding its lock.
+                    pendingData.removeAll(keepingCapacity: true)
+                    offset = 0
+                    fileIdentity = currentIdentity
+                }
+
                 if Self.fileSize(eventFileURL) < offset {
-                    offset = replayExistingEvents ? 0 : Self.fileSize(eventFileURL)
-                    pendingLine = ""
+                    offset = 0
+                    pendingData.removeAll(keepingCapacity: true)
                 }
 
                 if let data = try? Self.readAppendedData(from: eventFileURL, offset: &offset),
-                   !data.isEmpty,
-                   let text = String(data: data, encoding: .utf8) {
-                    let lines = Self.completeLines(from: text, pendingLine: &pendingLine)
-                    let events = lines.compactMap {
-                        WorkflowHookEventParser.workflowEvent(
-                            from: $0,
-                            defaultHostID: defaultHostID
-                        )
-                    }
-                    if !events.isEmpty {
-                        await MainActor.run {
-                            onEvents(events)
-                        }
+                   !data.isEmpty {
+                    events.append(contentsOf: Self.workflowEvents(
+                        from: data,
+                        pendingData: &pendingData,
+                        defaultHostID: defaultHostID
+                    ))
+                }
+
+                if !events.isEmpty {
+                    await MainActor.run {
+                        onEvents(events)
                     }
                 }
 
@@ -447,12 +497,84 @@ public final class WorkflowHookEventFileBridge: @unchecked Sendable {
         }
     }
 
-    private func prepareEventFile() {
+    @discardableResult
+    private func prepareEventFile() -> Bool {
         let directory = eventFileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: eventFileURL.path) {
-            FileManager.default.createFile(atPath: eventFileURL.path, contents: nil)
+        let manager = FileManager.default
+        let directoryExisted = manager.fileExists(atPath: directory.path)
+        do {
+            try manager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: directoryExisted ? nil : [.posixPermissions: 0o700]
+            )
+        } catch {
+            return false
         }
+
+        if Self.isSymbolicLink(eventFileURL) {
+            return false
+        }
+
+        if !FileManager.default.fileExists(atPath: eventFileURL.path) {
+            guard manager.createFile(
+                atPath: eventFileURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                return false
+            }
+        }
+
+        do {
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: eventFileURL.path)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private struct FileIdentity: Equatable {
+        var systemNumber: UInt64
+        var fileNumber: UInt64
+    }
+
+    private static func fileIdentity(_ url: URL) -> FileIdentity? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let systemNumber = attributes[.systemNumber] as? NSNumber,
+              let fileNumber = attributes[.systemFileNumber] as? NSNumber
+        else {
+            return nil
+        }
+        return FileIdentity(
+            systemNumber: systemNumber.uint64Value,
+            fileNumber: fileNumber.uint64Value
+        )
+    }
+
+    private static func isSymbolicLink(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            return false
+        }
+        return attributes[.type] as? FileAttributeType == .typeSymbolicLink
+    }
+
+    private static func rotatedFileLocation(
+        for eventFileURL: URL,
+        matching identity: FileIdentity
+    ) -> (url: URL, index: Int)? {
+        for index in 1...10 {
+            let candidate = rotatedFileURL(for: eventFileURL, index: index)
+            if fileIdentity(candidate) == identity {
+                return (candidate, index)
+            }
+        }
+        return nil
+    }
+
+    private static func rotatedFileURL(for eventFileURL: URL, index: Int) -> URL {
+        URL(fileURLWithPath: "\(eventFileURL.path).\(index)", isDirectory: false)
     }
 
     private static func fileSize(_ url: URL) -> UInt64 {
@@ -468,32 +590,66 @@ public final class WorkflowHookEventFileBridge: @unchecked Sendable {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         try handle.seek(toOffset: offset)
-        let data = try handle.readToEnd() ?? Data()
+        let data = try handle.read(upToCount: 1024 * 1024) ?? Data()
         offset += UInt64(data.count)
         return data
     }
 
-    private static func completeLines(from text: String, pendingLine: inout String) -> [String] {
-        let combined = pendingLine + text
-        guard !combined.isEmpty else {
+    private static func drainAppendedData(
+        from url: URL,
+        offset: inout UInt64,
+        pendingData: inout Data,
+        defaultHostID: HostID?
+    ) throws -> [WorkflowEvent] {
+        var events: [WorkflowEvent] = []
+        while offset < fileSize(url) {
+            let data = try readAppendedData(from: url, offset: &offset)
+            guard !data.isEmpty else { break }
+            events.append(contentsOf: workflowEvents(
+                from: data,
+                pendingData: &pendingData,
+                defaultHostID: defaultHostID
+            ))
+        }
+        return events
+    }
+
+    private static func workflowEvents(
+        from data: Data,
+        pendingData: inout Data,
+        defaultHostID: HostID?
+    ) -> [WorkflowEvent] {
+        completeLines(from: data, pendingData: &pendingData).compactMap {
+            WorkflowHookEventParser.workflowEvent(
+                from: $0,
+                defaultHostID: defaultHostID
+            )
+        }
+    }
+
+    private static func completeLines(from data: Data, pendingData: inout Data) -> [String] {
+        pendingData.append(data)
+        guard !pendingData.isEmpty else {
             return []
         }
 
-        var parts = combined
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
-
-        if combined.hasSuffix("\n") {
-            pendingLine = ""
-            if parts.last == "" {
-                parts.removeLast()
+        var lines: [String] = []
+        var lineStart = pendingData.startIndex
+        var remainingStart = pendingData.startIndex
+        for index in pendingData.indices where pendingData[index] == 0x0A {
+            let lineData = pendingData[lineStart..<index]
+            if let line = String(data: lineData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !line.isEmpty {
+                lines.append(line)
             }
-        } else {
-            pendingLine = parts.popLast() ?? ""
+            lineStart = pendingData.index(after: index)
+            remainingStart = lineStart
         }
 
-        return parts
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        if remainingStart > pendingData.startIndex {
+            pendingData = Data(pendingData[remainingStart...])
+        }
+        return lines
     }
 }

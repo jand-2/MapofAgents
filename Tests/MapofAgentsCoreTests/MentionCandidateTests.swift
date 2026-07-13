@@ -48,6 +48,9 @@ func bundledWorkflowBridgeSkillUsesMapofAgentsURI() {
     #expect(MapofAgentsWorkflowBridgeSkill.instructions.contains("You are responsible for chat delivery"))
     #expect(MapofAgentsWorkflowBridgeSkill.instructions.contains("sshFileAccess"))
     #expect(MapofAgentsWorkflowBridgeSkill.instructions.contains("Direct tunnel pattern"))
+    #expect(MapofAgentsWorkflowBridgeSkill.instructions.contains("script/mapofagents-hook-event.sh"))
+    #expect(MapofAgentsWorkflowBridgeSkill.instructions.contains("Never append"))
+    #expect(MapofAgentsWorkflowBridgeSkill.instructions.contains("Append one JSON line") == false)
 }
 
 @Test

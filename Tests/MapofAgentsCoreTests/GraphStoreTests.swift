@@ -1747,3 +1747,54 @@ func graphStoreExposesWorkflowFolderMentionCandidates() async throws {
 
     try? FileManager.default.removeItem(at: directory)
 }
+
+@Test
+@MainActor
+func graphStoreRecordsAndPropagatesPersistenceFailures() async {
+    let repository = FailingGraphControlRoomStore()
+    let graphStore = GraphStore(repository: repository)
+    let node = CanvasNode(
+        id: NodeID(rawValue: "unsaved"),
+        kind: .folder,
+        title: "Unsaved",
+        position: CanvasPoint(x: 0, y: 0),
+        size: .folder
+    )
+
+    var propagatedFailure = false
+    do {
+        _ = try await graphStore.applyCanvasPatch(.upsertNode(node))
+    } catch GraphStorePersistenceTestError.writeFailed {
+        propagatedFailure = true
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+
+    #expect(propagatedFailure)
+    #expect(graphStore.lastPersistenceFailure?.operation == "save node")
+    #expect(graphStore.persistenceFailureRevision == 1)
+    #expect(graphStore.errorMessage?.isEmpty == false)
+
+    await graphStore.addFolder(path: "/tmp/also-unsaved")
+    #expect(graphStore.persistenceFailureRevision == 2)
+    #expect(graphStore.lastPersistenceFailure?.operation == "save node")
+}
+
+private enum GraphStorePersistenceTestError: Error {
+    case writeFailed
+}
+
+private actor FailingGraphControlRoomStore: ControlRoomStore {
+    func loadCanvas() async throws -> AgentGraph { AgentGraph() }
+
+    func applyCanvasPatch(_ patch: CanvasPatch) async throws -> AgentGraph {
+        throw GraphStorePersistenceTestError.writeFailed
+    }
+
+    func loadWorkflowEvents() async throws -> [WorkflowEvent] { [] }
+    func saveWorkflowEvents(_ events: [WorkflowEvent]) async throws {}
+    func loadRelayEndpoints() async throws -> [AppServerRelayEndpoint] { [] }
+    func saveRelayEndpoints(_ endpoints: [AppServerRelayEndpoint]) async throws {}
+    func loadTranscript(for threadRef: ThreadRef) async throws -> ThreadTranscript? { nil }
+    func saveTranscript(_ transcript: ThreadTranscript) async throws {}
+}

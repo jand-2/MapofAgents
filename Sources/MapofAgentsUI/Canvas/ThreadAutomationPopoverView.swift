@@ -87,6 +87,7 @@ struct ThreadAutomationPopoverView: View {
             .foregroundStyle(.secondary)
             .help("Close automation details")
             .accessibilityLabel("Close automation details")
+            .minimumAccessibleHitTarget()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)

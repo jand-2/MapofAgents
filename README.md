@@ -9,16 +9,13 @@ configuration, approvals, tools, command execution, and thread history.
 MapofAgents stores visual control-room metadata such as node positions, manual
 connections, and non-secret endpoint descriptors.
 
-Codex can be extremely powerful with its ability to use the codex app server. It can create chats and communicate with other Codex threads, yet for me it is difficult to follow along with Codex. This app is to make it easier to digest. Like here it is in MapofAgents when you ask it to create new threads:
+Codex App Server can create threads and let them collaborate, but those
+relationships quickly become difficult to follow. MapofAgents makes the
+runtime visible: threads can create other threads, exchange `@` messages, and
+work across machines and folders while the canvas shows who is doing what and
+where.
 
-![Demo of chats creating other chats](docs/assets/demo_of_chats_creating_other_chats_3x.gif)
-
-Here, I made it easier to communicate between threads with just '@' so you can see in real time.
-![Demo of chats talking to each other](docs/assets/demo_of_chats_talking_to_each_other_3x.gif)
-
-The other solution this app aims to fix is simplying workflows across machines and folders. It's easy to get automated experiments set up across multiple machines/folders, but it is nearly impossible to follow along with the current tools. With the map canvas, I feel like it is easier to digest who is doing what and where.
-
-![Map canvas showing workflows across machines and folders](docs/assets/workflows_across_machines.png)
+![Public-safe schematic of the MapofAgents canvas](docs/assets/mapofagents-overview.svg)
 
 ## Status
 
@@ -33,6 +30,9 @@ Codex App Server endpoints; it does not run Codex locally on the phone.
 - The Codex CLI with `codex app-server` available on `PATH` for runtime use.
 - Full Xcode for iOS builds.
 - XcodeGen only when regenerating `mapofagents.xcodeproj` from `project.yml`.
+- Tailscale on the Mac and iPhone, signed in to the same tailnet, when using
+  secure iPhone pairing. The tailnet must support MagicDNS and HTTPS
+  certificates for Tailscale Serve.
 
 ## Quick Start
 
@@ -52,6 +52,10 @@ swift test
 ./script/runtime_diagnostic.py
 ./script/build_and_run.sh --verify
 ```
+
+GitHub Actions also runs repository and protocol validation, a public-safety
+scan, Swift build/test/coverage checks, a generated iOS Simulator build, and a
+locked Windows restore/test/Release x64 build. See `.github/workflows/ci.yml`.
 
 The integration test that connects to a real local Codex App Server is opt-in:
 
@@ -89,9 +93,57 @@ Physical-device builds require full Xcode, signing configured in Xcode, and a
 trusted unlocked iPhone. Use `MAPOFAGENTS_DEVICE_ID=<device-id>` only when more
 than one iPhone is connected.
 
-The iOS app expects authenticated Codex App Server or supervisor endpoints.
-Remote endpoints should use `wss://` with a bearer token. Loopback `ws://`
-endpoints are intended for local tunnels.
+Tailscale HTTPS certificates are recorded in public Certificate Transparency
+logs. Use a non-sensitive Tailscale machine name before enabling HTTPS for a
+pairing host.
+
+### Secure iPhone pairing
+
+On the Mac, open **Pair iPhone**, then scan the displayed code with the iOS
+companion. The Mac keeps Codex App Server and the credential exchange bound to
+loopback and uses Tailscale Serve to expose two private tailnet routes:
+
+- `wss://<mac-name>.<tailnet>.ts.net` for the authenticated App Server relay.
+- `https://<mac-name>.<tailnet>.ts.net:8443/v1/pairing` for device enrollment and
+  credential refresh.
+
+The QR code contains a one-time enrollment credential that expires after 30
+minutes. The iPhone exchanges it for a revocable device refresh credential,
+stores that credential in Keychain, and requests short-lived access tokens as
+needed. Access tokens last at most five minutes and are never used as the
+persistent pairing record. The Mac stores only a hash of the refresh credential
+in its paired-device registry. An app-owned loopback gateway validates the
+signed access token and current device registry before forwarding a WebSocket
+to Codex App Server; the backend port itself is never published to the tailnet.
+
+Closing the pairing popover does not disconnect an enrolled phone. While the
+Mac app is running, it supervises the pairing host independently of the
+popover. That supervision and its Tailscale Serve configuration start only
+when the user opens **Pair iPhone** or the Mac already has an active paired
+device; a first launch with no paired devices does not configure pairing
+routes.
+
+The gateway closes the server-side socket at token expiry and immediately when
+the device is revoked, so enforcement does not depend on a cooperative iPhone
+client. It also refuses to start unless the Codex backend belongs to the current
+user. Backend ownership probes run away from the gateway's proxy queue, so a
+slow system probe cannot delay token expiry or revocation. The enrollment
+listener also caps concurrent clients, applies a whole-request deadline, and
+drains open requests during replacement or shutdown. The two Serve routes run
+as foreground, app-scoped processes behind a small parent-process guardian. A
+gateway or current-generation backend failure tears down the routes; a late
+callback from a replaced backend cannot tear down its successor. Quitting or
+crashing MapofAgents does the same instead of leaving persistent forwards that
+a different local process could claim. Upgrades from the earlier background
+configuration remove those legacy routes once before starting the guarded ones.
+
+The Mac's **Pair iPhone** popover lists enrolled devices. Revoking a device
+closes its active gateway connections immediately and prevents future token
+refreshes. The device must scan a new code to enroll again.
+
+For manually configured endpoints, remote connections must still use `wss://`
+with an authentication credential. Loopback `ws://` is reserved for local
+tunnels; pairing does not weaken that transport policy.
 
 ## Windows Preview
 
@@ -99,6 +151,10 @@ A native Windows preview lives under `windows/` as a C#/.NET WinUI 3 app with a
 WebView2 graph renderer. It is kept in this repository so the Apple and Windows
 clients can share protocol fixtures and App Server behavior. See
 `docs/windows-port.md` for build steps and current scope.
+
+Secure device enrollment is not yet available on Windows. The Windows client
+shows that state explicitly and does not expose its legacy pairing host or
+import panels.
 
 For local development on the Mac, this script starts an authenticated loopback
 App Server and writes its token under the user's Application Support directory:

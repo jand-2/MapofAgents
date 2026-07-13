@@ -1,0 +1,6 @@
+{
+  "id": "example-secure-host",
+  "name": "Example secure host",
+  "url": "wss://example-host.example.ts.net/app-server",
+  "credentialReference": "relay:example-secure-host"
+}

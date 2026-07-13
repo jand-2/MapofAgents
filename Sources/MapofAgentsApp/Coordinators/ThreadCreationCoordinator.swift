@@ -112,10 +112,10 @@ final class ThreadCreationCoordinator {
         }
 
         do {
-            let threadRef: ThreadRef
+            let creationOutcome: ThreadCreationOutcome
             let trimmedInitialPrompt = request.initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             if targetContext.hostID == runtimeStore.localHost.id {
-                threadRef = try await runtimeStore.createThread(
+                creationOutcome = try await runtimeStore.createThread(
                     cwd: targetContext.cwd,
                     name: request.name,
                     model: request.model,
@@ -124,7 +124,7 @@ final class ThreadCreationCoordinator {
                     initialPrompt: ""
                 )
             } else {
-                threadRef = try await supervisorStore.createThread(
+                creationOutcome = try await supervisorStore.createThread(
                     on: targetContext.hostID,
                     cwd: targetContext.cwd,
                     name: request.name,
@@ -134,6 +134,8 @@ final class ThreadCreationCoordinator {
                     initialPrompt: ""
                 )
             }
+            let threadRef = creationOutcome.threadRef
+            var partialWarnings = creationOutcome.warning.map { [$0] } ?? []
 
             await graphStore.addThreadNode(
                 threadRef: threadRef,
@@ -165,12 +167,15 @@ final class ThreadCreationCoordinator {
                         )
                     }
                 } catch {
-                    errorMessage = "Thread created, but the initial prompt could not be sent: \(error.localizedDescription)"
+                    partialWarnings.append(
+                        "Thread created, but the initial prompt could not be sent: \(error.localizedDescription)"
+                    )
+                    errorMessage = partialWarnings.joined(separator: " ")
                     return true
                 }
             }
 
-            errorMessage = nil
+            errorMessage = partialWarnings.isEmpty ? nil : partialWarnings.joined(separator: " ")
             return true
         } catch {
             errorMessage = error.localizedDescription

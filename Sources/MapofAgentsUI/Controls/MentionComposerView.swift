@@ -12,21 +12,31 @@ struct MentionComposerView: View {
     var maxLines: Int = 5
     var isDisabled: Bool = false
     var usesLocalMentionCatalog: Bool = true
+    var initiallyFocused: Bool = false
     var onSubmit: () -> Void = {}
 
-    @State private var localFileCandidates: [MentionCandidate] = []
+    @State private var catalogCandidates: [MentionCandidate] = []
+    @State private var selectedMentionIndex = 0
+    @FocusState private var isEditorFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let activeMention {
                 let candidates = visibleCandidates(for: activeMention)
                 if !candidates.isEmpty {
-                    MentionSuggestionPanel(candidates: candidates, onSelect: insert)
+                    MentionSuggestionPanel(
+                        candidates: candidates,
+                        selectedCandidateID: candidates.indices.contains(selectedMentionIndex)
+                            ? candidates[selectedMentionIndex].id
+                            : candidates.first?.id,
+                        onSelect: insert
+                    )
                 }
             }
 
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $text)
+                    .focused($isEditorFocused)
                     .font(.body)
                     .scrollContentBackground(.hidden)
                     .padding(.horizontal, 6)
@@ -46,6 +56,23 @@ struct MentionComposerView: View {
             .background(.background.opacity(0.62), in: RoundedRectangle(cornerRadius: 8))
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .onKeyPress { keyPress in
+                if let activeMention {
+                    let candidates = visibleCandidates(for: activeMention)
+                    if !candidates.isEmpty {
+                        if keyPress.key == .downArrow {
+                            selectedMentionIndex = (selectedMentionIndex + 1) % candidates.count
+                            return .handled
+                        }
+                        if keyPress.key == .upArrow {
+                            selectedMentionIndex = (selectedMentionIndex - 1 + candidates.count) % candidates.count
+                            return .handled
+                        }
+                        if keyPress.key == .return, !keyPress.modifiers.contains(.shift) {
+                            insert(candidates[min(selectedMentionIndex, candidates.count - 1)])
+                            return .handled
+                        }
+                    }
+                }
                 guard keyPress.key == .return, !keyPress.modifiers.contains(.shift) else {
                     return .ignored
                 }
@@ -54,24 +81,31 @@ struct MentionComposerView: View {
             }
             .animation(.snappy(duration: 0.16), value: composerHeight)
         }
-        .task(id: refreshKey) {
+        .task(id: catalogTaskKey) {
             await refreshCatalogs()
         }
-        .onChange(of: text) { _, _ in
-            guard usesLocalMentionCatalog, activeMention?.trigger == "@" else { return }
-            Task {
-                await refreshLocalFiles()
-                await runtimeStore.refreshMentionCandidates(cwd: fileRoot)
-            }
+        .onChange(of: activeMention?.query) { _, _ in
+            selectedMentionIndex = 0
         }
-        .onChange(of: runtimeStore.connectionState) { _, state in
-            guard usesLocalMentionCatalog, state == .connected else { return }
-            Task { await runtimeStore.refreshMentionCandidates(cwd: fileRoot) }
+        .onAppear {
+            guard initiallyFocused else { return }
+            Task { @MainActor in
+                await Task.yield()
+                isEditorFocused = true
+            }
         }
     }
 
     private var refreshKey: String {
         "\(usesLocalMentionCatalog ? "local" : "remote")::\(fileRoot ?? "")"
+    }
+
+    /// Query text is intentionally excluded: SwiftUI cancels the previous task
+    /// when the root, connection, or mention mode changes, while each keystroke
+    /// only filters the already-loaded catalog in memory.
+    private var catalogTaskKey: String {
+        let mentionMode = activeMention?.trigger == "@" ? "files" : "idle"
+        return "\(refreshKey)::\(runtimeStore.connectionState.rawValue)::\(mentionMode)"
     }
 
     private var activeMention: ActiveMentionToken? {
@@ -104,11 +138,10 @@ struct MentionComposerView: View {
 
     private func visibleCandidates(for mention: ActiveMentionToken) -> [MentionCandidate] {
         let runtimeCandidates = usesLocalMentionCatalog
-            ? runtimeStore.mentionCandidates.filter { $0.trigger == mention.trigger }
+            ? catalogCandidates.filter { $0.trigger == mention.trigger }
             : []
         let sourceCandidates = runtimeCandidates
             + extraCandidates.filter { $0.trigger == mention.trigger }
-            + (usesLocalMentionCatalog && mention.trigger == "@" ? localFileCandidates : [])
         let query = mention.query.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let filtered: [MentionCandidate]
@@ -139,27 +172,25 @@ struct MentionComposerView: View {
     private func insert(_ candidate: MentionCandidate) {
         guard let activeMention else { return }
         text.replaceSubrange(activeMention.range, with: "\(candidate.insertionText) ")
+        selectedMentionIndex = 0
+        isEditorFocused = true
     }
 
     @MainActor
     private func refreshCatalogs() async {
         guard usesLocalMentionCatalog else {
-            localFileCandidates = []
+            catalogCandidates = []
             return
         }
-        await refreshLocalFiles()
-        guard runtimeStore.connectionState == .connected else { return }
-        await runtimeStore.refreshMentionCandidates(cwd: fileRoot)
-    }
-
-    @MainActor
-    private func refreshLocalFiles() async {
-        localFileCandidates = await CodexRuntimeStore.fileMentionCandidates(rootPath: fileRoot)
+        let candidates = await runtimeStore.loadMentionCandidates(cwd: fileRoot)
+        guard !Task.isCancelled else { return }
+        catalogCandidates = candidates
     }
 }
 
 private struct MentionSuggestionPanel: View {
     var candidates: [MentionCandidate]
+    var selectedCandidateID: String?
     var onSelect: (MentionCandidate) -> Void
 
     var body: some View {
@@ -189,8 +220,16 @@ private struct MentionSuggestionPanel: View {
                     .padding(.vertical, 6)
                     .padding(.horizontal, 8)
                     .contentShape(Rectangle())
+                    .background(
+                        candidate.id == selectedCandidateID
+                            ? Color.accentColor.opacity(0.14)
+                            : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6)
+                    )
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("\(candidate.title), \(candidate.subtitle)")
+                .accessibilityValue(candidate.id == selectedCandidateID ? "Selected" : "")
             }
         }
         .padding(4)

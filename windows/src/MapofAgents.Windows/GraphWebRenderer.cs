@@ -186,6 +186,28 @@ body {
   box-shadow: 0 {{nodeCardPresentation.ShadowYOffset}}px {{nodeCardPresentation.HoverShadowRadius}}px rgba(0, 0, 0, 0.10);
 }
 
+.node.keyboard-focused {
+  outline: none;
+  overflow: visible;
+}
+
+.node.keyboard-focused::after {
+  border-color: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.42);
+}
+
+.node-primary-action {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .node.highlighted::after {
   border-color: rgba(10, 132, 255, 0.85);
   box-shadow: 0 0 {{nodeCardPresentation.HighlightShadowRadius}}px rgba(10, 132, 255, 0.40);
@@ -446,8 +468,10 @@ body {
 	  cursor: pointer;
 	}
 
-	.context-menu-item:hover {
+	.context-menu-item:hover,
+	.context-menu-item:focus-visible {
 	  background: rgba(255, 255, 255, 0.08);
+	  outline: none;
 	}
 
 	.context-menu-item:disabled {
@@ -752,6 +776,18 @@ body {
   display: flex;
 }
 
+.screen-reader-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .hint-icon {
   font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets";
   color: #30d158;
@@ -764,10 +800,11 @@ body {
 </style>
 </head>
 <body>
-<main id="stage" aria-label="MapofAgents graph">
+<main id="stage" aria-label="MapofAgents graph" aria-describedby="graphKeyboardInstructions">
   <canvas id="edges"></canvas>
   <section id="world"></section>
 </main>
+<p id="graphKeyboardInstructions" class="screen-reader-only">Use Tab to enter the graph, arrow keys to move between nodes, Enter or Space to select a node, and Shift+F10 to open node actions.</p>
 <div id="linkHint"><span class="hint-icon"><span class="node-link-icon dotted-connection-icon" aria-hidden="true"><svg viewBox="0 0 18 18" focusable="false"><path class="triangle-path" d="M3.3 12.2 L9 3.2 L14.7 12.2 Z" /><circle class="triangle-point" cx="3.3" cy="12.2" r="1.45" /><circle class="triangle-point" cx="9" cy="3.2" r="1.45" /><circle class="triangle-point" cx="14.7" cy="12.2" r="1.45" /></svg></span></span><span>Click a target node to create a note line. Click empty canvas to cancel.</span></div>
 <script>
 let graph = {{graphJson}};
@@ -814,8 +851,11 @@ let view = {
 			const nodeFooterSpacerBeforeMetadata = {{(nodeCardPresentation.FooterSpacerBeforeMetadata ? "true" : "false")}};
 			let threadUpdatedRelativeFormatter = null;
 	let contextMenuNodeId = null;
+	let keyboardFocusedNodeId = null;
 	const contextMenu = document.createElement("div");
 	contextMenu.className = "node-context-menu";
+	contextMenu.setAttribute("role", "menu");
+	contextMenu.setAttribute("aria-label", "Node actions");
 	document.body.appendChild(contextMenu);
 
 const colors = {
@@ -979,6 +1019,55 @@ function statusMeta(node) {
   return statusPresentations.thread?.[status] ||
     statusPresentations.thread?.unknown ||
     fallbackStatusPresentation();
+}
+
+function nodeKindLabel(node) {
+  if (isSubagent(node)) {
+    return "agent thread";
+  }
+
+  switch (node.kind) {
+    case "machine":
+      return "machine";
+    case "folder":
+      return "folder";
+    case "codexThread":
+      return "thread";
+    default:
+      return "node";
+  }
+}
+
+function nodeAccessibleName(node) {
+  return `${String(node.title || node.kind || "Untitled")}, ${nodeKindLabel(node)}`;
+}
+
+function nodeAccessibleDescription(node) {
+  const details = [];
+  const subtitle = String(node.subtitle || "").trim();
+  if (subtitle) {
+    details.push(subtitle);
+  }
+
+  const status = String(statusMeta(node)?.label || statusFor(node) || "").trim();
+  if (status) {
+    details.push(`Status ${status}`);
+  }
+  if (node.metadata?.isUnread) {
+    details.push("Unread");
+  }
+  if (node.metadata?.model) {
+    details.push(`Model ${node.metadata.model}`);
+  }
+  if (node.metadata?.reasoningEffort) {
+    details.push(`Reasoning ${node.metadata.reasoningEffort}`);
+  }
+
+  const updated = threadUpdatedText(node);
+  if (updated) {
+    details.push(updated);
+  }
+  return details.join(". ");
 }
 
 	function statusPillHtml(node) {
@@ -1278,10 +1367,15 @@ function formatThreadRelativeTime(signedValue, unit) {
 	  return items;
 	}
 
-	function hideNodeContextMenu() {
+	function hideNodeContextMenu(restoreNodeFocus = false) {
+	  const previousNodeId = contextMenuNodeId;
 	  contextMenuNodeId = null;
 	  contextMenu.style.display = "none";
 	  contextMenu.replaceChildren();
+	  if (restoreNodeFocus && previousNodeId) {
+	    keyboardFocusedNodeId = previousNodeId;
+	    syncNodeRovingTabIndex(true);
+	  }
 	}
 
 	function postNodeCommand(id, command) {
@@ -1290,10 +1384,11 @@ function formatThreadRelativeTime(signedValue, unit) {
 	  }
 	}
 
-	function showNodeContextMenu(node, event) {
+	function showNodeContextMenu(node, event, anchorPoint = null) {
 	  event.preventDefault();
 	  event.stopPropagation();
 	  selectNode(node.id, false);
+	  keyboardFocusedNodeId = node.id;
 	  contextMenuNodeId = node.id;
 	  contextMenu.replaceChildren();
 
@@ -1301,6 +1396,7 @@ function formatThreadRelativeTime(signedValue, unit) {
 	    if (item.separator) {
 	      const separator = document.createElement("div");
 	      separator.className = "context-menu-separator";
+	      separator.setAttribute("role", "separator");
 	      contextMenu.appendChild(separator);
 	      continue;
 	    }
@@ -1309,6 +1405,7 @@ function formatThreadRelativeTime(signedValue, unit) {
 	    button.type = "button";
 	    button.className = `context-menu-item${item.destructive ? " destructive" : ""}`;
 	    button.disabled = Boolean(item.disabled);
+	    button.setAttribute("role", "menuitem");
 	    button.dataset.command = item.command;
 	    button.innerHTML = `<span class="context-menu-icon" aria-hidden="true">${item.icon}</span><span>${escapeText(item.text)}</span>`;
 	    button.addEventListener("click", clickEvent => {
@@ -1316,18 +1413,108 @@ function formatThreadRelativeTime(signedValue, unit) {
 	      if (!button.disabled) {
 	        postNodeCommand(node.id, item.command);
 	      }
-	      hideNodeContextMenu();
+	      hideNodeContextMenu(true);
 	    });
 	    contextMenu.appendChild(button);
 	  }
 
 	  contextMenu.style.display = "block";
 	  const rect = contextMenu.getBoundingClientRect();
-	  const left = Math.max(8, Math.min(event.clientX, window.innerWidth - rect.width - 8));
-	  const top = Math.max(8, Math.min(event.clientY, window.innerHeight - rect.height - 8));
+	  const anchorX = anchorPoint?.x ?? event.clientX;
+	  const anchorY = anchorPoint?.y ?? event.clientY;
+	  const left = Math.max(8, Math.min(anchorX, window.innerWidth - rect.width - 8));
+	  const top = Math.max(8, Math.min(anchorY, window.innerHeight - rect.height - 8));
 	  contextMenu.style.left = `${left}px`;
 	  contextMenu.style.top = `${top}px`;
+	  contextMenu.querySelector("button:not(:disabled)")?.focus({ preventScroll: true });
 	}
+
+	contextMenu.addEventListener("keydown", event => {
+	  const items = Array.from(contextMenu.querySelectorAll("button:not(:disabled)"));
+	  if (event.key === "Escape") {
+	    event.preventDefault();
+	    hideNodeContextMenu(true);
+	    return;
+	  }
+
+	  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || items.length === 0) {
+	    return;
+	  }
+
+	  event.preventDefault();
+	  const currentIndex = Math.max(0, items.indexOf(document.activeElement));
+	  const nextIndex = event.key === "Home"
+	    ? 0
+	    : event.key === "End"
+	      ? items.length - 1
+	      : event.key === "ArrowDown"
+	        ? (currentIndex + 1) % items.length
+	        : (currentIndex - 1 + items.length) % items.length;
+	  items[nextIndex].focus({ preventScroll: true });
+	});
+
+function visibleNodeElements() {
+  return Array.from(world.querySelectorAll(".node"))
+    .filter(element => element.style.display !== "none");
+}
+
+function syncNodeRovingTabIndex(focusTarget = false) {
+  const elements = visibleNodeElements();
+  if (elements.length === 0) {
+    keyboardFocusedNodeId = null;
+    return;
+  }
+
+  if (!elements.some(element => element.dataset.nodeId === keyboardFocusedNodeId)) {
+    keyboardFocusedNodeId = elements.some(element => element.dataset.nodeId === selectedNodeId)
+      ? selectedNodeId
+      : elements[0].dataset.nodeId;
+  }
+
+  let focusElement = null;
+  for (const element of world.querySelectorAll(".node")) {
+    const isKeyboardTarget = element.dataset.nodeId === keyboardFocusedNodeId &&
+      element.style.display !== "none";
+    const primaryAction = element.querySelector(".node-primary-action");
+    if (primaryAction) {
+      primaryAction.tabIndex = isKeyboardTarget ? 0 : -1;
+    }
+    if (isKeyboardTarget) {
+      focusElement = primaryAction;
+    }
+  }
+
+  if (focusTarget) {
+    focusElement?.focus({ preventScroll: true });
+  }
+}
+
+function moveNodeKeyboardFocus(element, key) {
+  const elements = visibleNodeElements();
+  const currentIndex = Math.max(0, elements.indexOf(element));
+  const nextIndex = key === "Home"
+    ? 0
+    : key === "End"
+      ? elements.length - 1
+      : key === "ArrowRight" || key === "ArrowDown"
+        ? (currentIndex + 1) % elements.length
+        : (currentIndex - 1 + elements.length) % elements.length;
+  keyboardFocusedNodeId = elements[nextIndex]?.dataset.nodeId || null;
+  syncNodeRovingTabIndex(true);
+}
+
+function activateNodeFromKeyboard(node) {
+  if (pendingLinkSourceId) {
+    if (pendingLinkSourceId === node.id) {
+      cancelLinkMode(true);
+    } else {
+      completeLinkTo(node.id);
+    }
+    return;
+  }
+
+  selectNode(node.id);
+}
 
 function renderNodes() {
   if (nodes.length === 0) {
@@ -1347,17 +1534,31 @@ function renderNodes() {
     const model = node.metadata?.model;
     const effort = node.metadata?.reasoningEffort;
     const agentBadge = isSubagent(node) ? "<span class=\"agent-badge\">agent</span>" : "";
-    const unreadDot = node.metadata?.isUnread ? "<span class=\"unread-dot\"></span>" : "";
+	    const unreadDot = node.metadata?.isUnread ? "<span class=\"unread-dot\" aria-hidden=\"true\"></span>" : "";
     const subtitle = String(node.subtitle || "").trim();
     const subtitleHtml = subtitle ? `<div class="node-subtitle">${escapeText(subtitle)}</div>` : "";
     const compact = height < 110 ? " compact" : "";
     const hidden = !showsSubagents && isSubagent(node) ? "display:none;" : "";
-    const updatedText = threadUpdatedText(node);
-    return `
-      <article
-        class="node${compact}"
-        data-node-id="${escapeText(node.id)}"
-        style="left:${left}px; top:${top}px; width:${width}px; --node-height:${height}px; --accent:${accent}; --accent-soft:${alphaHex(accent, 0.12)}; --node-border:${nodeBorder}; ${hidden}">
+	    const updatedText = threadUpdatedText(node);
+	    const accessibleDescription = nodeAccessibleDescription(node);
+	    const accessibleDescriptionAttribute = accessibleDescription
+	      ? ` aria-description="${escapeText(accessibleDescription)}"`
+	      : "";
+	    return `
+	      <article
+	        class="node${compact}"
+	        data-node-id="${escapeText(node.id)}"
+	        role="group"
+	        aria-label="${escapeText(nodeAccessibleName(node))} controls"
+	        style="left:${left}px; top:${top}px; width:${width}px; --node-height:${height}px; --accent:${accent}; --accent-soft:${alphaHex(accent, 0.12)}; --node-border:${nodeBorder}; ${hidden}">
+	        <button
+	          type="button"
+	          class="node-primary-action"
+	          tabindex="-1"
+	          aria-label="${escapeText(nodeAccessibleName(node))}"
+	          aria-pressed="false"
+	          aria-haspopup="menu"
+	          aria-keyshortcuts="Enter Space Shift+F10"${accessibleDescriptionAttribute}></button>
         <div class="node-inner">
           <div class="node-heading">
             <div class="node-icon">${iconFor(node)}</div>
@@ -1386,6 +1587,39 @@ function renderNodes() {
   renderEdgeControls();
 
 	  for (const element of world.querySelectorAll(".node")) {
+	    const primaryAction = element.querySelector(".node-primary-action");
+	    primaryAction?.addEventListener("focus", () => {
+	      keyboardFocusedNodeId = element.dataset.nodeId;
+	      element.classList.add("keyboard-focused");
+	      syncNodeRovingTabIndex(false);
+	    });
+	    primaryAction?.addEventListener("blur", () => {
+	      element.classList.remove("keyboard-focused");
+	    });
+	    primaryAction?.addEventListener("click", event => {
+	      event.stopPropagation();
+	      const node = nodeById.get(element.dataset.nodeId);
+	      if (node) {
+	        activateNodeFromKeyboard(node);
+	      }
+	    });
+	    primaryAction?.addEventListener("keydown", event => {
+	      const node = nodeById.get(element.dataset.nodeId);
+	      if (!node) {
+	        return;
+	      }
+
+	      if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) {
+	        event.preventDefault();
+	        moveNodeKeyboardFocus(element, event.key);
+	      } else if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+	        const rect = element.getBoundingClientRect();
+	        showNodeContextMenu(node, event, { x: rect.left + 20, y: rect.top + 20 });
+	      } else if (event.key === "Escape" && pendingLinkSourceId) {
+	        event.preventDefault();
+	        cancelLinkMode(true);
+	      }
+	    });
 	    element.addEventListener("contextmenu", event => {
 	      const node = nodeById.get(element.dataset.nodeId);
 	      if (node) {
@@ -1453,6 +1687,8 @@ function renderNodes() {
 	      postNodeCommand(node.id, action.dataset.command);
 	    });
 	  }
+
+	  syncNodeRovingTabIndex(false);
 	}
 
 function resizeCanvas() {
@@ -1622,9 +1858,13 @@ function updateNodeStateClasses() {
   const neighborhood = focusedNodeNeighborhood();
   for (const element of world.querySelectorAll(".node")) {
     const nodeId = element.dataset.nodeId;
-    element.classList.toggle("selected", nodeId === selectedNodeId);
+    const isSelected = nodeId === selectedNodeId;
+    element.classList.toggle("selected", isSelected);
+    element.querySelector(".node-primary-action")
+      ?.setAttribute("aria-pressed", isSelected ? "true" : "false");
     element.classList.toggle("dimmed", Boolean(neighborhood) && !neighborhood.has(nodeId));
   }
+  syncNodeRovingTabIndex(false);
 }
 
 function edgeMeta(edge, isSelected, focusOpacity) {
@@ -2139,6 +2379,7 @@ function postViewportChanged() {
 function selectNode(id, notifyHost = true) {
   pendingLinkSourceId = null;
   selectedNodeId = id;
+  keyboardFocusedNodeId = id;
   selectedEdgeId = null;
   applyLinkState();
   updateNodeStateClasses();
@@ -2266,6 +2507,7 @@ function updateSubagentVisibility() {
     const node = nodeById.get(element.dataset.nodeId);
     element.style.display = !showsSubagents && node && isSubagent(node) ? "none" : "";
   }
+  syncNodeRovingTabIndex(false);
   draw();
 }
 
@@ -2274,6 +2516,17 @@ function applyGraphUpdate(payload) {
   if (!nextGraph) {
     return;
   }
+
+	  const focusedNodeBeforeUpdate = document.activeElement?.closest?.(".node");
+	  const focusedMenuNodeId = contextMenu.contains(document.activeElement)
+	    ? contextMenuNodeId
+	    : null;
+	  const shouldRestoreNodeFocus = Boolean(focusedNodeBeforeUpdate || focusedMenuNodeId);
+	  if (focusedMenuNodeId) {
+	    keyboardFocusedNodeId = focusedMenuNodeId;
+	  } else if (focusedNodeBeforeUpdate?.dataset?.nodeId) {
+	    keyboardFocusedNodeId = focusedNodeBeforeUpdate.dataset.nodeId;
+	  }
 
   hideNodeContextMenu();
   if (typeof payload.showsSubagents === "boolean") {
@@ -2313,6 +2566,7 @@ function applyGraphUpdate(payload) {
   if (highlightedNodeId) {
     highlightNode(highlightedNodeId);
   }
+	  syncNodeRovingTabIndex(shouldRestoreNodeFocus);
   applyView();
 }
 

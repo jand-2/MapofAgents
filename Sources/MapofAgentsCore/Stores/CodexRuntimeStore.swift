@@ -19,10 +19,16 @@ public final class CodexRuntimeStore {
     public private(set) var threadRuntimeStates: [String: ThreadRuntimeState] = [:]
 
     private let client: CodexAppServerClient
+    private let mentionCatalogSession: MentionCatalogSession
     private var isConnectingRuntime = false
+    private var mentionCatalogPublicationGeneration = MentionCatalogPublicationGeneration()
 
-    public init(client: CodexAppServerClient = CodexAppServerClient()) {
+    public init(
+        client: CodexAppServerClient = CodexAppServerClient(),
+        mentionCatalogSession: MentionCatalogSession = MentionCatalogSession()
+    ) {
         self.client = client
+        self.mentionCatalogSession = mentionCatalogSession
         #if os(macOS)
         let codexPath = LocalCodexDiscovery.findCodexExecutable()
         self.localHost = AgentHost(
@@ -114,8 +120,8 @@ public final class CodexRuntimeStore {
 
     private func connectOnce() async throws {
         do {
-            let initializeResult = try await client.request(
-                method: "initialize",
+            let initializeResult = try await client.request(AppServerCall(
+                .initialize,
                 params: .object([
                     "clientInfo": .object([
                         "name": .string("mapofagents"),
@@ -126,7 +132,7 @@ public final class CodexRuntimeStore {
                         "experimentalApi": .bool(true),
                     ]),
                 ])
-            )
+            ))
 
             try await client.notify(method: "initialized")
             await client.markInitialized()
@@ -171,8 +177,8 @@ public final class CodexRuntimeStore {
     }
 
     public func refreshModels() async throws {
-        let result = try await runtimeRequest(
-            method: "model/list",
+        let result = try await runtimeRead(
+            method: .listModels,
             params: .object([
                 "limit": .number(100),
                 "includeHidden": .bool(false),
@@ -184,13 +190,13 @@ public final class CodexRuntimeStore {
     }
 
     private func refreshModelsDirect() async throws {
-        let result = try await client.request(
-            method: "model/list",
+        let result = try await client.request(AppServerCall(
+            .listModels,
             params: .object([
                 "limit": .number(100),
                 "includeHidden": .bool(false),
             ])
-        )
+        ))
 
         let values = result["data"]?.arrayValue ?? []
         models = values.compactMap(Self.modelOption)
@@ -202,8 +208,8 @@ public final class CodexRuntimeStore {
     }
 
     public func threadCatalogEntries(limit: Int = 100, archived: Bool = false) async throws -> [ThreadCatalogEntry] {
-        let result = try await runtimeRequest(
-            method: "thread/list",
+        let result = try await runtimeRead(
+            method: .listThreads,
             params: .object([
                 "limit": .number(Double(limit)),
                 "archived": .bool(archived),
@@ -226,8 +232,8 @@ public final class CodexRuntimeStore {
     public func searchThreadCatalog(query: String, limit: Int = 50) async throws -> [ThreadCatalogEntry] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        let result = try await runtimeRequest(
-            method: "thread/search",
+        let result = try await runtimeRead(
+            method: .searchThreads,
             params: .object(Self.threadSearchParams(query: trimmed, limit: limit))
         )
 
@@ -237,8 +243,8 @@ public final class CodexRuntimeStore {
     }
 
     public func loadedThreadCatalogEntries(limit: Int = 100) async -> [ThreadCatalogEntry] {
-        guard let result = try? await runtimeRequest(
-            method: "thread/loaded/list",
+        guard let result = try? await runtimeRead(
+            method: .listLoadedThreads,
             params: .object(["limit": .number(Double(limit))])
         ) else {
             return []
@@ -283,32 +289,47 @@ public final class CodexRuntimeStore {
     }
 
     public func refreshMentionCandidates(cwd: String? = nil) async {
-        async let skillsResult = optionalRuntimeRequest(
-            method: "skills/list",
-            params: Self.catalogParams(cwd: cwd)
-        )
-        async let pluginsResult = optionalRuntimeRequest(method: "plugin/list", params: Self.catalogParams(cwd: cwd))
-        async let filesResult = Self.fileMentionCandidates(rootPath: cwd)
+        let generation = mentionCatalogPublicationGeneration.begin()
+        let candidates = await loadMentionCandidates(cwd: cwd)
+        guard !Task.isCancelled,
+              mentionCatalogPublicationGeneration.accepts(generation) else {
+            return
+        }
+        mentionCandidates = candidates
+    }
 
-        let fileValue = await filesResult
-        if !fileValue.isEmpty {
-            mentionCandidates = Self.uniquedMentionCandidates(
-                mentionCandidates.filter { $0.kind != .file } + fileValue
+    public func loadMentionCandidates(cwd: String? = nil) async -> [MentionCandidate] {
+        let key = MentionCatalogSession.Key(
+            scope: "\(localHost.id.rawValue)|\(connectionState.rawValue)",
+            rootPath: cwd
+        )
+        return await mentionCatalogSession.candidates(for: key) { [weak self] in
+            guard let self else { return [MapofAgentsWorkflowBridgeSkill.mentionCandidate] }
+            async let skillsResult = self.optionalRuntimeRequest(
+                method: .listSkills,
+                params: Self.catalogParams(cwd: cwd)
+            )
+            async let pluginsResult = self.optionalRuntimeRequest(
+                method: .listPlugins,
+                params: Self.catalogParams(cwd: cwd)
+            )
+            async let filesResult = Self.fileMentionCandidates(rootPath: cwd)
+
+            let skillValue = await skillsResult
+            let pluginValue = await pluginsResult
+            let fileValue = await filesResult
+            guard !Task.isCancelled else { return [] }
+            return Self.catalogMentionCandidates(
+                skillsResult: skillValue,
+                pluginsResult: pluginValue,
+                fileCandidates: fileValue
             )
         }
-
-        let skillValue = await skillsResult
-        let pluginValue = await pluginsResult
-        mentionCandidates = Self.catalogMentionCandidates(
-            skillsResult: skillValue,
-            pluginsResult: pluginValue,
-            fileCandidates: fileValue
-        )
     }
 
     public func refreshAccount() async throws {
-        let result = try await runtimeRequest(
-            method: "account/read",
+        let result = try await runtimeRead(
+            method: .accountRead,
             params: .object([
                 "refreshToken": .bool(false),
             ])
@@ -318,12 +339,12 @@ public final class CodexRuntimeStore {
     }
 
     private func refreshAccountDirect() async throws {
-        let result = try await client.request(
-            method: "account/read",
+        let result = try await client.request(AppServerCall(
+            .accountRead,
             params: .object([
                 "refreshToken": .bool(false),
             ])
-        )
+        ))
 
         applyAccountResult(result)
     }
@@ -348,8 +369,8 @@ public final class CodexRuntimeStore {
     }
 
     private func readThreadCatalogEntry(threadID: String, cwdHint: String?) async throws -> ThreadCatalogEntry? {
-        let result = try await runtimeRequest(
-            method: "thread/read",
+        let result = try await runtimeRead(
+            method: .readThread,
             params: .object([
                 "threadId": .string(threadID),
             ])
@@ -365,8 +386,8 @@ public final class CodexRuntimeStore {
     }
 
     private func findThreadInList(threadID: String, limit: Int) async throws -> ThreadRef? {
-        let result = try await runtimeRequest(
-            method: "thread/list",
+        let result = try await runtimeRead(
+            method: .listThreads,
             params: .object([
                 "limit": .number(Double(limit)),
                 "archived": .bool(false),
@@ -436,10 +457,32 @@ public final class CodexRuntimeStore {
         reasoningEffort: String,
         permissions: CodexThreadPermissions = .default,
         initialPrompt: String = ""
-    ) async throws -> ThreadRef {
-        let result = try await runtimeRequest(
-            method: "thread/start",
-            params: .object(Self.threadStartParams(cwd: cwd, model: model, permissions: permissions))
+    ) async throws -> ThreadCreationOutcome {
+        try await createThreadUsingRequest(
+            cwd: cwd,
+            name: name,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            permissions: permissions,
+            initialPrompt: initialPrompt
+        ) { [weak self] method, params in
+            guard let self else { throw CodexAppServerError.disconnected }
+            return try await self.runtimeRequest(method: method, params: params)
+        }
+    }
+
+    func createThreadUsingRequest(
+        cwd: String,
+        name: String,
+        model: String,
+        reasoningEffort: String,
+        permissions: CodexThreadPermissions = .default,
+        initialPrompt: String = "",
+        request: @escaping (AppServerMethod, JSONValue) async throws -> JSONValue
+    ) async throws -> ThreadCreationOutcome {
+        let result = try await request(
+            .startThread,
+            .object(Self.threadStartParams(cwd: cwd, model: model, permissions: permissions))
         )
 
         guard
@@ -450,33 +493,55 @@ public final class CodexRuntimeStore {
             throw CodexAppServerError.invalidResponse
         }
 
+        var threadRef = ThreadRef(hostID: localHost.id, threadID: threadID, cwd: threadCwd)
+        publishCreatedThread(threadRef)
+        var warnings: [String] = []
+
         if !name.isEmpty {
-            _ = try await runtimeRequest(
-                method: "thread/name/set",
-                params: .object([
+            do {
+                _ = try await request(
+                    .setThreadName,
+                    .object([
                     "threadId": .string(threadID),
                     "name": .string(name),
-                ])
-            )
-        }
-
-        let threadRef = ThreadRef(hostID: localHost.id, threadID: threadID, cwd: threadCwd, name: name.isEmpty ? nil : name)
-        if !threadSummaries.contains(threadRef) {
-            threadSummaries.insert(threadRef, at: 0)
+                    ])
+                )
+                threadRef.name = name
+                publishCreatedThread(threadRef)
+            } catch {
+                warnings.append("Thread created, but its name could not be saved: \(error.localizedDescription)")
+            }
         }
 
         let trimmedPrompt = initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrompt.isEmpty {
-            try await sendMessage(
-                trimmedPrompt,
-                to: threadRef,
-                model: model,
-                reasoningEffort: reasoningEffort,
-                permissions: permissions
-            )
+            do {
+                try await sendMessage(
+                    trimmedPrompt,
+                    to: threadRef,
+                    model: model,
+                    reasoningEffort: reasoningEffort,
+                    permissions: permissions
+                )
+            } catch {
+                warnings.append("Thread created, but the initial prompt could not be sent: \(error.localizedDescription)")
+            }
         }
 
-        return threadRef
+        return ThreadCreationOutcome(
+            threadRef: threadRef,
+            warning: warnings.isEmpty ? nil : warnings.joined(separator: " ")
+        )
+    }
+
+    private func publishCreatedThread(_ threadRef: ThreadRef) {
+        if let index = threadSummaries.firstIndex(where: {
+            $0.hostID == threadRef.hostID && $0.threadID == threadRef.threadID
+        }) {
+            threadSummaries[index] = threadRef
+        } else {
+            threadSummaries.insert(threadRef, at: 0)
+        }
     }
 
     public func loadTranscript(for threadRef: ThreadRef) async throws -> ThreadTranscript {
@@ -512,8 +577,8 @@ public final class CodexRuntimeStore {
     }
 
     private func loadTranscriptPage(for threadRef: ThreadRef, cursor: String?) async throws -> ThreadTranscript {
-        let threadReadResult = try? await runtimeRequest(
-            method: "thread/read",
+        let threadReadResult = try? await runtimeRead(
+            method: .readThread,
             params: .object([
                 "threadId": .string(threadRef.threadID),
             ])
@@ -528,8 +593,8 @@ public final class CodexRuntimeStore {
             params["cursor"] = .string(cursor)
         }
 
-        let result = try await runtimeRequest(
-            method: "thread/turns/list",
+        let result = try await runtimeRead(
+            method: .listTurns,
             params: .object(params)
         )
 
@@ -579,13 +644,6 @@ public final class CodexRuntimeStore {
         )
         guard !inputItems.isEmpty else { return }
 
-        upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
-            state.status = .running
-            state.activeFlags.insert(.running)
-            state.liveAssistantText = ""
-            state.lastActivityAt = Date()
-        }
-
         try await resumeThread(threadRef, permissions: permissions)
 
         var params: [String: JSONValue] = [
@@ -605,9 +663,14 @@ public final class CodexRuntimeStore {
             params.merge(permissions.turnParams(cwd: threadRef.cwd)) { _, new in new }
         }
 
-        let result = try await runtimeRequest(method: "turn/start", params: .object(params))
-        if let turnID = Self.turnID(fromAppServerValue: result) {
-            upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
+        let result = try await runtimeRequest(method: .startTurn, params: .object(params))
+        let turnID = Self.turnID(fromAppServerValue: result)
+        upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
+            state.status = .running
+            state.activeFlags.insert(.running)
+            state.liveAssistantText = ""
+            state.lastActivityAt = Date()
+            if let turnID {
                 state.activeTurnID = turnID
             }
         }
@@ -620,7 +683,7 @@ public final class CodexRuntimeStore {
 
         let turnID = try await interruptibleTurnID(for: threadRef)
         _ = try await runtimeRequest(
-            method: "turn/interrupt",
+            method: .interruptTurn,
             params: .object([
                 "threadId": .string(threadRef.threadID),
                 "turnId": .string(turnID),
@@ -675,7 +738,7 @@ public final class CodexRuntimeStore {
         }
 
         return try await runtimeRequest(
-            method: "thread/resume",
+            method: .resumeThread,
             params: .object(params)
         )
     }
@@ -687,8 +750,8 @@ public final class CodexRuntimeStore {
             return stateTurnID
         }
 
-        let result = try await runtimeRequest(
-            method: "thread/turns/list",
+        let result = try await runtimeRead(
+            method: .listTurns,
             params: .object([
                 "threadId": .string(threadRef.threadID),
                 "limit": .number(5),
@@ -881,7 +944,7 @@ public final class CodexRuntimeStore {
         }
 
         _ = try await runtimeRequest(
-            method: "thread/archive",
+            method: .archiveThread,
             params: .object([
                 "threadId": .string(threadRef.threadID),
             ])
@@ -904,7 +967,7 @@ public final class CodexRuntimeStore {
             params["model"] = .string(model)
         }
 
-        let result = try await runtimeRequest(method: "thread/fork", params: .object(params))
+        let result = try await runtimeRequest(method: .forkThread, params: .object(params))
         guard
             let thread = result["thread"],
             let threadID = thread["id"]?.stringValue,
@@ -936,13 +999,15 @@ public final class CodexRuntimeStore {
         guard request.supportsApprovalDecision else {
             throw CodexAppServerError.server("This request needs a typed response and cannot be answered with Allow/Deny.")
         }
-        guard let requestID = request.requestID else {
-            throw CodexAppServerError.invalidResponse
+        guard let requestID = request.requestID,
+              let connectionID = request.connectionID else {
+            throw CodexAppServerError.staleServerRequest
         }
 
         try await client.respondToServerRequest(
             id: requestID,
-            result: request.appServerApprovalResult(allow: allow)
+            result: request.appServerApprovalResult(allow: allow),
+            connectionID: connectionID
         )
         completeAttentionRequest(request)
     }
@@ -951,13 +1016,15 @@ public final class CodexRuntimeStore {
         guard request.supportsTypedResponse else {
             throw CodexAppServerError.server("This request cannot be answered with typed input.")
         }
-        guard let requestID = request.requestID else {
-            throw CodexAppServerError.invalidResponse
+        guard let requestID = request.requestID,
+              let connectionID = request.connectionID else {
+            throw CodexAppServerError.staleServerRequest
         }
 
         try await client.respondToServerRequest(
             id: requestID,
-            result: request.appServerTextResponseResult(text)
+            result: request.appServerTextResponseResult(text),
+            connectionID: connectionID
         )
         completeAttentionRequest(request)
     }
@@ -966,13 +1033,15 @@ public final class CodexRuntimeStore {
         guard request.supportsTypedResponse else {
             throw CodexAppServerError.server("This request does not support typed responses.")
         }
-        guard let requestID = request.requestID else {
-            throw CodexAppServerError.invalidResponse
+        guard let requestID = request.requestID,
+              let connectionID = request.connectionID else {
+            throw CodexAppServerError.staleServerRequest
         }
 
         try await client.respondToServerRequest(
             id: requestID,
-            result: request.appServerTextDeclineResult()
+            result: request.appServerTextDeclineResult(),
+            connectionID: connectionID
         )
         completeAttentionRequest(request)
     }
@@ -1347,9 +1416,14 @@ public final class CodexRuntimeStore {
             return []
         }
 
-        return await Task.detached(priority: .utility) {
+        let scanTask = Task.detached(priority: .utility) {
             fileMentionCandidates(rootPath: rootPath, limit: limit)
-        }.value
+        }
+        return await withTaskCancellationHandler {
+            await scanTask.value
+        } onCancel: {
+            scanTask.cancel()
+        }
     }
 
     nonisolated static func fileMentionCandidates(rootPath: String, limit: Int = 120) -> [MentionCandidate] {
@@ -1371,6 +1445,7 @@ public final class CodexRuntimeStore {
 
         var candidates: [MentionCandidate] = []
         for case let url as URL in enumerator {
+            guard !Task.isCancelled else { return [] }
             let name = url.lastPathComponent
             let resourceValues = try? url.resourceValues(forKeys: keys)
             let isDirectory = resourceValues?.isDirectory == true
@@ -1411,12 +1486,23 @@ public final class CodexRuntimeStore {
         }
     }
 
-    private func runtimeRequest(method: String, params: JSONValue = .object([:])) async throws -> JSONValue {
+    private func runtimeRequest(
+        method: AppServerMethod,
+        params: JSONValue = .object([:])
+    ) async throws -> JSONValue {
+        let call = AppServerCall(method, params: params)
         try await ensureConnectedRuntime()
 
         do {
-            return try await client.request(method: method, params: params)
-        } catch CodexAppServerError.disconnected {
+            return try await client.request(call)
+        } catch {
+            if method.replaySafety == .nonReplayableWrite,
+               Self.isAmbiguousWriteFailure(error) {
+                await reconcileAfterAmbiguousWrite(method: method, params: params)
+                throw CodexAppServerError.ambiguousWrite(method: method.rawValue)
+            }
+
+            guard case CodexAppServerError.disconnected = error else { throw error }
             connectionState = .connecting
             localHost.status = .connecting
             statusMessage = "Restoring codex app-server connection"
@@ -1425,8 +1511,59 @@ public final class CodexRuntimeStore {
             guard connectionState == .connected else {
                 throw CodexAppServerError.disconnected
             }
-            return try await client.request(method: method, params: params)
+            return try await client.request(call)
         }
+    }
+
+    private static func isAmbiguousWriteFailure(_ error: Error) -> Bool {
+        guard let appServerError = error as? CodexAppServerError else {
+            // Once request serialization has succeeded, an untyped error comes
+            // from the process pipe and may represent a partial write.
+            return true
+        }
+        switch appServerError {
+        case .disconnected,
+             .invalidResponse,
+             .daemonProxyRequestTimedOut,
+             .ambiguousWrite,
+             .transport:
+            return true
+        case .unsupportedPlatform,
+             .codexNotInstalled,
+             .launchFailed,
+             .daemonProxyHandshakeFailed,
+             .staleServerRequest,
+             .server:
+            return false
+        }
+    }
+
+    private func reconcileAfterAmbiguousWrite(
+        method: AppServerMethod,
+        params: JSONValue
+    ) async {
+        statusMessage = "Refreshing runtime state after an unconfirmed \(method.rawValue) request"
+        await connect()
+        guard connectionState == .connected else { return }
+
+        try? await refreshThreads()
+        guard method == .startTurn,
+              let threadID = params["threadId"]?.stringValue,
+              let threadRef = threadSummaries.first(where: { $0.threadID == threadID }) else {
+            return
+        }
+        _ = try? await loadTranscript(for: threadRef)
+    }
+
+    private func runtimeRead(
+        method: AppServerMethod,
+        params: JSONValue = .object([:])
+    ) async throws -> JSONValue {
+        precondition(
+            method.replaySafety == .replayableRead,
+            "runtimeRead only accepts protocol-declared read methods"
+        )
+        return try await runtimeRequest(method: method, params: params)
     }
 
     private func ensureConnectedRuntime() async throws {
@@ -1443,14 +1580,17 @@ public final class CodexRuntimeStore {
         }
     }
 
-    private func optionalRuntimeRequest(method: String, params: JSONValue = .object([:])) async -> JSONValue? {
+    private func optionalRuntimeRequest(
+        method: AppServerMethod,
+        params: JSONValue = .object([:])
+    ) async -> JSONValue? {
         do {
-            return try await runtimeRequest(method: method, params: params)
+            return try await runtimeRead(method: method, params: params)
         } catch {
             guard params != .object([:]) else {
                 return nil
             }
-            return try? await runtimeRequest(method: method)
+            return try? await runtimeRead(method: method)
         }
     }
 

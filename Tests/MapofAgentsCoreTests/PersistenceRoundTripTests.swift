@@ -147,7 +147,11 @@ func localStoreMigratesLegacyCanvasIntoMainWorkflow() async throws {
 func localStoreReplacesWorkflowSnapshot() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("mapofagents-snapshot-import-tests-\(UUID().uuidString)", isDirectory: true)
-    let store = LocalControlRoomStore(paths: ApplicationPaths(applicationSupportDirectory: directory))
+    let vault = TestRelayCredentialVault()
+    let store = LocalControlRoomStore(
+        paths: ApplicationPaths(applicationSupportDirectory: directory),
+        relayCredentialVault: vault
+    )
 
     let workflow = WorkflowRecord(id: "remote-main", name: "Remote Main")
     let folder = CanvasNode(
@@ -185,8 +189,17 @@ func localStoreReplacesWorkflowSnapshot() async throws {
     )
 
     try await store.replaceWorkflowSnapshot(snapshot)
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let pointer = try decoder.decode(
+        WorkflowSnapshotPointer.self,
+        from: Data(contentsOf: directory.appendingPathComponent("workflow-snapshots/current.json"))
+    )
     let relayEndpointJSON = try String(
-        contentsOf: directory.appendingPathComponent("relay-endpoints.json"),
+        contentsOf: directory
+            .appendingPathComponent("workflow-snapshots")
+            .appendingPathComponent(pointer.activeSnapshotID)
+            .appendingPathComponent("relay-endpoints.json"),
         encoding: .utf8
     )
 
@@ -195,7 +208,7 @@ func localStoreReplacesWorkflowSnapshot() async throws {
     #expect(try await store.loadCanvas().nodes[folder.id]?.title == "Project")
     #expect(try await store.loadWorkflowEvents().map(\.id) == ["event-1"])
     #expect(relayEndpointJSON.contains("secret") == false)
-    #expect(try await store.loadRelayEndpoints().first?.bearerToken == nil)
+    #expect(try await store.loadRelayEndpoints().first?.bearerToken == "secret")
 
     try? FileManager.default.removeItem(at: directory)
 }
@@ -277,6 +290,265 @@ func localStoreRejectsDuplicateWorkflowIDsWithoutOverwriting() async throws {
     #expect(integrityError == .duplicateWorkflowID("duplicate"))
     let graph = try await store.loadCanvas()
     #expect(graph.nodes[existingFolder.id]?.title == "Existing")
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func snapshotImportFailureBeforePointerSwitchLeavesLiveStateUntouched() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-snapshot-atomicity-tests-\(UUID().uuidString)", isDirectory: true)
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    let originalStore = LocalControlRoomStore(paths: paths)
+    try await originalStore.replaceWorkflowSnapshot(testWorkflowSnapshot(id: "original", title: "Original"))
+
+    let pointerDataBefore = try Data(contentsOf: paths.workflowSnapshotPointerURL)
+    let failingStore = LocalControlRoomStore(
+        paths: paths,
+        snapshotFailureInjector: { step in
+            if step == .workflowGraph("replacement") {
+                throw SnapshotInjectionError.injected
+            }
+        }
+    )
+
+    var didThrowInjectedFailure = false
+    do {
+        try await failingStore.replaceWorkflowSnapshot(
+            testWorkflowSnapshot(id: "replacement", title: "Replacement")
+        )
+    } catch SnapshotInjectionError.injected {
+        didThrowInjectedFailure = true
+    }
+
+    #expect(didThrowInjectedFailure)
+    #expect(try Data(contentsOf: paths.workflowSnapshotPointerURL) == pointerDataBefore)
+    #expect(try await failingStore.loadCanvas().title == "Original")
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func snapshotPointerWriteFailureLeavesLegacyStateAndNoStagedVersions() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-snapshot-pointer-failure-tests-\(UUID().uuidString)", isDirectory: true)
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let legacyEncoder = JSONEncoder()
+    legacyEncoder.dateEncodingStrategy = .iso8601
+    try legacyEncoder.encode(AgentGraph(title: "Legacy Live")).write(
+        to: paths.canvasURL,
+        options: [.atomic]
+    )
+
+    let failingStore = LocalControlRoomStore(
+        paths: paths,
+        snapshotFailureInjector: { step in
+            if step == .activatePointer {
+                throw SnapshotInjectionError.injected
+            }
+        }
+    )
+    var didThrowInjectedFailure = false
+    do {
+        try await failingStore.replaceWorkflowSnapshot(
+            testWorkflowSnapshot(id: "replacement", title: "Replacement")
+        )
+    } catch SnapshotInjectionError.injected {
+        didThrowInjectedFailure = true
+    }
+
+    #expect(didThrowInjectedFailure)
+    #expect(FileManager.default.fileExists(atPath: paths.workflowSnapshotPointerURL.path) == false)
+    #expect(try await failingStore.loadCanvas().title == "Legacy Live")
+    let snapshotDirectoryContents = try FileManager.default.contentsOfDirectory(
+        at: paths.workflowSnapshotsDirectory,
+        includingPropertiesForKeys: nil
+    )
+    #expect(snapshotDirectoryContents.isEmpty)
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func snapshotPointerFailureRollsBackRelayCredentialMutation() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-snapshot-credential-rollback-tests-\(UUID().uuidString)", isDirectory: true)
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    let vault = TestRelayCredentialVault()
+    let endpointURL = try #require(URL(string: "wss://mac.example.test/app-server"))
+    var original = testWorkflowSnapshot(id: "original", title: "Original")
+    original.relayEndpoints = [
+        AppServerRelayEndpoint(
+            id: HostID(rawValue: "paired-mac"),
+            name: "Paired Mac",
+            url: endpointURL,
+            bearerToken: "original-credential"
+        ),
+    ]
+    let originalStore = LocalControlRoomStore(paths: paths, relayCredentialVault: vault)
+    try await originalStore.replaceWorkflowSnapshot(original)
+    let pointerDataBefore = try Data(contentsOf: paths.workflowSnapshotPointerURL)
+
+    var replacement = testWorkflowSnapshot(id: "replacement", title: "Replacement")
+    replacement.relayEndpoints = [
+        AppServerRelayEndpoint(
+            id: HostID(rawValue: "paired-mac"),
+            name: "Paired Mac",
+            url: endpointURL,
+            bearerToken: "replacement-credential"
+        ),
+    ]
+    let failingStore = LocalControlRoomStore(
+        paths: paths,
+        relayCredentialVault: vault,
+        snapshotFailureInjector: { step in
+            if step == .activatePointer {
+                throw SnapshotInjectionError.injected
+            }
+        }
+    )
+
+    await #expect(throws: SnapshotInjectionError.self) {
+        try await failingStore.replaceWorkflowSnapshot(replacement)
+    }
+
+    #expect(try Data(contentsOf: paths.workflowSnapshotPointerURL) == pointerDataBefore)
+    #expect(vault.credential(for: "relay:paired-mac") == "original-credential")
+    #expect(try await failingStore.loadCanvas().title == "Original")
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func workflowSnapshotRollbackRestoresVersionedRelayCredential() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-snapshot-credential-version-tests-\(UUID().uuidString)", isDirectory: true)
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    let vault = TestRelayCredentialVault()
+    let store = LocalControlRoomStore(paths: paths, relayCredentialVault: vault)
+    let endpointURL = try #require(URL(string: "wss://mac.example.test/app-server"))
+
+    var first = testWorkflowSnapshot(id: "first", title: "First")
+    first.relayEndpoints = [
+        AppServerRelayEndpoint(
+            id: HostID(rawValue: "paired-mac"),
+            name: "Paired Mac",
+            url: endpointURL,
+            bearerToken: "first-credential"
+        ),
+    ]
+    try await store.replaceWorkflowSnapshot(first)
+    let firstReference = try #require(
+        try await store.loadRelayEndpoints().first?.credentialReference
+    )
+
+    var second = testWorkflowSnapshot(id: "second", title: "Second")
+    second.relayEndpoints = [
+        AppServerRelayEndpoint(
+            id: HostID(rawValue: "paired-mac"),
+            name: "Paired Mac",
+            url: endpointURL,
+            bearerToken: "second-credential",
+            credentialReference: firstReference
+        ),
+    ]
+    try await store.replaceWorkflowSnapshot(second)
+    let secondEndpoint = try #require(try await store.loadRelayEndpoints().first)
+    #expect(secondEndpoint.bearerToken == "second-credential")
+    #expect(secondEndpoint.credentialReference != firstReference)
+
+    try await store.rollbackWorkflowSnapshot()
+    let restoredEndpoint = try #require(try await store.loadRelayEndpoints().first)
+    #expect(restoredEndpoint.credentialReference == firstReference)
+    #expect(restoredEndpoint.bearerToken == "first-credential")
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func relayCredentialRecoveryJournalRemovesPrePointerCrashCredential() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-relay-crash-recovery-tests-\(UUID().uuidString)", isDirectory: true)
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    let vault = TestRelayCredentialVault()
+    let setupStore = LocalControlRoomStore(paths: paths, relayCredentialVault: vault)
+    try await setupStore.replaceWorkflowSnapshot(testWorkflowSnapshot(id: "active", title: "Active"))
+
+    let orphanedReference = "relay:paired-mac:v:interrupted-before-pointer"
+    try vault.save("orphaned-credential", reference: orphanedReference)
+    try Data("{\"references\":[\"\(orphanedReference)\"]}".utf8).write(
+        to: directory.appendingPathComponent("relay-credential-recovery.json"),
+        options: [.atomic]
+    )
+
+    let recoveredStore = LocalControlRoomStore(paths: paths, relayCredentialVault: vault)
+    _ = try await recoveredStore.loadCanvas()
+
+    #expect(vault.credential(for: orphanedReference) == nil)
+    #expect(FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent("relay-credential-recovery.json").path
+    ) == false)
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func workflowSnapshotRollbackAtomicallyRestoresPreviousVersion() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-snapshot-rollback-tests-\(UUID().uuidString)", isDirectory: true)
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    let store = LocalControlRoomStore(paths: paths)
+
+    try await store.replaceWorkflowSnapshot(testWorkflowSnapshot(id: "first", title: "First"))
+    try await store.replaceWorkflowSnapshot(testWorkflowSnapshot(id: "second", title: "Second"))
+    #expect(try await store.loadCanvas().title == "Second")
+
+    try await store.rollbackWorkflowSnapshot()
+    #expect(try await store.activeWorkflowID() == "first")
+    #expect(try await store.loadCanvas().title == "First")
+
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let pointer = try decoder.decode(
+        WorkflowSnapshotPointer.self,
+        from: Data(contentsOf: paths.workflowSnapshotPointerURL)
+    )
+    #expect(pointer.rollbackSnapshotIDs.count <= 2)
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+func corruptRollbackSnapshotDoesNotChangeActivePointer() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-snapshot-corrupt-rollback-tests-\(UUID().uuidString)", isDirectory: true)
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    let store = LocalControlRoomStore(paths: paths)
+
+    try await store.replaceWorkflowSnapshot(testWorkflowSnapshot(id: "first", title: "First"))
+    try await store.replaceWorkflowSnapshot(testWorkflowSnapshot(id: "second", title: "Second"))
+
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let pointerDataBefore = try Data(contentsOf: paths.workflowSnapshotPointerURL)
+    let pointer = try decoder.decode(WorkflowSnapshotPointer.self, from: pointerDataBefore)
+    let rollbackID = try #require(pointer.rollbackSnapshotIDs.first)
+    try Data("{not-json".utf8).write(
+        to: paths.workflowSnapshotDirectory(for: rollbackID).appendingPathComponent("metadata.json"),
+        options: [.atomic]
+    )
+
+    var rejectedCorruption = false
+    do {
+        try await store.rollbackWorkflowSnapshot()
+    } catch is DecodingError {
+        rejectedCorruption = true
+    }
+
+    #expect(rejectedCorruption)
+    #expect(try Data(contentsOf: paths.workflowSnapshotPointerURL) == pointerDataBefore)
+    #expect(try await store.loadCanvas().title == "Second")
 
     try? FileManager.default.removeItem(at: directory)
 }
@@ -391,4 +663,16 @@ func workflowSnapshotRewritesMacLocalHostForIPhone() throws {
     #expect(rewrittenGraph.messageRoutes["route-1"]?.sourceHostID == macHostID)
     #expect(rewrittenGraph.messageRoutes["route-1"]?.targetHostID == macHostID)
     #expect(rewritten.workflowEvents.first?.hostID == macHostID)
+}
+
+private enum SnapshotInjectionError: Error {
+    case injected
+}
+
+private func testWorkflowSnapshot(id: String, title: String) -> WorkflowSnapshot {
+    let workflow = WorkflowRecord(id: id, name: title)
+    return WorkflowSnapshot(
+        library: WorkflowLibrarySnapshot(activeWorkflowID: id, workflows: [workflow]),
+        graphsByWorkflowID: [id: AgentGraph(title: title)]
+    )
 }

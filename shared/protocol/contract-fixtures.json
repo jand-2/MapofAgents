@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "contracts": [
+    {
+      "schema": "app-server.schema.json",
+      "valid": [
+        "fixtures/local-endpoint.json",
+        "fixtures/persisted-secure-endpoint.json",
+        "fixtures/app-server-request.json",
+        "fixtures/app-server-notification.json",
+        "fixtures/app-server-success-response.json",
+        "fixtures/app-server-error-response.json"
+      ],
+      "invalid": [
+        "fixtures/invalid/app-server-mixed-request-response.json",
+        "fixtures/invalid/app-server-response-with-result-and-error.json",
+        "fixtures/invalid/app-server-endpoint-with-protocol-fields.json"
+      ]
+    },
+    {
+      "schema": "graph.schema.json",
+      "valid": [
+        "fixtures/sample-graph.json",
+        "fixtures/sample-cross-platform-graph.json"
+      ],
+      "invalid": [
+        "fixtures/invalid/graph-with-unknown-metadata.json"
+      ]
+    },
+    {
+      "schema": "../workflow-events/workflow-event.schema.json",
+      "valid": [
+        "../workflow-events/fixtures/folder-created.json",
+        "../workflow-events/fixtures/thread-created.json",
+        "../workflow-events/fixtures/turn-completed.json"
+      ],
+      "invalid": [
+        "fixtures/invalid/workflow-event-with-unknown-field.json"
+      ]
+    }
+  ]
+}

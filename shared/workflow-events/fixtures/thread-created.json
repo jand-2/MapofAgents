@@ -1,0 +1,16 @@
+{
+  "id": "event-thread-created-1",
+  "source": "codex-hook",
+  "type": "thread.created",
+  "method": "thread/created",
+  "summary": "Created Example child",
+  "sourceHostID": "local",
+  "sourceThreadID": "source-thread",
+  "sourceTurnID": "turn-1",
+  "childHostID": "remote-example",
+  "childThreadID": "child-thread",
+  "cwd": "/Users/example/project",
+  "title": "Example child",
+  "kind": "thread",
+  "createdAt": "2026-05-28T10:16:30Z"
+}

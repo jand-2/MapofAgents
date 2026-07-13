@@ -1,72 +1,11 @@
 import MapofAgentsCore
 import SwiftUI
-import UniformTypeIdentifiers
 
 #if os(macOS)
 import AppKit
 #elseif os(iOS)
 import UIKit
 #endif
-
-enum TranscriptLoadPhase: Hashable {
-    case idle
-    case connectingHost
-    case loadingHistory
-    case hydratingArtifacts
-    case refreshing
-    case loadingOlder
-
-    var title: String {
-        switch self {
-        case .idle:
-            return "Ready"
-        case .connectingHost:
-            return "Checking host connection"
-        case .loadingHistory:
-            return "Loading message history"
-        case .hydratingArtifacts:
-            return "Hydrating artifacts"
-        case .refreshing:
-            return "Refreshing transcript"
-        case .loadingOlder:
-            return "Loading older messages"
-        }
-    }
-
-    var detail: String {
-        switch self {
-        case .idle:
-            return ""
-        case .connectingHost:
-            return "Waiting on the owning machine or App Server route."
-        case .loadingHistory:
-            return "Waiting on thread history from Codex App Server."
-        case .hydratingArtifacts:
-            return "Reading generated files, diffs, or images."
-        case .refreshing:
-            return "Keeping the last loaded messages visible."
-        case .loadingOlder:
-            return "Prepending an older transcript page."
-        }
-    }
-
-    var iconName: String {
-        switch self {
-        case .idle:
-            return "checkmark.circle"
-        case .connectingHost:
-            return "antenna.radiowaves.left.and.right"
-        case .loadingHistory:
-            return "text.bubble"
-        case .hydratingArtifacts:
-            return "shippingbox"
-        case .refreshing:
-            return "arrow.clockwise"
-        case .loadingOlder:
-            return "clock.arrow.circlepath"
-        }
-    }
-}
 
 private enum TranscriptRowCategory: String, CaseIterable, Identifiable, Hashable {
     case messages
@@ -339,18 +278,15 @@ struct ThreadPopoverView: View {
     var onOpenAutomation: () -> Void = {}
     var onClose: () -> Void
 
-    @State private var draft = ""
     @State private var isRenaming = false
     @State private var titleDraft = ""
     @State private var pendingOlderAnchorID: String?
     @State private var isArtifactsPresented = false
-    @State private var isSubmitting = false
-    @State private var pendingAttachments: [ChatInputAttachment] = []
-    @State private var isFileImporterPresented = false
-    @State private var attachmentError: String?
     @State private var activeRowCategories = Set(TranscriptRowCategory.allCases)
     @State private var currentUserMessageNavigationID: String?
     @State private var manualTranscriptNavigationStartedAt: Date?
+    @State private var isNearMessageBottom = true
+    @State private var hasUnseenLatestContent = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -366,7 +302,19 @@ struct ThreadPopoverView: View {
 
             Divider()
 
-            composer
+            ThreadPopoverComposerView(
+                node: node,
+                runtimeStore: runtimeStore,
+                threadIdentity: threadIdentity,
+                threadMentionCandidates: threadMentionCandidates,
+                isAwaitingResponse: isAwaitingResponse,
+                runStatus: headerRunStatus,
+                canStopTurn: canStopTurn,
+                isStoppingTurn: isStoppingTurn,
+                isFullScreen: isFullScreen,
+                onStopTurn: onStopTurn,
+                onSend: onSend
+            )
         }
         .background(popoverBackground)
         .overlay {
@@ -376,10 +324,6 @@ struct ThreadPopoverView: View {
             }
         }
         .shadow(color: .black.opacity(isFullScreen ? 0 : 0.18), radius: 18, x: 0, y: 10)
-        .task(id: mentionFileRoot ?? "") {
-            guard usesLocalMentionCatalog else { return }
-            await runtimeStore.refreshMentionCandidates(cwd: mentionFileRoot)
-        }
         .onAppear {
             resetPopoverStateForCurrentThread()
         }
@@ -393,19 +337,6 @@ struct ThreadPopoverView: View {
         .sheet(isPresented: $isArtifactsPresented) {
             ThreadArtifactsListView(attachments: threadArtifacts)
         }
-        .fileImporter(
-            isPresented: $isFileImporterPresented,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: true
-        ) { result in
-            switch result {
-            case .success(let urls):
-                appendFileAttachments(from: urls)
-            case .failure(let error):
-                attachmentError = error.localizedDescription
-            }
-        }
-        .modifier(ChatAttachmentPasteCommandModifier(onPaste: pasteAttachmentsFromClipboard))
     }
 
     private var threadIdentity: String {
@@ -484,6 +415,7 @@ struct ThreadPopoverView: View {
                     .help(automationHelp(threadAutomation))
                     .accessibilityLabel("Thread automation")
                     .accessibilityValue(automationHelp(threadAutomation))
+                    .minimumAccessibleHitTarget()
                 }
 
                 ThreadHeaderRunStatusPill(
@@ -513,6 +445,7 @@ struct ThreadPopoverView: View {
             .buttonStyle(.plain)
             .help(artifactsUnavailableReason ?? "Artifacts")
             .accessibilityLabel("Artifacts")
+            .minimumAccessibleHitTarget()
 
             Button(action: onRefresh) {
                 Image(systemName: "arrow.clockwise")
@@ -520,6 +453,7 @@ struct ThreadPopoverView: View {
             .buttonStyle(.plain)
             .help("Refresh")
             .accessibilityLabel("Refresh transcript")
+            .minimumAccessibleHitTarget()
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -527,6 +461,7 @@ struct ThreadPopoverView: View {
             .buttonStyle(.plain)
             .help("Close")
             .accessibilityLabel("Close chat")
+            .minimumAccessibleHitTarget()
         }
         .foregroundStyle(.secondary)
     }
@@ -571,6 +506,7 @@ struct ThreadPopoverView: View {
                     .buttonStyle(.plain)
                     .help(isRenaming ? "Save name" : "Rename")
                     .accessibilityLabel(isRenaming ? "Save thread name" : "Rename thread")
+                    .minimumAccessibleHitTarget()
                 }
 
                 Text(node.subtitle)
@@ -597,6 +533,7 @@ struct ThreadPopoverView: View {
                         .buttonStyle(.plain)
                         .help("Copy thread id")
                         .accessibilityLabel("Copy thread ID")
+                        .minimumAccessibleHitTarget()
                     }
                 }
             }
@@ -625,16 +562,7 @@ struct ThreadPopoverView: View {
         .frame(width: 28, height: 28)
         .help("Drag chat")
         .accessibilityLabel("Drag chat")
-    }
-
-    private var stopTurnUnavailableReason: String? {
-        if isStoppingTurn {
-            return "Stop request is already in progress."
-        }
-        if !canStopTurn {
-            return "This thread is not currently running or its machine is disconnected."
-        }
-        return nil
+        .minimumAccessibleHitTarget()
     }
 
     private var moveGesture: some Gesture {
@@ -655,10 +583,11 @@ struct ThreadPopoverView: View {
     }
 
     private var messageList: some View {
-        ScrollViewReader { proxy in
-            let navigationEntries = userMessageNavigationEntries
+        GeometryReader { viewportProxy in
+            ScrollViewReader { proxy in
+                let navigationEntries = userMessageNavigationEntries
 
-            ZStack(alignment: .leading) {
+                ZStack(alignment: .leading) {
                 ScrollView {
                     let messages = displayMessages
                     let timeline = displayTimeline
@@ -683,7 +612,9 @@ struct ThreadPopoverView: View {
 
                         if canLoadOlder {
                             FeedbackButton(
-                                unavailableReason: isLoadingOlder ? "Older messages are already loading." : nil,
+                                unavailableReason: isLoading
+                                    ? "Wait for the current transcript refresh to finish."
+                                    : (isLoadingOlder ? "Older messages are already loading." : nil),
                                 action: {
                                     pendingOlderAnchorID = filteredMessages.first?.id ?? messages.first?.id
                                     onLoadOlder()
@@ -705,27 +636,9 @@ struct ThreadPopoverView: View {
                         }
 
                         if let timeline, !timeline.turns.isEmpty {
-                            ForEach(timeline.turns) { turn in
-                                if let navigationMessageID = turn.items.first(where: { $0.message.role == .user })?.message.id {
-                                    ThreadUserMessageNavigationTarget(messageID: navigationMessageID) {
-                                        ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
-                                    }
-                                } else {
-                                    ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
-                                }
-                            }
+                            transcriptTimelineRows(timeline)
                         } else {
-                            ForEach(filteredMessages) { message in
-                                if message.role == .user {
-                                    ThreadUserMessageNavigationTarget(messageID: message.id) {
-                                        ThreadMessageRow(message: message)
-                                            .id(message.id)
-                                    }
-                                } else {
-                                    ThreadMessageRow(message: message)
-                                        .id(message.id)
-                                }
-                            }
+                            transcriptMessageRows(filteredMessages)
                         }
 
                         if activeRowCategories.contains(.messages), !liveAssistantText.isEmpty {
@@ -772,6 +685,16 @@ struct ThreadPopoverView: View {
                         Color.clear
                             .frame(height: 1)
                             .id(Self.messageBottomAnchorID)
+                            .background {
+                                GeometryReader { bottomProxy in
+                                    Color.clear.preference(
+                                        key: ThreadMessageBottomPreferenceKey.self,
+                                        value: bottomProxy.frame(
+                                            in: .named(ThreadUserMessageNavigationLayout.coordinateSpaceName)
+                                        ).maxY
+                                    )
+                                }
+                            }
                     }
                     .padding(.top, 14)
                     .padding(.trailing, 14)
@@ -801,17 +724,37 @@ struct ThreadPopoverView: View {
                     .padding(.leading, 2)
                     .padding(.vertical, 10)
                 }
-            }
-            .onChange(of: transcript?.messages.last?.id) { _, id in
-                guard let id else { return }
-                scrollToMessageEnd(id, with: proxy)
-            }
-            .onChange(of: messageListRevision) { _, _ in
-                scrollToBottom(with: proxy)
-            }
-            .onChange(of: liveAssistantText) { _, _ in
-                scrollToBottom(with: proxy)
-            }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if hasUnseenLatestContent {
+                        Button {
+                            manualTranscriptNavigationStartedAt = nil
+                            hasUnseenLatestContent = false
+                            scrollToBottom(with: proxy)
+                        } label: {
+                            Label("Jump to latest", systemImage: "arrow.down.to.line")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .padding(12)
+                        .accessibilityLabel("Jump to latest message")
+                        .minimumAccessibleHitTarget()
+                    }
+                }
+                .onPreferenceChange(ThreadMessageBottomPreferenceKey.self) { bottomY in
+                    let isNearBottom = bottomY <= viewportProxy.size.height + 96
+                    isNearMessageBottom = isNearBottom
+                    if isNearBottom {
+                        hasUnseenLatestContent = false
+                    }
+                }
+                .onChange(of: messageListRevision) { _, _ in
+                    if isNearMessageBottom {
+                        scrollToBottom(with: proxy)
+                    } else {
+                        hasUnseenLatestContent = true
+                    }
+                }
             .onChange(of: transcript?.messages.first?.id) { _, _ in
                 guard let anchorID = pendingOlderAnchorID else { return }
                 pendingOlderAnchorID = nil
@@ -819,12 +762,39 @@ struct ThreadPopoverView: View {
                     proxy.scrollTo(anchorID, anchor: .top)
                 }
             }
-            .onChange(of: isAwaitingResponse) { _, isAwaiting in
-                guard isAwaiting else { return }
-                scrollToBottom(with: proxy)
+                .task(id: threadIdentity) {
+                    isNearMessageBottom = true
+                    hasUnseenLatestContent = false
+                    scrollToBottom(with: proxy, animated: false)
+                }
             }
-            .task(id: threadIdentity) {
-                scrollToBottom(with: proxy, animated: false)
+        }
+    }
+
+    @ViewBuilder
+    private func transcriptTimelineRows(_ timeline: ThreadTurnTimeline) -> some View {
+        ForEach(timeline.turns) { turn in
+            if let navigationMessageID = turn.items.first(where: { $0.message.role == .user })?.message.id {
+                ThreadUserMessageNavigationTarget(messageID: navigationMessageID) {
+                    ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
+                }
+            } else {
+                ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func transcriptMessageRows(_ messages: [ThreadMessage]) -> some View {
+        ForEach(messages) { message in
+            if message.role == .user {
+                ThreadUserMessageNavigationTarget(messageID: message.id) {
+                    ThreadMessageRow(message: message)
+                        .id(message.id)
+                }
+            } else {
+                ThreadMessageRow(message: message)
+                    .id(message.id)
             }
         }
     }
@@ -986,15 +956,6 @@ struct ThreadPopoverView: View {
         return "\(threadIdentity)#\(messages)#artifacts:\(artifactRevision)#timeline:\(timeline)#live:\(liveAssistantText.count)#await:\(isAwaitingResponse)"
     }
 
-    private func scrollToMessageEnd(_ messageID: String, with proxy: ScrollViewProxy) {
-        guard pendingOlderAnchorID == nil else { return }
-        guard !isManualTranscriptNavigationActive else { return }
-        withAnimation(.snappy) {
-            proxy.scrollTo(messageID, anchor: .bottom)
-        }
-        scrollToBottom(with: proxy)
-    }
-
     private func scrollToBottom(with proxy: ScrollViewProxy, animated: Bool = true) {
         guard pendingOlderAnchorID == nil else { return }
         guard !isManualTranscriptNavigationActive else { return }
@@ -1064,161 +1025,6 @@ struct ThreadPopoverView: View {
         }
     }
 
-    private var composer: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 8) {
-                if let model = node.metadata.model {
-                    Label(model, systemImage: "cpu")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if let effort = node.metadata.reasoningEffort {
-                    Label(effort, systemImage: "dial.medium")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-            }
-
-            HStack(alignment: .bottom, spacing: 10) {
-                VStack(alignment: .leading, spacing: 8) {
-                    composerAttachmentToolbar
-
-                    if !pendingAttachments.isEmpty {
-                        pendingAttachmentTray
-                    }
-
-                    MentionComposerView(
-                        text: $draft,
-                        runtimeStore: runtimeStore,
-                        placeholder: "Message this thread",
-                        fileRoot: mentionFileRoot,
-                        extraCandidates: threadMentionCandidates,
-                        minLines: 3,
-                        maxLines: 8,
-                        isDisabled: isAwaitingResponse || isSubmitting,
-                        usesLocalMentionCatalog: usesLocalMentionCatalog,
-                        onSubmit: sendDraft
-                    )
-
-                    if let attachmentError {
-                        Text(attachmentError)
-                            .font(.caption2)
-                            .foregroundStyle(.red)
-                            .lineLimit(2)
-                    }
-                }
-
-                VStack(spacing: 8) {
-                    if showsStopTurnButton {
-                        stopTurnButton
-                    }
-
-                    FeedbackButton(
-                        unavailableReason: sendUnavailableReason,
-                        action: sendDraft
-                    ) {
-                        Image(systemName: "paperplane.fill")
-                            .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .help(sendUnavailableReason ?? "Send")
-                }
-            }
-        }
-        .padding(14)
-        #if os(iOS)
-        .padding(.bottom, isFullScreen ? 10 : 0)
-        #endif
-    }
-
-    private var showsStopTurnButton: Bool {
-        headerRunStatus == .running || canStopTurn || isStoppingTurn
-    }
-
-    private var stopTurnButton: some View {
-        FeedbackButton(
-            unavailableReason: stopTurnUnavailableReason,
-            action: onStopTurn
-        ) {
-            Image(systemName: isStoppingTurn ? "stop.circle" : "stop.fill")
-                .frame(width: 28, height: 28)
-        }
-        .buttonStyle(.bordered)
-        .foregroundStyle(.red)
-        .help(stopTurnUnavailableReason ?? "Stop running turn")
-        .accessibilityLabel(isStoppingTurn ? "Stopping turn" : "Stop running turn")
-    }
-
-    private var composerAttachmentToolbar: some View {
-        HStack(spacing: 8) {
-            Button {
-                isFileImporterPresented = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .frame(width: 18, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(isAwaitingResponse || isSubmitting)
-            .help("Attach files")
-            .accessibilityLabel("Attach files")
-
-            Button {
-                pasteAttachmentsFromClipboard()
-            } label: {
-                Image(systemName: "doc.on.clipboard")
-                    .frame(width: 18, height: 18)
-            }
-            .buttonStyle(.plain)
-            .disabled(isAwaitingResponse || isSubmitting)
-            .help("Paste screenshot or files")
-            .accessibilityLabel("Paste screenshot or files")
-
-            if !pendingAttachments.isEmpty {
-                Text("\(pendingAttachments.count) attached")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-        }
-    }
-
-    private var pendingAttachmentTray: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(pendingAttachments) { attachment in
-                    PendingChatAttachmentChip(
-                        attachment: attachment,
-                        onRemove: {
-                            pendingAttachments.removeAll { $0.id == attachment.id }
-                        }
-                    )
-                }
-            }
-            .padding(.vertical, 1)
-        }
-    }
-
-    private var mentionFileRoot: String? {
-        if let cwd = node.metadata.threadRef?.cwd {
-            return cwd
-        }
-        if node.subtitle.hasPrefix("/") {
-            return node.subtitle
-        }
-        return nil
-    }
-
-    private var usesLocalMentionCatalog: Bool {
-        guard let threadRef = node.metadata.threadRef else {
-            return true
-        }
-        return threadRef.hostID == runtimeStore.localHost.id
-    }
-
     private var threadArtifacts: [ThreadMessageAttachment] {
         (transcript?.primaryArtifactAttachments ?? [])
             .sorted {
@@ -1228,19 +1034,6 @@ struct ThreadPopoverView: View {
 
     private var artifactsUnavailableReason: String? {
         threadArtifacts.isEmpty ? "This thread has not produced any artifacts yet." : nil
-    }
-
-    private var sendUnavailableReason: String? {
-        if isAwaitingResponse {
-            return "This thread is still running. Wait for the current turn to finish."
-        }
-        if isSubmitting {
-            return "This message is still being sent."
-        }
-        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingAttachments.isEmpty {
-            return "Type a message or attach a file before sending."
-        }
-        return nil
     }
 
     private func saveRename() {
@@ -1255,30 +1048,6 @@ struct ThreadPopoverView: View {
         isRenaming = false
     }
 
-    private func sendDraft() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachments = pendingAttachments
-        guard (!text.isEmpty || !attachments.isEmpty), !isAwaitingResponse, !isSubmitting else { return }
-        let sendingIdentity = threadIdentity
-        draft = ""
-        pendingAttachments = []
-        attachmentError = nil
-        isSubmitting = true
-        Task {
-            let didSend = await onSend(text, attachments)
-            await MainActor.run {
-                guard sendingIdentity == threadIdentity else { return }
-                if !didSend, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    draft = text
-                }
-                if !didSend, pendingAttachments.isEmpty {
-                    pendingAttachments = attachments
-                }
-                isSubmitting = false
-            }
-        }
-    }
-
     private func copyThreadID(_ threadID: String) {
         #if os(macOS)
         NSPasteboard.general.clearContents()
@@ -1289,122 +1058,16 @@ struct ThreadPopoverView: View {
     }
 
     private func resetPopoverStateForCurrentThread() {
-        draft = ""
         isRenaming = false
         titleDraft = node.title
         pendingOlderAnchorID = nil
         isArtifactsPresented = false
-        isSubmitting = false
-        pendingAttachments = []
-        attachmentError = nil
         activeRowCategories = Set(TranscriptRowCategory.allCases)
+        isNearMessageBottom = true
+        hasUnseenLatestContent = false
+        manualTranscriptNavigationStartedAt = nil
     }
 
-    private func appendFileAttachments(from urls: [URL]) {
-        guard !urls.isEmpty else { return }
-        Task {
-            do {
-                let attachments = try await Self.attachments(from: urls)
-                await MainActor.run {
-                    pendingAttachments.append(contentsOf: attachments)
-                    attachmentError = nil
-                }
-            } catch {
-                await MainActor.run {
-                    attachmentError = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    private static func attachments(from urls: [URL]) async throws -> [ChatInputAttachment] {
-        try await Task.detached(priority: .utility) {
-            try urls.map { url in
-                let didStartAccessing = url.startAccessingSecurityScopedResource()
-                defer {
-                    if didStartAccessing {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-                }
-                let data = try Data(contentsOf: url)
-                try ChatInputAttachmentService.validateSize(data.count, name: url.lastPathComponent)
-                let mimeType = mimeType(for: url)
-                let name = ChatInputAttachmentService.sanitizedFileName(url.lastPathComponent)
-                return ChatInputAttachment(
-                    kind: ChatInputAttachmentService.kind(forFileName: name, mimeType: mimeType),
-                    name: name,
-                    mimeType: mimeType,
-                    sourcePath: url.isFileURL ? url.path : nil,
-                    data: data,
-                    byteCount: data.count
-                )
-            }
-        }.value
-    }
-
-    nonisolated private static func mimeType(for url: URL) -> String? {
-        if let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
-           let type = values.contentType {
-            return type.preferredMIMEType
-        }
-        return ChatInputAttachmentService.inferredMimeType(forFileName: url.lastPathComponent)
-    }
-
-    private func pasteAttachmentsFromClipboard() {
-        #if os(macOS)
-        var didAttach = false
-        if let objects = NSPasteboard.general.readObjects(
-            forClasses: [NSURL.self],
-            options: [.urlReadingFileURLsOnly: true]
-        ) as? [NSURL] {
-            let urls = objects.compactMap { $0 as URL }
-            if !urls.isEmpty {
-                didAttach = true
-                appendFileAttachments(from: urls)
-            }
-        }
-
-        if let image = NSImage(pasteboard: NSPasteboard.general),
-           let data = image.pngDataForChatAttachment {
-            let name = "screenshot-\(Int(Date().timeIntervalSince1970 * 1000)).png"
-            pendingAttachments.append(
-                ChatInputAttachment(
-                    kind: .image,
-                    name: name,
-                    mimeType: "image/png",
-                    data: data,
-                    byteCount: data.count
-                )
-            )
-            didAttach = true
-        }
-
-        if !didAttach {
-            attachmentError = "Clipboard does not contain a file or screenshot."
-        } else {
-            attachmentError = nil
-        }
-        #elseif os(iOS)
-        if let image = UIPasteboard.general.image,
-           let data = image.pngData() {
-            let name = "screenshot-\(Int(Date().timeIntervalSince1970 * 1000)).png"
-            pendingAttachments.append(
-                ChatInputAttachment(
-                    kind: .image,
-                    name: name,
-                    mimeType: "image/png",
-                    data: data,
-                    byteCount: data.count
-                )
-            )
-            attachmentError = nil
-        } else if let url = UIPasteboard.general.url, url.isFileURL {
-            appendFileAttachments(from: [url])
-        } else {
-            attachmentError = "Clipboard does not contain a file or screenshot."
-        }
-        #endif
-    }
 }
 
 private struct OlderMessagesButtonLabel: View {
@@ -1488,6 +1151,7 @@ private struct TranscriptFilterBar: View {
                 .buttonStyle(.plain)
                 .help("Show all transcript rows")
                 .accessibilityLabel("Show all transcript rows")
+                .minimumAccessibleHitTarget()
             } else {
                 Text("Messages, progress, thoughts, tools, artifacts, approvals, events")
                     .font(.caption2)
@@ -1642,71 +1306,6 @@ private struct ThreadHeaderRunStatusPill: View {
         return "\(label), updated \(formatter.localizedString(for: updatedAt, relativeTo: Date()))"
     }
 }
-
-private struct PendingChatAttachmentChip: View {
-    var attachment: ChatInputAttachment
-    var onRemove: () -> Void
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: attachment.kind == .image ? "photo" : "doc")
-                .foregroundStyle(attachment.kind == .image ? .blue : .secondary)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(attachment.name)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-
-                if let byteCount = attachment.byteCount {
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Button(action: onRemove) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.tertiary)
-            }
-            .buttonStyle(.plain)
-            .help("Remove attachment")
-            .accessibilityLabel("Remove \(attachment.name)")
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 7)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(.quaternary, lineWidth: 1)
-        }
-    }
-}
-
-private struct ChatAttachmentPasteCommandModifier: ViewModifier {
-    var onPaste: () -> Void
-
-    func body(content: Content) -> some View {
-        #if os(macOS)
-        content.onPasteCommand(of: [.fileURL, .image, .png, .jpeg, .tiff]) { _ in
-            onPaste()
-        }
-        #else
-        content
-        #endif
-    }
-}
-
-#if os(macOS)
-private extension NSImage {
-    var pngDataForChatAttachment: Data? {
-        guard let tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffRepresentation) else {
-            return nil
-        }
-        return bitmap.representation(using: .png, properties: [:])
-    }
-}
-#endif
 
 private struct PendingAssistantRow: View {
     var body: some View {
@@ -1903,7 +1502,7 @@ private struct ThreadUserMessageNavigationEntry: Identifiable, Hashable {
             let displayedAttachments = changedAttachments.isEmpty ? attachments : changedAttachments
             let names = displayedAttachments
                 .map { attachment in
-                    artifactFileName(attachment.sourcePath ?? attachment.cachedPath ?? attachment.title ?? attachment.kind.rawValue)
+                    ArtifactService.fileName(attachment.sourcePath ?? attachment.cachedPath ?? attachment.title ?? attachment.kind.rawValue)
                 }
                 .filter { !$0.isEmpty }
             let uniqueNames = names.reduce(into: [String]()) { partial, name in
@@ -1975,6 +1574,14 @@ private struct ThreadUserMessageNavigationAnchorPreferenceKey: PreferenceKey {
         nextValue: () -> [ThreadUserMessageNavigationAnchorPosition]
     ) {
         value.append(contentsOf: nextValue())
+    }
+}
+
+private struct ThreadMessageBottomPreferenceKey: PreferenceKey {
+    static let defaultValue = CGFloat.greatestFiniteMagnitude
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
@@ -2585,6 +2192,8 @@ private struct ThreadMessageRow: View {
                                         .frame(width: 18, height: 18)
                                 }
                                 .buttonStyle(.plain)
+                                .minimumAccessibleHitTarget()
+                                .accessibilityLabel("Copy assistant update")
                                 .help("Copy message")
                                 .disabled(message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
@@ -2637,6 +2246,8 @@ private struct ThreadMessageRow: View {
                                     .frame(width: 18, height: 18)
                             }
                             .buttonStyle(.plain)
+                            .minimumAccessibleHitTarget()
+                            .accessibilityLabel("Copy \(roleLabel.lowercased()) message")
                             .help("Copy message")
                             .disabled(message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
@@ -2989,7 +2600,7 @@ private struct ArtifactGalleryTile: View {
                 Spacer(minLength: 0)
             }
 
-            Text(attachment.title ?? artifactFileName(attachment.sourcePath ?? attachment.cachedPath ?? kindLabel))
+            Text(attachment.title ?? ArtifactService.fileName(attachment.sourcePath ?? attachment.cachedPath ?? kindLabel))
                 .font(.caption.weight(.semibold))
                 .lineLimit(2)
 
@@ -3041,7 +2652,7 @@ private struct ArtifactGalleryTile: View {
             return status
         }
         if let byteCount = attachment.byteCount {
-            return formattedBytes(byteCount)
+            return ArtifactService.formattedBytes(byteCount)
         }
         return attachment.sourcePath ?? "Ready"
     }
@@ -3106,7 +2717,7 @@ private struct ThreadImageAttachmentView: View {
             .padding(8)
             .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
             .task(id: attachment.cachedPath ?? attachment.sourcePath ?? attachment.id) {
-                loadImage()
+                await loadImage()
             }
             .sheet(isPresented: $isPreviewPresented) {
                 ThreadImagePreviewView(
@@ -3116,7 +2727,7 @@ private struct ThreadImageAttachmentView: View {
                     displayPath: displayPath,
                     onCopyImage: copyImage,
                     onCopyPath: copyPath,
-                    onSaveCopy: saveCopy
+                    onSaveCopy: { Task { await saveCopy() } }
                 )
             }
     }
@@ -3192,6 +2803,7 @@ private struct ThreadImageAttachmentView: View {
         }
         .buttonStyle(.plain)
         .help("Open larger preview")
+        .accessibilityLabel("Open \(attachment.title ?? "image") preview")
         .contextMenu {
             imageContextMenu
         }
@@ -3220,7 +2832,7 @@ private struct ThreadImageAttachmentView: View {
                 help: "Save a copy",
                 unavailableReason: resolvedURL == nil ? "The image has not been cached locally yet." : nil
             ) {
-                saveCopy()
+                Task { await saveCopy() }
             }
 
             Spacer(minLength: 0)
@@ -3272,6 +2884,8 @@ private struct ThreadImageAttachmentView: View {
                     }
                     .buttonStyle(.plain)
                     .help("Copy path")
+                    .accessibilityLabel("Copy image path")
+                    .minimumAccessibleHitTarget()
                 }
             }
         }
@@ -3301,7 +2915,7 @@ private struct ThreadImageAttachmentView: View {
 
         if resolvedURL != nil {
             Button {
-                saveCopy()
+                Task { await saveCopy() }
             } label: {
                 Label("Save Copy", systemImage: "square.and.arrow.down")
             }
@@ -3331,12 +2945,14 @@ private struct ThreadImageAttachmentView: View {
         return url
     }
 
-    private func loadImage() {
+    private func loadImage() async {
         guard let path = attachment.cachedPath else {
             platformImage = nil
             return
         }
-        platformImage = PlatformImage(contentsOfFile: path)
+        let decoded = await ArtifactService.shared.image(at: path)
+        guard !Task.isCancelled else { return }
+        platformImage = decoded?.image
     }
 
     private func copy(_ text: String, message: String) {
@@ -3377,18 +2993,15 @@ private struct ThreadImageAttachmentView: View {
         #endif
     }
 
-    private func saveCopy() {
+    private func saveCopy() async {
         guard let sourceURL = resolvedURL else { return }
 
         do {
-            let destinationDirectory = try destinationDirectory()
-            try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
-            let destinationURL = uniqueDestinationURL(in: destinationDirectory, preferredName: sourceURL.lastPathComponent)
-
-            if FileManager.default.fileExists(atPath: destinationURL.path) {
-                try FileManager.default.removeItem(at: destinationURL)
-            }
-            try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+            let destinationURL = try await ArtifactService.shared.saveCopy(
+                from: sourceURL,
+                preferredName: sourceURL.lastPathComponent
+            )
+            guard !Task.isCancelled else { return }
             actionMessage = "Saved \(destinationURL.lastPathComponent)"
 
             #if os(macOS)
@@ -3397,42 +3010,6 @@ private struct ThreadImageAttachmentView: View {
         } catch {
             actionMessage = "Save failed"
         }
-    }
-
-    private func destinationDirectory() throws -> URL {
-        #if os(macOS)
-        if let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
-            return downloads
-        }
-        #endif
-
-        return try FileManager.default.url(
-            for: .documentDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-    }
-
-    private func uniqueDestinationURL(in directory: URL, preferredName: String) -> URL {
-        let baseURL = directory.appendingPathComponent(preferredName.isEmpty ? "generated-image.png" : preferredName)
-        guard FileManager.default.fileExists(atPath: baseURL.path) else {
-            return baseURL
-        }
-
-        let name = baseURL.deletingPathExtension().lastPathComponent
-        let pathExtension = baseURL.pathExtension
-        for index in 2...999 {
-            let candidateName = pathExtension.isEmpty
-                ? "\(name)-\(index)"
-                : "\(name)-\(index).\(pathExtension)"
-            let candidateURL = directory.appendingPathComponent(candidateName)
-            if !FileManager.default.fileExists(atPath: candidateURL.path) {
-                return candidateURL
-            }
-        }
-
-        return directory.appendingPathComponent(UUID().uuidString).appendingPathExtension(pathExtension.isEmpty ? "png" : pathExtension)
     }
 
     private func platformImageView(_ image: PlatformImage) -> Image {
@@ -3517,7 +3094,7 @@ private struct ThreadFileAttachmentView: View {
                     Label(language, systemImage: "curlybraces")
                 }
                 if let byteCount = attachment.byteCount {
-                    Text(formattedBytes(byteCount))
+                    Text(ArtifactService.formattedBytes(byteCount))
                 }
             }
             .font(.caption2)
@@ -3548,7 +3125,7 @@ private struct ThreadFileAttachmentView: View {
                 help: "Save a copy",
                 unavailableReason: attachment.cachedPath == nil ? "The file is not cached locally yet." : nil
             ) {
-                saveCopy()
+                Task { await saveCopy() }
             }
 
             #if os(macOS)
@@ -3573,11 +3150,11 @@ private struct ThreadFileAttachmentView: View {
     }
 
     private var fileName: String {
-        artifactFileName(attachment.sourcePath ?? attachment.cachedPath ?? "File")
+        ArtifactService.fileName(attachment.sourcePath ?? attachment.cachedPath ?? "File")
     }
 
     private var fileIcon: String {
-        switch artifactPathExtension(attachment.sourcePath ?? attachment.cachedPath ?? "") {
+        switch ArtifactService.pathExtension(attachment.sourcePath ?? attachment.cachedPath ?? "") {
         case "swift", "js", "ts", "tsx", "jsx", "py", "rb", "go", "rs", "java", "kt", "sh", "zsh", "ps1":
             return "chevron.left.forwardslash.chevron.right"
         case "json", "yml", "yaml", "toml":
@@ -3594,7 +3171,7 @@ private struct ThreadFileAttachmentView: View {
     private var summaryText: String {
         if let status = attachment.status, !status.isEmpty {
             if let byteCount = attachment.byteCount {
-                return "\(status) - \(formattedBytes(byteCount))"
+                return "\(status) - \(ArtifactService.formattedBytes(byteCount))"
             }
             return status
         }
@@ -3612,18 +3189,16 @@ private struct ThreadFileAttachmentView: View {
         actionMessage = message
     }
 
-    private func saveCopy() {
+    private func saveCopy() async {
         guard let cachedPath = attachment.cachedPath else { return }
         let sourceURL = URL(fileURLWithPath: cachedPath)
 
         do {
-            let destinationDirectory = try artifactDestinationDirectory()
-            try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
-            let destinationURL = uniqueArtifactDestinationURL(in: destinationDirectory, preferredName: fileName)
-            if FileManager.default.fileExists(atPath: destinationURL.path) {
-                try FileManager.default.removeItem(at: destinationURL)
-            }
-            try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+            let destinationURL = try await ArtifactService.shared.saveCopy(
+                from: sourceURL,
+                preferredName: fileName
+            )
+            guard !Task.isCancelled else { return }
             actionMessage = "Saved \(destinationURL.lastPathComponent)"
             #if os(macOS)
             NSWorkspace.shared.activateFileViewerSelecting([destinationURL])
@@ -3783,6 +3358,9 @@ private struct ThreadArtifactsListView: View {
                         .frame(width: 24, height: 24)
                 }
                 .buttonStyle(.plain)
+                .help("Close")
+                .accessibilityLabel("Close artifacts")
+                .minimumAccessibleHitTarget()
             }
             .padding(14)
 
@@ -3914,7 +3492,7 @@ private struct ArtifactListRow: View {
     }
 
     private var titleFallback: String {
-        artifactFileName(attachment.sourcePath ?? attachment.cachedPath ?? attachment.kind.rawValue)
+        ArtifactService.fileName(attachment.sourcePath ?? attachment.cachedPath ?? attachment.kind.rawValue)
     }
 
     private var subtitle: String {
@@ -3933,6 +3511,7 @@ private struct ThreadArtifactPreviewView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var textPreview: String?
+    @State private var platformImage: PlatformImage?
     @State private var previewError: String?
 
     var body: some View {
@@ -3942,7 +3521,7 @@ private struct ThreadArtifactPreviewView: View {
                     .foregroundStyle(previewColor)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(attachment.title ?? artifactFileName(attachment.sourcePath ?? attachment.cachedPath ?? "Artifact"))
+                    Text(attachment.title ?? ArtifactService.fileName(attachment.sourcePath ?? attachment.cachedPath ?? "Artifact"))
                         .font(.headline)
                         .lineLimit(1)
 
@@ -3962,6 +3541,8 @@ private struct ThreadArtifactPreviewView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Copy")
+                .accessibilityLabel("Copy artifact preview")
+                .minimumAccessibleHitTarget()
 
                 Button {
                     dismiss()
@@ -3971,6 +3552,8 @@ private struct ThreadArtifactPreviewView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Close")
+                .accessibilityLabel("Close artifact preview")
+                .minimumAccessibleHitTarget()
             }
             .padding(14)
 
@@ -3982,7 +3565,7 @@ private struct ThreadArtifactPreviewView: View {
         .frame(minWidth: 680, minHeight: 520)
         #endif
         .task(id: attachment.cachedPath ?? attachment.id) {
-            await loadPreviewText()
+            await loadPreview()
         }
     }
 
@@ -3990,10 +3573,9 @@ private struct ThreadArtifactPreviewView: View {
     private var previewContent: some View {
         switch attachment.kind {
         case .image:
-            if let path = attachment.cachedPath ?? attachment.sourcePath,
-               let image = PlatformImage(contentsOfFile: path) {
+            if let platformImage {
                 ScrollView([.horizontal, .vertical]) {
-                    platformImageView(image)
+                    platformImageView(platformImage)
                         .resizable()
                         .scaledToFit()
                         .padding(16)
@@ -4045,6 +3627,20 @@ private struct ThreadArtifactPreviewView: View {
         }
     }
 
+    private func loadPreview() async {
+        if attachment.kind == .image {
+            guard let path = attachment.cachedPath ?? attachment.sourcePath else {
+                platformImage = nil
+                return
+            }
+            let decoded = await ArtifactService.shared.image(at: path)
+            guard !Task.isCancelled else { return }
+            platformImage = decoded?.image
+            return
+        }
+        await loadPreviewText()
+    }
+
     private func loadPreviewText() async {
         guard attachment.kind == .file else { return }
         guard let cachedPath = attachment.cachedPath else {
@@ -4052,21 +3648,7 @@ private struct ThreadArtifactPreviewView: View {
             return
         }
 
-        let loaded = await Task.detached(priority: .utility) { () -> String? in
-            let url = URL(fileURLWithPath: cachedPath)
-            guard let data = try? Data(contentsOf: url) else {
-                return nil
-            }
-            let maxBytes = 240_000
-            let previewData = data.count > maxBytes ? data.prefix(maxBytes) : data[...]
-            guard var text = String(data: Data(previewData), encoding: .utf8) else {
-                return nil
-            }
-            if data.count > maxBytes {
-                text += "\n\n... file truncated for preview ..."
-            }
-            return text
-        }.value
+        let loaded = await ArtifactService.shared.textPreview(at: cachedPath)
 
         if let loaded {
             textPreview = loaded
@@ -4208,6 +3790,8 @@ private struct ImageActionButton: View {
         }
         .buttonStyle(.plain)
         .help(unavailableReason ?? help)
+        .accessibilityLabel(help)
+        .minimumAccessibleHitTarget()
     }
 }
 
@@ -4259,6 +3843,8 @@ private struct ThreadImagePreviewView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Close")
+                .accessibilityLabel("Close image preview")
+                .minimumAccessibleHitTarget()
             }
             .padding(14)
 
@@ -4302,63 +3888,6 @@ private struct ThreadImagePreviewView: View {
         Image(systemName: "photo")
         #endif
     }
-}
-
-private func artifactFileName(_ path: String) -> String {
-    path
-        .split(whereSeparator: { $0 == "/" || $0 == "\\" })
-        .last
-        .map(String.init) ?? path
-}
-
-private func artifactPathExtension(_ path: String) -> String {
-    let name = artifactFileName(path)
-    guard let dotIndex = name.lastIndex(of: "."),
-          dotIndex < name.index(before: name.endIndex)
-    else {
-        return ""
-    }
-    return String(name[name.index(after: dotIndex)...]).lowercased()
-}
-
-private func formattedBytes(_ byteCount: Int) -> String {
-    ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file)
-}
-
-private func artifactDestinationDirectory() throws -> URL {
-    #if os(macOS)
-    if let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
-        return downloads
-    }
-    #endif
-
-    return try FileManager.default.url(
-        for: .documentDirectory,
-        in: .userDomainMask,
-        appropriateFor: nil,
-        create: true
-    )
-}
-
-private func uniqueArtifactDestinationURL(in directory: URL, preferredName: String) -> URL {
-    let baseURL = directory.appendingPathComponent(preferredName.isEmpty ? "artifact" : preferredName)
-    guard FileManager.default.fileExists(atPath: baseURL.path) else {
-        return baseURL
-    }
-
-    let name = baseURL.deletingPathExtension().lastPathComponent
-    let pathExtension = baseURL.pathExtension
-    for index in 2...999 {
-        let candidateName = pathExtension.isEmpty
-            ? "\(name)-\(index)"
-            : "\(name)-\(index).\(pathExtension)"
-        let candidateURL = directory.appendingPathComponent(candidateName)
-        if !FileManager.default.fileExists(atPath: candidateURL.path) {
-            return candidateURL
-        }
-    }
-
-    return directory.appendingPathComponent(UUID().uuidString)
 }
 
 #if os(macOS)

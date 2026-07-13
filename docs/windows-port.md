@@ -24,10 +24,11 @@ shared/
 ```
 
 `MapofAgents.Core` contains portable Windows-side models, presentation metrics,
-endpoint validation, local graph storage, pairing, remote tunnel helpers, and
-Codex App Server clients. `MapofAgents.Windows` contains the WinUI 3 shell and
-WebView2 graph renderer. The shared protocol folder provides schema and fixture
-contracts that can be used by both the Swift and C# clients.
+endpoint validation, local graph storage, legacy pairing compatibility helpers,
+remote tunnel helpers, and Codex App Server clients.
+`MapofAgents.Windows` contains the WinUI 3 shell and WebView2 graph renderer.
+The shared protocol folder provides schema and fixture contracts that can be
+used by both the Swift and C# clients.
 
 ## Build And Test On Windows
 
@@ -36,9 +37,9 @@ runtime, then run:
 
 ```powershell
 cd windows
-dotnet restore .\MapofAgents.Windows.sln
-dotnet test .\MapofAgents.Windows.sln
-dotnet build .\src\MapofAgents.Windows\MapofAgents.Windows.csproj -c Release -r win-x64 -p:Platform=x64
+dotnet restore .\MapofAgents.Windows.sln --locked-mode
+dotnet test .\tests\MapofAgents.Windows.Tests\MapofAgents.Windows.Tests.csproj -c Release --no-restore
+dotnet build .\src\MapofAgents.Windows\MapofAgents.Windows.csproj -c Release -r win-x64 -p:Platform=x64 --no-restore
 dotnet run --project .\src\MapofAgents.Windows\MapofAgents.Windows.csproj -c Release
 ```
 
@@ -53,7 +54,8 @@ The app stores its local graph at:
 - Renders the MapofAgents canvas through WebView2, including nodes, semantic
   edges, selection state, manual link source state, and dark-grid presentation.
 - Provides a WinUI 3 command surface with creation, search, arrange, health,
-  pairing, activity, workflow, subagent, feedback, and reading controls.
+  activity, workflow, subagent, feedback, and reading controls, plus an explicit
+  unavailable state for secure device enrollment.
 - Presents Mac-aligned operational rails, including machines, activity,
   attention requests, diagnostics, selection details, and the bottom-right
   Thread Inbox dock.
@@ -62,11 +64,22 @@ The app stores its local graph at:
 - Supports thread inbox summaries, workflow filters, search field styling, row
   actions, unread/live status, warning and empty states, and workflow
   membership presentation.
-- Handles App Server endpoint validation, local and remote pairing payloads,
-  signed bearer pairing, remote tunnel diagnostics, app-server readiness checks,
-  and token-redacted diagnostic reports.
+- Handles App Server endpoint validation, remote tunnel diagnostics, app-server
+  readiness checks, and token-redacted diagnostic reports.
+- Retains legacy pairing implementation pieces for protocol compatibility and
+  test coverage, but deliberately hides the pairing host and import panels.
+  Windows does not currently generate or consume secure device enrollment
+  codes.
 - Persists Windows-side graph and preference state under the user's application
   data folder.
+
+## Continuous Integration
+
+The repository's GitHub Actions workflow restores NuGet dependencies in locked
+mode, runs the Windows test project, and builds the WinUI client for Release
+`win-x64` on a Windows runner. Repository syntax, shared protocol contracts,
+public-safety scanning, Swift coverage, and the iOS Simulator build are gated in
+the same workflow. See `.github/workflows/ci.yml`.
 
 ## Packaging Status
 
@@ -86,8 +99,9 @@ and an update path such as App Installer or Microsoft Store distribution.
 The Windows client is now a real native companion app rather than a proof of
 life. Before a public Windows launch, the remaining release work is:
 
-- Wire Windows CI for restore, test, Release x64 build, and sensitive-string
-  scans.
+- Implement the same revocable, short-lived secure device enrollment model used
+  by the Apple clients before enabling Windows pairing controls.
 - Add signed installer/package generation and publishable release artifacts.
-- Run first-install, pairing, remote App Server, transcript, diagnostics,
-  update, and uninstall QA on clean Windows machines.
+- Run first-install, remote App Server, transcript, diagnostics, update, and
+  uninstall QA on clean Windows machines, then add pairing QA once secure
+  enrollment is implemented.

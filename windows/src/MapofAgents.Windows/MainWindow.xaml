@@ -577,9 +577,12 @@
 
                 <Button
                     x:Name="PairButton"
-                    Click="PairButton_Click"
+                    IsEnabled="False"
+                    Opacity="0.65"
                     Style="{StaticResource ToolbarPlainButtonStyle}"
-                    ToolTipService.ToolTip="Pair an iPhone with this Windows PC">
+                    AutomationProperties.Name="Secure device enrollment unavailable"
+                    AutomationProperties.HelpText="Secure device enrollment is not yet available on Windows."
+                    ToolTipService.ToolTip="Secure device enrollment is not yet available on Windows.">
                     <StackPanel Orientation="Horizontal" Spacing="7">
                         <Canvas
                             Width="15"
@@ -694,7 +697,7 @@
                                 RadiusX="0.2"
                                 RadiusY="0.2" />
                         </Canvas>
-                        <TextBlock Text="Pair" />
+                        <TextBlock Text="Secure device enrollment is not yet available on Windows." />
                     </StackPanel>
                 </Button>
             </StackPanel>
@@ -852,7 +855,7 @@
                         Spacing="1">
                         <TextBlock
                             x:Name="PairingHeaderTitleText"
-                            Text="Pair iPhone"
+                            Text="Secure device enrollment"
                             FontSize="16"
                             FontWeight="SemiBold" />
                         <TextBlock
@@ -871,6 +874,7 @@
                         ToolTipService.ToolTip="Refresh"
                         Width="24"
                         Height="24"
+                        Visibility="Collapsed"
                         Padding="0"
                         Background="#00FFFFFF"
                         BorderThickness="0">
@@ -903,7 +907,7 @@
                             Foreground="#0A84FF" />
                         <TextBlock
                             x:Name="PairingStatusText"
-                            Text="Starting pairing host"
+                            Text="Unavailable on Windows"
                             FontSize="12"
                             FontWeight="SemiBold"
                             Foreground="#0A84FF" />
@@ -918,7 +922,7 @@
                         CornerRadius="8">
                         <TextBlock
                             x:Name="PairingDetailText"
-                            Text="Preparing a short-lived pairing code for this Windows PC."
+                            Text="Secure device enrollment is not yet available on Windows."
                             FontSize="12"
                             FontWeight="SemiBold"
                             Foreground="#D7DCE5"
@@ -1018,7 +1022,6 @@
                             </ItemsControl>
                             <Button
                                 x:Name="CopyPairingUrlButton"
-                                Click="CopyPairingUrlButton_Click"
                                 HorizontalAlignment="Left"
                                 Style="{StaticResource ToolbarPrimaryButtonStyle}">
                                 <StackPanel
@@ -1675,11 +1678,14 @@
                                         <DataTemplate>
 	                                            <Button
 	                                                Click="NewThreadMentionSuggestionButton_Click"
+	                                                AutomationProperties.Name="{Binding AccessibilityLabel}"
+	                                                AutomationProperties.HelpText="Press Enter to insert this mention"
 	                                                HorizontalAlignment="Stretch"
 	                                                HorizontalContentAlignment="Stretch"
+	                                                IsTabStop="False"
 	                                                Margin="{Binding RowMargin}"
 	                                                Padding="{Binding RowPadding}"
-	                                                Background="#00FFFFFF"
+	                                                Background="{Binding RowBackgroundBrush}"
 	                                                BorderThickness="0">
 	                                                <Grid ColumnSpacing="{Binding ContentSpacing}">
 	                                                    <Grid.ColumnDefinitions>
@@ -3265,11 +3271,14 @@
                                         <DataTemplate>
 	                                            <Button
 	                                                Click="ThreadPopoverMentionSuggestionButton_Click"
+	                                                AutomationProperties.Name="{Binding AccessibilityLabel}"
+	                                                AutomationProperties.HelpText="Press Enter to insert this mention"
 	                                                HorizontalAlignment="Stretch"
 	                                                HorizontalContentAlignment="Stretch"
+	                                                IsTabStop="False"
 	                                                Margin="{Binding RowMargin}"
 	                                                Padding="{Binding RowPadding}"
-	                                                Background="#00FFFFFF"
+	                                                Background="{Binding RowBackgroundBrush}"
 	                                                BorderThickness="0">
 	                                                <Grid ColumnSpacing="{Binding ContentSpacing}">
 	                                                    <Grid.ColumnDefinitions>
@@ -8034,11 +8043,14 @@
                                                             <DataTemplate>
 	                                                                <Button
 	                                                                    Click="ReaderMentionSuggestionButton_Click"
+	                                                                    AutomationProperties.Name="{Binding AccessibilityLabel}"
+	                                                                    AutomationProperties.HelpText="Press Enter to insert this mention"
 	                                                                    HorizontalAlignment="Stretch"
 	                                                                    HorizontalContentAlignment="Stretch"
+	                                                                    IsTabStop="False"
 	                                                                    Margin="{Binding RowMargin}"
 	                                                                    Padding="{Binding RowPadding}"
-	                                                                    Background="#00FFFFFF"
+	                                                                    Background="{Binding RowBackgroundBrush}"
 	                                                                    BorderThickness="0">
 	                                                                    <Grid ColumnSpacing="{Binding ContentSpacing}">
 	                                                                        <Grid.ColumnDefinitions>

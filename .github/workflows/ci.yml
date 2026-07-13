@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-gates:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Repository syntax
+            os: macos-26
+            command: python3 script/ci_validate_repository.py
+          - name: Protocol contracts
+            os: ubuntu-24.04
+            command: python3 script/ci_validate_contracts.py
+          - name: Public-safety scan
+            os: ubuntu-24.04
+            command: python3 script/ci_sensitive_scan.py --self-test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Run ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+  swift:
+    name: macOS Swift build, tests, and coverage
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+      MAPOFAGENTS_MIN_CORE_LINE_COVERAGE: "50"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Confirm Xcode toolchain
+        run: xcodebuild -version
+      - name: Build, test, and enforce coverage baseline
+        run: script/ci_swift_coverage.sh
+
+  ios:
+    name: XcodeGen and generic iOS Simulator build
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+      XCODEGEN_VERSION: 2.45.4
+      XCODEGEN_COMMIT: 8d3d3476a69ae3e5d68e1adccc701c410c05eb36
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Build pinned XcodeGen
+        run: |
+          git clone --quiet --depth 1 --branch "$XCODEGEN_VERSION" https://github.com/yonaskolb/XcodeGen.git .generated/XcodeGen
+          test "$(git -C .generated/XcodeGen rev-parse HEAD)" = "$XCODEGEN_COMMIT"
+          swift build --package-path .generated/XcodeGen --configuration release --product xcodegen
+          .generated/XcodeGen/.build/release/xcodegen --version
+      - name: Generate iOS project
+        run: script/ios_project.sh
+      - name: Build generic iOS Simulator destination
+        env:
+          MAPOFAGENTS_SIM_DESTINATION: generic/platform=iOS Simulator
+        run: script/build_ios.sh sim
+
+  windows:
+    name: Windows locked restore, tests, and Release build
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.422
+      - name: Require committed NuGet lock files
+        shell: pwsh
+        run: |
+          $expected = @(
+            "windows/src/MapofAgents.Core/packages.lock.json",
+            "windows/src/MapofAgents.Windows/packages.lock.json",
+            "windows/tests/MapofAgents.Windows.Tests/packages.lock.json"
+          )
+          $missing = $expected | Where-Object { -not (Test-Path $_ -PathType Leaf) }
+          if ($missing.Count -ne 0) {
+            throw "Missing required NuGet lock files: $($missing -join ', ')"
+          }
+      - name: Restore exactly from lock files
+        run: dotnet restore windows/MapofAgents.Windows.sln --locked-mode --verbosity minimal
+      - name: Run Windows tests
+        run: dotnet test windows/tests/MapofAgents.Windows.Tests/MapofAgents.Windows.Tests.csproj --configuration Release --no-restore --verbosity normal
+      - name: Build Windows Release x64
+        run: dotnet build windows/src/MapofAgents.Windows/MapofAgents.Windows.csproj --configuration Release --runtime win-x64 -p:Platform=x64 --no-restore --verbosity normal
+      - name: Confirm restore did not mutate lock files
+        shell: pwsh
+        run: |
+          $changes = git status --porcelain -- "windows/**/packages.lock.json"
+          if ($changes) {
+            Write-Error "Locked restore changed NuGet lock files:`n$changes"
+            exit 1
+          }

@@ -71,6 +71,91 @@ public enum WorkflowSnapshotIntegrityError: LocalizedError, Equatable, Sendable 
     }
 }
 
+public struct WorkflowSnapshotPointer: Codable, Equatable, Sendable {
+    public static let currentFormatVersion = 1
+
+    public var formatVersion: Int
+    public var activeSnapshotID: String
+    public var rollbackSnapshotIDs: [String]
+
+    public init(
+        formatVersion: Int = Self.currentFormatVersion,
+        activeSnapshotID: String,
+        rollbackSnapshotIDs: [String] = []
+    ) {
+        self.formatVersion = formatVersion
+        self.activeSnapshotID = activeSnapshotID
+        self.rollbackSnapshotIDs = rollbackSnapshotIDs
+    }
+
+    public func validate() throws {
+        guard formatVersion == Self.currentFormatVersion else {
+            throw WorkflowSnapshotPersistenceError.unsupportedFormatVersion(formatVersion)
+        }
+        guard ApplicationPaths.isSafeSnapshotID(activeSnapshotID),
+              rollbackSnapshotIDs.allSatisfy(ApplicationPaths.isSafeSnapshotID) else {
+            throw WorkflowSnapshotPersistenceError.invalidManifest
+        }
+    }
+}
+
+public struct WorkflowSnapshotMetadata: Codable, Equatable, Sendable {
+    public static let currentFormatVersion = 1
+
+    public var formatVersion: Int
+    public var snapshotID: String
+    public var createdAt: Date
+
+    public init(
+        formatVersion: Int = Self.currentFormatVersion,
+        snapshotID: String,
+        createdAt: Date = Date()
+    ) {
+        self.formatVersion = formatVersion
+        self.snapshotID = snapshotID
+        self.createdAt = createdAt
+    }
+
+    public func validate(expectedSnapshotID: String) throws {
+        guard formatVersion == Self.currentFormatVersion else {
+            throw WorkflowSnapshotPersistenceError.unsupportedFormatVersion(formatVersion)
+        }
+        guard snapshotID == expectedSnapshotID,
+              ApplicationPaths.isSafeSnapshotID(snapshotID) else {
+            throw WorkflowSnapshotPersistenceError.invalidSnapshotMetadata
+        }
+    }
+}
+
+public enum WorkflowSnapshotPersistenceError: LocalizedError, Equatable, Sendable {
+    case invalidManifest
+    case invalidSnapshotMetadata
+    case unsupportedFormatVersion(Int)
+    case noRollbackAvailable
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidManifest:
+            return "The workflow snapshot pointer is invalid."
+        case .invalidSnapshotMetadata:
+            return "The workflow snapshot metadata does not match the selected snapshot."
+        case .unsupportedFormatVersion(let version):
+            return "Workflow snapshot format version \(version) is not supported."
+        case .noRollbackAvailable:
+            return "There is no previous workflow snapshot to restore."
+        }
+    }
+}
+
+public enum WorkflowSnapshotCommitStep: Equatable, Sendable {
+    case metadata
+    case library
+    case workflowGraph(String)
+    case workflowEvents
+    case relayEndpoints
+    case activatePointer
+}
+
 public struct WorkflowSnapshot: Codable, Hashable, Sendable {
     public var library: WorkflowLibrarySnapshot
     public var graphsByWorkflowID: [String: AgentGraph]
@@ -150,6 +235,18 @@ public struct ApplicationPaths: Sendable {
 
     public var workflowsDirectory: URL {
         applicationSupportDirectory.appendingPathComponent("workflows", isDirectory: true)
+    }
+
+    public var workflowSnapshotsDirectory: URL {
+        applicationSupportDirectory.appendingPathComponent("workflow-snapshots", isDirectory: true)
+    }
+
+    public var workflowSnapshotPointerURL: URL {
+        workflowSnapshotsDirectory.appendingPathComponent("current.json")
+    }
+
+    public func workflowSnapshotDirectory(for snapshotID: String) -> URL {
+        workflowSnapshotsDirectory.appendingPathComponent(snapshotID, isDirectory: true)
     }
 
     public var workflowLibraryURL: URL {
@@ -259,6 +356,12 @@ public struct ApplicationPaths: Sendable {
         return "~tx_\(hostDataCount)-\(base64URL(hostID))_\(threadDataCount)-\(base64URL(threadID))"
     }
 
+    public static func isSafeSnapshotID(_ value: String) -> Bool {
+        !value.isEmpty && value.count <= 128 && value.allSatisfy { character in
+            character.isASCII && (character.isLetter || character.isNumber || character == "-" || character == "_")
+        }
+    }
+
     private static func isLegacySafeFileComponent(_ value: String) -> Bool {
         guard !value.isEmpty else { return false }
         return value.allSatisfy { character in
@@ -280,16 +383,42 @@ public struct ApplicationPaths: Sendable {
 }
 
 public actor LocalControlRoomStore: ControlRoomStore {
+    private static let maximumRollbackSnapshots = 2
+
+    private struct RelayCredentialMutation {
+        var reference: String
+        var previousCredential: String?
+        var nextCredential: String?
+    }
+
+    private struct PreparedRelayCredentials {
+        var endpoints: [AppServerRelayEndpoint]
+        var mutations: [RelayCredentialMutation]
+    }
+
+    private struct RelayCredentialRecoveryJournal: Codable {
+        var references: [String]
+    }
+
     private let paths: ApplicationPaths
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private let relayCredentialVault: any AppServerRelayCredentialVault
+    private let snapshotFailureInjector: (@Sendable (WorkflowSnapshotCommitStep) throws -> Void)?
     private var cachedGraph: AgentGraph?
     private var cachedLibrary: WorkflowLibrarySnapshot?
+    private var didRecoverRelayCredentialJournal = false
 
-    public init(paths: ApplicationPaths) {
+    public init(
+        paths: ApplicationPaths,
+        relayCredentialVault: any AppServerRelayCredentialVault = KeychainAppServerRelayCredentialVault(),
+        snapshotFailureInjector: (@Sendable (WorkflowSnapshotCommitStep) throws -> Void)? = nil
+    ) {
         self.paths = paths
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
+        self.relayCredentialVault = relayCredentialVault
+        self.snapshotFailureInjector = snapshotFailureInjector
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
@@ -303,8 +432,11 @@ public actor LocalControlRoomStore: ControlRoomStore {
         let library = try ensureWorkflowLibrary()
         let workflowID = library.activeWorkflowID
 
-        let url = paths.workflowCanvasReadURL(for: workflowID)
+        let url = try workflowCanvasReadURL(for: workflowID)
         guard FileManager.default.fileExists(atPath: url.path) else {
+            if try loadSnapshotPointer() != nil {
+                throw WorkflowSnapshotIntegrityError.missingWorkflowGraph(workflowID)
+            }
             let graph = AgentGraph.starter(
                 localHostName: ProcessInfo.processInfo.hostName,
                 codexPath: LocalCodexDiscovery.findCodexExecutable()
@@ -321,7 +453,9 @@ public actor LocalControlRoomStore: ControlRoomStore {
     }
 
     public func applyCanvasPatch(_ patch: CanvasPatch) async throws -> AgentGraph {
-        var graph = try await loadCanvas()
+        var snapshot = try await loadWorkflowSnapshot()
+        let workflowID = snapshot.library.activeWorkflowID
+        var graph = try snapshot.graphsByWorkflowID[workflowID].requiredWorkflowGraph(workflowID)
 
         switch patch {
         case .replace(let replacement):
@@ -342,10 +476,11 @@ public actor LocalControlRoomStore: ControlRoomStore {
             graph.upsertMessageRoute(route)
         }
 
-        let library = try ensureWorkflowLibrary()
-        try writeCanvas(graph, workflowID: library.activeWorkflowID)
-        try updateActiveWorkflowTimestamp()
-        cachedGraph = graph
+        snapshot.graphsByWorkflowID[workflowID] = graph
+        if let index = snapshot.library.workflows.firstIndex(where: { $0.id == workflowID }) {
+            snapshot.library.workflows[index].updatedAt = Date()
+        }
+        try await replaceWorkflowSnapshot(snapshot)
         return graph
     }
 
@@ -368,19 +503,17 @@ public actor LocalControlRoomStore: ControlRoomStore {
 
     @discardableResult
     public func createWorkflow(name: String, graph: AgentGraph? = nil) async throws -> WorkflowRecord {
-        var library = try ensureWorkflowLibrary()
+        var snapshot = try await loadWorkflowSnapshot()
         let workflow = WorkflowRecord(name: sanitizedWorkflowName(name, fallback: "New Workflow"))
         let graph = graph ?? AgentGraph.starter(
             localHostName: ProcessInfo.processInfo.hostName,
             codexPath: LocalCodexDiscovery.findCodexExecutable()
         )
 
-        library.workflows.append(workflow)
-        library.activeWorkflowID = workflow.id
-        try writeCanvas(graph, workflowID: workflow.id)
-        try writeLibrary(library)
-        cachedLibrary = library
-        cachedGraph = graph
+        snapshot.library.workflows.append(workflow)
+        snapshot.library.activeWorkflowID = workflow.id
+        snapshot.graphsByWorkflowID[workflow.id] = graph
+        try await replaceWorkflowSnapshot(snapshot)
         return workflow
     }
 
@@ -391,64 +524,70 @@ public actor LocalControlRoomStore: ControlRoomStore {
     }
 
     public func selectWorkflow(id: String) async throws {
-        var library = try ensureWorkflowLibrary()
-        guard library.workflows.contains(where: { $0.id == id }) else {
+        var snapshot = try await loadWorkflowSnapshot()
+        guard snapshot.library.workflows.contains(where: { $0.id == id }),
+              snapshot.graphsByWorkflowID[id] != nil else {
             throw CocoaError(.fileNoSuchFile)
         }
 
-        library.activeWorkflowID = id
-        try writeLibrary(library)
-        cachedLibrary = library
-        cachedGraph = nil
+        snapshot.library.activeWorkflowID = id
+        try await replaceWorkflowSnapshot(snapshot)
     }
 
     @discardableResult
     public func renameWorkflow(id: String, name: String) async throws -> WorkflowRecord {
-        var library = try ensureWorkflowLibrary()
-        guard let index = library.workflows.firstIndex(where: { $0.id == id }) else {
+        var snapshot = try await loadWorkflowSnapshot()
+        guard let index = snapshot.library.workflows.firstIndex(where: { $0.id == id }) else {
             throw CocoaError(.fileNoSuchFile)
         }
 
-        library.workflows[index].name = sanitizedWorkflowName(name, fallback: library.workflows[index].name)
-        library.workflows[index].updatedAt = Date()
-        try writeLibrary(library)
-        cachedLibrary = library
-        return library.workflows[index]
+        snapshot.library.workflows[index].name = sanitizedWorkflowName(
+            name,
+            fallback: snapshot.library.workflows[index].name
+        )
+        snapshot.library.workflows[index].updatedAt = Date()
+        try await replaceWorkflowSnapshot(snapshot)
+        return snapshot.library.workflows[index]
     }
 
     public func deleteWorkflow(id: String) async throws -> WorkflowRecord {
-        var library = try ensureWorkflowLibrary()
-        guard library.workflows.count > 1 else {
+        var snapshot = try await loadWorkflowSnapshot()
+        guard snapshot.library.workflows.count > 1 else {
             throw CocoaError(.fileWriteUnknown)
         }
-        guard let index = library.workflows.firstIndex(where: { $0.id == id }) else {
+        guard let index = snapshot.library.workflows.firstIndex(where: { $0.id == id }) else {
             throw CocoaError(.fileNoSuchFile)
         }
 
-        let removed = library.workflows.remove(at: index)
-        try? FileManager.default.removeItem(at: paths.workflowCanvasURL(for: id))
-        let legacyURL = paths.legacyWorkflowCanvasURL(for: id)
-        if legacyURL != paths.workflowCanvasURL(for: id) {
-            try? FileManager.default.removeItem(at: legacyURL)
+        let removed = snapshot.library.workflows.remove(at: index)
+        snapshot.graphsByWorkflowID[id] = nil
+
+        if snapshot.library.activeWorkflowID == id {
+            snapshot.library.activeWorkflowID = snapshot.library.workflows[
+                max(0, min(index, snapshot.library.workflows.count - 1))
+            ].id
         }
 
-        if library.activeWorkflowID == id {
-            library.activeWorkflowID = library.workflows[max(0, min(index, library.workflows.count - 1))].id
-            cachedGraph = nil
-        }
-
-        try writeLibrary(library)
-        cachedLibrary = library
+        try await replaceWorkflowSnapshot(snapshot)
         return removed
     }
 
     public func loadWorkflowSnapshot() async throws -> WorkflowSnapshot {
+        if let pointer = try loadSnapshotPointer() {
+            var snapshot = try loadWorkflowSnapshot(
+                from: paths.workflowSnapshotDirectory(for: pointer.activeSnapshotID),
+                expectedSnapshotID: pointer.activeSnapshotID
+            )
+            snapshot.relayEndpoints = try resolveRelayCredentials(in: snapshot.relayEndpoints)
+            return snapshot
+        }
+
         let library = try ensureWorkflowLibrary()
         try library.validateWorkflowIDs()
         var graphsByWorkflowID: [String: AgentGraph] = [:]
 
         for workflow in library.workflows {
-            let url = paths.workflowCanvasReadURL(for: workflow.id)
+            let url = try workflowCanvasReadURL(for: workflow.id)
             if FileManager.default.fileExists(atPath: url.path) {
                 let data = try Data(contentsOf: url)
                 graphsByWorkflowID[workflow.id] = try decoder.decode(AgentGraph.self, from: data)
@@ -471,28 +610,107 @@ public actor LocalControlRoomStore: ControlRoomStore {
 
     public func replaceWorkflowSnapshot(_ snapshot: WorkflowSnapshot) async throws {
         try snapshot.validateForActivation()
-
         try ensureDirectories()
+        var securedSnapshot = snapshot
+        let preparedCredentials = try prepareRelayCredentials(in: snapshot.relayEndpoints)
+        securedSnapshot.relayEndpoints = preparedCredentials.endpoints
 
-        for workflow in snapshot.library.workflows {
-            let graph = try snapshot.graphsByWorkflowID[workflow.id].requiredWorkflowGraph(workflow.id)
-            try writeCanvas(graph, workflowID: workflow.id)
+        let currentSnapshot = try await loadWorkflowSnapshot()
+        let existingPointer = try loadSnapshotPointer()
+        let previousActiveID: String
+        var previousRollbackIDs: [String]
+
+        if let existingPointer {
+            previousActiveID = existingPointer.activeSnapshotID
+            previousRollbackIDs = existingPointer.rollbackSnapshotIDs
+        } else {
+            previousActiveID = try stageSnapshot(currentSnapshot)
+            previousRollbackIDs = []
         }
 
-        try writeLibrary(snapshot.library)
-        try await saveWorkflowEvents(snapshot.workflowEvents)
-        try await saveRelayEndpoints(snapshot.relayEndpoints)
+        let stagedSnapshotID: String
+        do {
+            stagedSnapshotID = try stageSnapshot(securedSnapshot)
+        } catch {
+            if existingPointer == nil {
+                try? FileManager.default.removeItem(at: paths.workflowSnapshotDirectory(for: previousActiveID))
+            }
+            throw error
+        }
+        let rollbackIDs = Self.boundedUniqueSnapshotIDs(
+            [previousActiveID] + previousRollbackIDs,
+            excluding: stagedSnapshotID
+        )
+        let pointer = WorkflowSnapshotPointer(
+            activeSnapshotID: stagedSnapshotID,
+            rollbackSnapshotIDs: rollbackIDs
+        )
+        let journalReferences = try allPersistedRelayCredentialReferences().union(
+            preparedCredentials.mutations.map(\.reference)
+        )
+
+        do {
+            try writeRelayCredentialRecoveryJournal(references: journalReferences)
+            try applyRelayCredentialMutations(preparedCredentials.mutations)
+            try snapshotFailureInjector?(.activatePointer)
+            try writeSnapshotPointer(pointer)
+        } catch let activationError {
+            try? FileManager.default.removeItem(at: paths.workflowSnapshotDirectory(for: stagedSnapshotID))
+            if existingPointer == nil {
+                try? FileManager.default.removeItem(at: paths.workflowSnapshotDirectory(for: previousActiveID))
+            }
+            finishRelayCredentialRecoveryIfPossible()
+            throw activationError
+        }
+
+        cachedLibrary = securedSnapshot.library
+        cachedGraph = securedSnapshot.graphsByWorkflowID[securedSnapshot.library.activeWorkflowID]
+        pruneUnreferencedSnapshots(keeping: Set([pointer.activeSnapshotID] + pointer.rollbackSnapshotIDs))
+        finishRelayCredentialRecoveryIfPossible()
+    }
+
+    public func rollbackWorkflowSnapshot() async throws {
+        guard let pointer = try loadSnapshotPointer(),
+              let rollbackID = pointer.rollbackSnapshotIDs.first else {
+            throw WorkflowSnapshotPersistenceError.noRollbackAvailable
+        }
+
+        let snapshot = try loadWorkflowSnapshot(
+            from: paths.workflowSnapshotDirectory(for: rollbackID),
+            expectedSnapshotID: rollbackID
+        )
+        let remainingRollbackIDs = Array(pointer.rollbackSnapshotIDs.dropFirst())
+        let nextPointer = WorkflowSnapshotPointer(
+            activeSnapshotID: rollbackID,
+            rollbackSnapshotIDs: Self.boundedUniqueSnapshotIDs(
+                [pointer.activeSnapshotID] + remainingRollbackIDs,
+                excluding: rollbackID
+            )
+        )
+        do {
+            try writeRelayCredentialRecoveryJournal(
+                references: try allPersistedRelayCredentialReferences()
+            )
+            try snapshotFailureInjector?(.activatePointer)
+            try writeSnapshotPointer(nextPointer)
+        } catch {
+            finishRelayCredentialRecoveryIfPossible()
+            throw error
+        }
 
         cachedLibrary = snapshot.library
         cachedGraph = snapshot.graphsByWorkflowID[snapshot.library.activeWorkflowID]
+        pruneUnreferencedSnapshots(keeping: Set([nextPointer.activeSnapshotID] + nextPointer.rollbackSnapshotIDs))
+        finishRelayCredentialRecoveryIfPossible()
     }
 
     public func loadWorkflowEvents() async throws -> [WorkflowEvent] {
         try ensureDirectories()
-        guard FileManager.default.fileExists(atPath: paths.workflowEventsURL.path) else {
+        let url = try workflowEventsURL()
+        guard FileManager.default.fileExists(atPath: url.path) else {
             return []
         }
-        let data = try Data(contentsOf: paths.workflowEventsURL)
+        let data = try Data(contentsOf: url)
         return try decoder.decode([WorkflowEvent].self, from: data)
     }
 
@@ -500,22 +718,56 @@ public actor LocalControlRoomStore: ControlRoomStore {
         try ensureDirectories()
         let recentEvents = Array(events.sorted { $0.createdAt > $1.createdAt }.prefix(200))
         let data = try encoder.encode(recentEvents)
-        try data.write(to: paths.workflowEventsURL, options: [.atomic])
+        try data.write(to: workflowEventsURL(), options: [.atomic])
     }
 
     public func loadRelayEndpoints() async throws -> [AppServerRelayEndpoint] {
         try ensureDirectories()
-        guard FileManager.default.fileExists(atPath: paths.relayEndpointsURL.path) else {
+        let url = try relayEndpointsURL()
+        guard FileManager.default.fileExists(atPath: url.path) else {
             return []
         }
-        let data = try Data(contentsOf: paths.relayEndpointsURL)
-        return try decoder.decode([AppServerRelayEndpoint].self, from: data)
+        let data = try Data(contentsOf: url)
+        let endpoints = try decoder.decode([AppServerRelayEndpoint].self, from: data)
+        let containsLegacyPlaintext = endpoints.contains { $0.bearerToken != nil }
+
+        // Older releases wrote the token into this JSON file. Move it into
+        // Keychain on first read and immediately sanitize the on-disk record.
+        if containsLegacyPlaintext {
+            let preparedCredentials = try prepareRelayCredentials(in: endpoints)
+            let journalReferences = try allPersistedRelayCredentialReferences().union(
+                preparedCredentials.mutations.map(\.reference)
+            )
+            do {
+                try writeRelayCredentialRecoveryJournal(references: journalReferences)
+                try applyRelayCredentialMutations(preparedCredentials.mutations)
+                try encoder.encode(preparedCredentials.endpoints).write(to: url, options: [.atomic])
+            } catch let migrationError {
+                finishRelayCredentialRecoveryIfPossible()
+                throw migrationError
+            }
+            finishRelayCredentialRecoveryIfPossible()
+            return preparedCredentials.endpoints
+        }
+        return try resolveRelayCredentials(in: endpoints)
     }
 
     public func saveRelayEndpoints(_ endpoints: [AppServerRelayEndpoint]) async throws {
         try ensureDirectories()
-        let data = try encoder.encode(endpoints)
-        try data.write(to: paths.relayEndpointsURL, options: [.atomic])
+        let url = try relayEndpointsURL()
+        let preparedCredentials = try prepareRelayCredentials(in: endpoints)
+        let journalReferences = try allPersistedRelayCredentialReferences().union(
+            preparedCredentials.mutations.map(\.reference)
+        )
+        do {
+            try writeRelayCredentialRecoveryJournal(references: journalReferences)
+            try applyRelayCredentialMutations(preparedCredentials.mutations)
+            try encoder.encode(preparedCredentials.endpoints).write(to: url, options: [.atomic])
+        } catch let persistenceError {
+            finishRelayCredentialRecoveryIfPossible()
+            throw persistenceError
+        }
+        finishRelayCredentialRecoveryIfPossible()
     }
 
     public func loadTranscript(for threadRef: ThreadRef) async throws -> ThreadTranscript? {
@@ -534,6 +786,194 @@ public actor LocalControlRoomStore: ControlRoomStore {
         try data.write(to: paths.transcriptURL(for: transcript.threadRef), options: [.atomic])
     }
 
+    private func prepareRelayCredentials(
+        in endpoints: [AppServerRelayEndpoint]
+    ) throws -> PreparedRelayCredentials {
+        var requestedCredentialsByReference: [String: String] = [:]
+        var mutations: [RelayCredentialMutation] = []
+        let securedEndpoints = try endpoints.map { endpoint in
+            guard let credential = endpoint.bearerToken else { return endpoint }
+            let baseReference = endpoint.credentialReference
+                ?? AppServerRelayEndpoint.defaultCredentialReference(for: endpoint.id)
+            if let existing = requestedCredentialsByReference[baseReference], existing != credential {
+                throw AppServerRelayCredentialVaultError.conflictingCredentials(baseReference)
+            }
+            requestedCredentialsByReference[baseReference] = credential
+
+            let existingCredential = try relayCredentialVault.load(reference: baseReference)
+            let targetReference: String
+            if existingCredential == credential {
+                targetReference = baseReference
+            } else if existingCredential == nil {
+                targetReference = baseReference
+            } else {
+                targetReference = Self.versionedCredentialReference(for: endpoint.id)
+            }
+
+            if targetReference != baseReference || existingCredential != credential {
+                mutations.append(
+                    RelayCredentialMutation(
+                        reference: targetReference,
+                        previousCredential: try relayCredentialVault.load(reference: targetReference),
+                        nextCredential: credential
+                    )
+                )
+            }
+            var secured = endpoint
+            secured.credentialReference = targetReference
+            return secured
+        }
+        return PreparedRelayCredentials(endpoints: securedEndpoints, mutations: mutations)
+    }
+
+    private static func versionedCredentialReference(for hostID: HostID) -> String {
+        "\(AppServerRelayEndpoint.defaultCredentialReference(for: hostID)):v:\(UUID().uuidString.lowercased())"
+    }
+
+    private func applyRelayCredentialMutations(_ mutations: [RelayCredentialMutation]) throws {
+        var applied: [RelayCredentialMutation] = []
+        do {
+            for mutation in mutations {
+                if let nextCredential = mutation.nextCredential {
+                    try relayCredentialVault.save(nextCredential, reference: mutation.reference)
+                } else {
+                    try relayCredentialVault.delete(reference: mutation.reference)
+                }
+                applied.append(mutation)
+            }
+        } catch let mutationError {
+            do {
+                try rollbackRelayCredentialMutations(applied)
+            } catch {
+                throw AppServerRelayCredentialVaultError.transactionRollbackFailed(
+                    error.localizedDescription
+                )
+            }
+            throw mutationError
+        }
+    }
+
+    private func rollbackRelayCredentialMutations(_ mutations: [RelayCredentialMutation]) throws {
+        for mutation in mutations.reversed() {
+            if let previousCredential = mutation.previousCredential {
+                try relayCredentialVault.save(previousCredential, reference: mutation.reference)
+            } else {
+                try relayCredentialVault.delete(reference: mutation.reference)
+            }
+        }
+    }
+
+    private func resolveRelayCredentials(
+        in endpoints: [AppServerRelayEndpoint]
+    ) throws -> [AppServerRelayEndpoint] {
+        try endpoints.map { endpoint in
+            if let legacyCredential = endpoint.bearerToken {
+                let reference = endpoint.credentialReference
+                    ?? AppServerRelayEndpoint.defaultCredentialReference(for: endpoint.id)
+                try relayCredentialVault.save(legacyCredential, reference: reference)
+                var migrated = endpoint
+                migrated.credentialReference = reference
+                return migrated
+            }
+
+            guard let reference = endpoint.credentialReference else { return endpoint }
+            return endpoint.resolvingBearerToken(try relayCredentialVault.load(reference: reference))
+        }
+    }
+
+    private func persistedRelayCredentialReferences(at url: URL) throws -> Set<String> {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        let endpoints = try decoder.decode(
+            [AppServerRelayEndpoint].self,
+            from: Data(contentsOf: url)
+        )
+        return Set(endpoints.compactMap(\.credentialReference))
+    }
+
+    private var relayCredentialRecoveryJournalURL: URL {
+        paths.applicationSupportDirectory.appendingPathComponent("relay-credential-recovery.json")
+    }
+
+    private func writeRelayCredentialRecoveryJournal(references: Set<String>) throws {
+        guard !references.isEmpty else {
+            try? FileManager.default.removeItem(at: relayCredentialRecoveryJournalURL)
+            return
+        }
+        let journal = RelayCredentialRecoveryJournal(references: references.sorted())
+        try encoder.encode(journal).write(to: relayCredentialRecoveryJournalURL, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: relayCredentialRecoveryJournalURL.path
+        )
+        didRecoverRelayCredentialJournal = false
+    }
+
+    private func finishRelayCredentialRecoveryIfPossible() {
+        do {
+            try recoverRelayCredentialJournalIfNeeded(force: true)
+        } catch {
+            // Keep the owner-only journal so the next store operation or app
+            // launch can deterministically finish cleanup.
+            didRecoverRelayCredentialJournal = false
+        }
+    }
+
+    private func recoverRelayCredentialJournalIfNeeded(force: Bool = false) throws {
+        guard force || !didRecoverRelayCredentialJournal else { return }
+        guard FileManager.default.fileExists(atPath: relayCredentialRecoveryJournalURL.path) else {
+            didRecoverRelayCredentialJournal = true
+            return
+        }
+
+        let journal = try decoder.decode(
+            RelayCredentialRecoveryJournal.self,
+            from: Data(contentsOf: relayCredentialRecoveryJournalURL)
+        )
+        let retainedReferences = try retainedRelayCredentialReferences()
+        for reference in journal.references where !retainedReferences.contains(reference) {
+            try relayCredentialVault.delete(reference: reference)
+        }
+        try FileManager.default.removeItem(at: relayCredentialRecoveryJournalURL)
+        didRecoverRelayCredentialJournal = true
+    }
+
+    private func retainedRelayCredentialReferences() throws -> Set<String> {
+        if let pointer = try loadSnapshotPointer() {
+            return try Set([pointer.activeSnapshotID] + pointer.rollbackSnapshotIDs).reduce(into: Set<String>()) {
+                result, snapshotID in
+                let url = try relayEndpointsURL(root: paths.workflowSnapshotDirectory(for: snapshotID))
+                result.formUnion(try persistedRelayCredentialReferences(at: url))
+            }
+        }
+        return try persistedRelayCredentialReferences(
+            at: paths.applicationSupportDirectory.appendingPathComponent("relay-endpoints.json")
+        )
+    }
+
+    private func allPersistedRelayCredentialReferences() throws -> Set<String> {
+        var references = try persistedRelayCredentialReferences(
+            at: paths.applicationSupportDirectory.appendingPathComponent("relay-endpoints.json")
+        )
+        guard FileManager.default.fileExists(atPath: paths.workflowSnapshotsDirectory.path) else {
+            return references
+        }
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: paths.workflowSnapshotsDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        for entry in entries {
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+                continue
+            }
+            let url = entry.appendingPathComponent("relay-endpoints.json")
+            if let snapshotReferences = try? persistedRelayCredentialReferences(at: url) {
+                references.formUnion(snapshotReferences)
+            }
+        }
+        return references
+    }
+
     private func ensureDirectories() throws {
         try FileManager.default.createDirectory(
             at: paths.applicationSupportDirectory,
@@ -547,12 +987,17 @@ public actor LocalControlRoomStore: ControlRoomStore {
             at: paths.transcriptsDirectory,
             withIntermediateDirectories: true
         )
+        try FileManager.default.createDirectory(
+            at: paths.workflowSnapshotsDirectory,
+            withIntermediateDirectories: true
+        )
+        try recoverRelayCredentialJournalIfNeeded()
     }
 
     private func writeCanvas(_ graph: AgentGraph, workflowID: String) throws {
         try ensureDirectories()
         let data = try encoder.encode(graph)
-        try data.write(to: paths.workflowCanvasURL(for: workflowID), options: [.atomic])
+        try data.write(to: workflowCanvasURL(for: workflowID), options: [.atomic])
     }
 
     private func ensureWorkflowLibrary() throws -> WorkflowLibrarySnapshot {
@@ -562,8 +1007,9 @@ public actor LocalControlRoomStore: ControlRoomStore {
 
         try ensureDirectories()
 
-        if FileManager.default.fileExists(atPath: paths.workflowLibraryURL.path) {
-            let data = try Data(contentsOf: paths.workflowLibraryURL)
+        let libraryURL = try workflowLibraryURL()
+        if FileManager.default.fileExists(atPath: libraryURL.path) {
+            let data = try Data(contentsOf: libraryURL)
             var library = try decoder.decode(WorkflowLibrarySnapshot.self, from: data)
             if library.workflows.isEmpty {
                 library = try createInitialLibrary()
@@ -578,6 +1024,10 @@ public actor LocalControlRoomStore: ControlRoomStore {
             return library
         }
 
+        if try loadSnapshotPointer() != nil {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
         let library = try createInitialLibrary()
         cachedLibrary = library
         return library
@@ -588,11 +1038,15 @@ public actor LocalControlRoomStore: ControlRoomStore {
         let workflow = WorkflowRecord(id: "main", name: "Main Workflow", createdAt: now, updatedAt: now)
         let library = WorkflowLibrarySnapshot(activeWorkflowID: workflow.id, workflows: [workflow])
 
-        if FileManager.default.fileExists(atPath: paths.canvasURL.path) {
-            if !FileManager.default.fileExists(atPath: paths.workflowCanvasURL(for: workflow.id).path) {
+        let stateRoot = try activeStateRoot()
+        let legacyCanvasURL = stateRoot == paths.applicationSupportDirectory ? paths.canvasURL : stateRoot.appendingPathComponent("canvas.json")
+
+        if FileManager.default.fileExists(atPath: legacyCanvasURL.path) {
+            let canvasURL = try workflowCanvasURL(for: workflow.id)
+            if !FileManager.default.fileExists(atPath: canvasURL.path) {
                 try FileManager.default.copyItem(
-                    at: paths.canvasURL,
-                    to: paths.workflowCanvasURL(for: workflow.id)
+                    at: legacyCanvasURL,
+                    to: canvasURL
                 )
             }
         } else {
@@ -610,7 +1064,7 @@ public actor LocalControlRoomStore: ControlRoomStore {
     private func writeLibrary(_ library: WorkflowLibrarySnapshot) throws {
         try ensureDirectories()
         let data = try encoder.encode(library)
-        try data.write(to: paths.workflowLibraryURL, options: [.atomic])
+        try data.write(to: workflowLibraryURL(), options: [.atomic])
     }
 
     private func updateActiveWorkflowTimestamp() throws {
@@ -621,6 +1075,211 @@ public actor LocalControlRoomStore: ControlRoomStore {
         library.workflows[index].updatedAt = Date()
         try writeLibrary(library)
         cachedLibrary = library
+    }
+
+    private func activeStateRoot() throws -> URL {
+        guard let pointer = try loadSnapshotPointer() else {
+            return paths.applicationSupportDirectory
+        }
+        return paths.workflowSnapshotDirectory(for: pointer.activeSnapshotID)
+    }
+
+    private func workflowLibraryURL(root: URL? = nil) throws -> URL {
+        let root = try root ?? activeStateRoot()
+        return root
+            .appendingPathComponent("workflows", isDirectory: true)
+            .appendingPathComponent("library.json")
+    }
+
+    private func workflowCanvasURL(for workflowID: String, root: URL? = nil) throws -> URL {
+        let root = try root ?? activeStateRoot()
+        return root
+            .appendingPathComponent("workflows", isDirectory: true)
+            .appendingPathComponent("\(ApplicationPaths.safeFileComponent(workflowID)).json")
+    }
+
+    private func legacyWorkflowCanvasURL(for workflowID: String, root: URL? = nil) throws -> URL {
+        let root = try root ?? activeStateRoot()
+        return root
+            .appendingPathComponent("workflows", isDirectory: true)
+            .appendingPathComponent("\(ApplicationPaths.legacySafeFileComponent(workflowID)).json")
+    }
+
+    private func workflowCanvasReadURL(for workflowID: String, root: URL? = nil) throws -> URL {
+        let primary = try workflowCanvasURL(for: workflowID, root: root)
+        if FileManager.default.fileExists(atPath: primary.path) {
+            return primary
+        }
+        let legacy = try legacyWorkflowCanvasURL(for: workflowID, root: root)
+        if legacy != primary, FileManager.default.fileExists(atPath: legacy.path) {
+            return legacy
+        }
+        return primary
+    }
+
+    private func workflowEventsURL(root: URL? = nil) throws -> URL {
+        let root = try root ?? activeStateRoot()
+        return root.appendingPathComponent("workflow-events.json")
+    }
+
+    private func relayEndpointsURL(root: URL? = nil) throws -> URL {
+        let root = try root ?? activeStateRoot()
+        return root.appendingPathComponent("relay-endpoints.json")
+    }
+
+    private func loadSnapshotPointer() throws -> WorkflowSnapshotPointer? {
+        guard FileManager.default.fileExists(atPath: paths.workflowSnapshotPointerURL.path) else {
+            return nil
+        }
+        let data = try Data(contentsOf: paths.workflowSnapshotPointerURL)
+        let pointer = try decoder.decode(WorkflowSnapshotPointer.self, from: data)
+        try pointer.validate()
+        return pointer
+    }
+
+    private func writeSnapshotPointer(_ pointer: WorkflowSnapshotPointer) throws {
+        try pointer.validate()
+        let data = try encoder.encode(pointer)
+        try data.write(to: paths.workflowSnapshotPointerURL, options: [.atomic])
+    }
+
+    private func stageSnapshot(_ snapshot: WorkflowSnapshot) throws -> String {
+        try snapshot.validateForActivation()
+
+        let snapshotID = UUID().uuidString
+        let stagingURL = paths.workflowSnapshotsDirectory
+            .appendingPathComponent(".staging-\(snapshotID)", isDirectory: true)
+        let finalURL = paths.workflowSnapshotDirectory(for: snapshotID)
+        let workflowsURL = stagingURL.appendingPathComponent("workflows", isDirectory: true)
+
+        try FileManager.default.createDirectory(at: workflowsURL, withIntermediateDirectories: true)
+        do {
+            try snapshotFailureInjector?(.metadata)
+            let metadata = WorkflowSnapshotMetadata(snapshotID: snapshotID)
+            try encoder.encode(metadata).write(
+                to: stagingURL.appendingPathComponent("metadata.json"),
+                options: [.atomic]
+            )
+
+            try snapshotFailureInjector?(.library)
+            try encoder.encode(snapshot.library).write(
+                to: workflowsURL.appendingPathComponent("library.json"),
+                options: [.atomic]
+            )
+
+            for workflow in snapshot.library.workflows {
+                let graph = try snapshot.graphsByWorkflowID[workflow.id].requiredWorkflowGraph(workflow.id)
+                try snapshotFailureInjector?(.workflowGraph(workflow.id))
+                try encoder.encode(graph).write(
+                    to: workflowsURL.appendingPathComponent(
+                        "\(ApplicationPaths.safeFileComponent(workflow.id)).json"
+                    ),
+                    options: [.atomic]
+                )
+            }
+
+            try snapshotFailureInjector?(.workflowEvents)
+            let recentEvents = Array(snapshot.workflowEvents.sorted { $0.createdAt > $1.createdAt }.prefix(200))
+            try encoder.encode(recentEvents).write(
+                to: stagingURL.appendingPathComponent("workflow-events.json"),
+                options: [.atomic]
+            )
+
+            try snapshotFailureInjector?(.relayEndpoints)
+            try encoder.encode(snapshot.relayEndpoints).write(
+                to: stagingURL.appendingPathComponent("relay-endpoints.json"),
+                options: [.atomic]
+            )
+
+            _ = try loadWorkflowSnapshot(from: stagingURL, expectedSnapshotID: snapshotID)
+            try FileManager.default.moveItem(at: stagingURL, to: finalURL)
+            return snapshotID
+        } catch {
+            try? FileManager.default.removeItem(at: stagingURL)
+            throw error
+        }
+    }
+
+    private func loadWorkflowSnapshot(
+        from root: URL,
+        expectedSnapshotID: String? = nil
+    ) throws -> WorkflowSnapshot {
+        if let expectedSnapshotID {
+            let metadataURL = root.appendingPathComponent("metadata.json")
+            let metadata = try decoder.decode(
+                WorkflowSnapshotMetadata.self,
+                from: Data(contentsOf: metadataURL)
+            )
+            try metadata.validate(expectedSnapshotID: expectedSnapshotID)
+        }
+
+        let library = try decoder.decode(
+            WorkflowLibrarySnapshot.self,
+            from: Data(contentsOf: try workflowLibraryURL(root: root))
+        )
+        try library.validateWorkflowIDs()
+
+        var graphsByWorkflowID: [String: AgentGraph] = [:]
+        for workflow in library.workflows {
+            let graphURL = try workflowCanvasReadURL(for: workflow.id, root: root)
+            guard FileManager.default.fileExists(atPath: graphURL.path) else {
+                throw WorkflowSnapshotIntegrityError.missingWorkflowGraph(workflow.id)
+            }
+            graphsByWorkflowID[workflow.id] = try decoder.decode(
+                AgentGraph.self,
+                from: Data(contentsOf: graphURL)
+            )
+        }
+
+        let eventsURL = try workflowEventsURL(root: root)
+        let workflowEvents: [WorkflowEvent]
+        if FileManager.default.fileExists(atPath: eventsURL.path) {
+            workflowEvents = try decoder.decode([WorkflowEvent].self, from: Data(contentsOf: eventsURL))
+        } else {
+            workflowEvents = []
+        }
+
+        let endpointsURL = try relayEndpointsURL(root: root)
+        let relayEndpoints: [AppServerRelayEndpoint]
+        if FileManager.default.fileExists(atPath: endpointsURL.path) {
+            relayEndpoints = try decoder.decode([AppServerRelayEndpoint].self, from: Data(contentsOf: endpointsURL))
+        } else {
+            relayEndpoints = []
+        }
+
+        let snapshot = WorkflowSnapshot(
+            library: library,
+            graphsByWorkflowID: graphsByWorkflowID,
+            workflowEvents: workflowEvents,
+            relayEndpoints: relayEndpoints
+        )
+        try snapshot.validateForActivation()
+        return snapshot
+    }
+
+    private static func boundedUniqueSnapshotIDs(
+        _ ids: [String],
+        excluding excludedID: String
+    ) -> [String] {
+        var seen = Set([excludedID])
+        return ids.filter { seen.insert($0).inserted }
+            .prefix(maximumRollbackSnapshots)
+            .map(\.self)
+    }
+
+    private func pruneUnreferencedSnapshots(keeping retainedIDs: Set<String>) {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: paths.workflowSnapshotsDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        for url in contents where url.lastPathComponent != paths.workflowSnapshotPointerURL.lastPathComponent {
+            guard retainedIDs.contains(url.lastPathComponent) == false else { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     private func sanitizedWorkflowName(_ name: String, fallback: String) -> String {

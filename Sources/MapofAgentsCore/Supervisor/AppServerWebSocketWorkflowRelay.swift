@@ -1,22 +1,72 @@
 import Foundation
 
+public struct AppServerAccessToken: Equatable, Sendable {
+    public var value: String
+    public var expiresAt: Date?
+
+    public init(value: String, expiresAt: Date? = nil) {
+        self.value = value
+        self.expiresAt = expiresAt
+    }
+}
+
+public protocol AppServerAccessTokenProviding: Sendable {
+    func accessToken() async throws -> AppServerAccessToken?
+}
+
+enum AppServerAccessTokenExpiryPolicy {
+    static func delay(until expiresAt: Date, now: Date = Date()) -> TimeInterval {
+        max(0, expiresAt.timeIntervalSince(now))
+    }
+
+    static func applies(
+        expectedConnectionID: AppServerConnectionID,
+        currentConnectionID: AppServerConnectionID?
+    ) -> Bool {
+        expectedConnectionID == currentConnectionID
+    }
+}
+
+enum AppServerRelayConnectionPhase: Equatable, Sendable {
+    case stopped
+    case disconnected
+    case connecting
+    case connected
+}
+
+struct AppServerRelayConnectionSnapshot: Equatable, Sendable {
+    var phase: AppServerRelayConnectionPhase
+    var connectionID: AppServerConnectionID?
+    var hasWebSocket: Bool
+}
+
 public struct AppServerRelayEndpoint: Codable, Identifiable, Hashable, Sendable {
     public var id: HostID
     public var name: String
     public var url: URL
     public var bearerToken: String?
+    public var credentialReference: String?
 
-    public init(id: HostID, name: String, url: URL, bearerToken: String? = nil) {
+    public init(
+        id: HostID,
+        name: String,
+        url: URL,
+        bearerToken: String? = nil,
+        credentialReference: String? = nil
+    ) {
         self.id = id
         self.name = name
         self.url = url
         self.bearerToken = bearerToken?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.credentialReference = credentialReference?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? (self.bearerToken == nil ? nil : Self.defaultCredentialReference(for: id))
     }
 
     public init?(machine: SupervisorMachine) {
         guard machine.status == .connected,
               let url = URL(string: machine.endpointDescription),
-              Self.isAppServerWebSocketURL(url) else {
+              Self.isAppServerWebSocketURL(url),
+              Self.endpointStructureError(url) == nil else {
             return nil
         }
 
@@ -38,6 +88,9 @@ public struct AppServerRelayEndpoint: Codable, Identifiable, Hashable, Sendable 
         guard isAppServerWebSocketURL(url) else {
             return "Codex App Server endpoints must use ws:// or wss://."
         }
+        if let structureError = endpointStructureError(url) {
+            return structureError
+        }
 
         let token = bearerToken?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         let scheme = url.scheme?.lowercased()
@@ -57,6 +110,22 @@ public struct AppServerRelayEndpoint: Codable, Identifiable, Hashable, Sendable 
         return nil
     }
 
+    static func endpointStructureError(_ url: URL) -> String? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return "The Codex App Server endpoint is malformed."
+        }
+        if components.user != nil || components.password != nil {
+            return "WebSocket endpoint credentials must be supplied through the protected bearer-token field, not URL user-info."
+        }
+        if components.query != nil {
+            return "WebSocket endpoint query parameters are not supported; supply credentials through the protected bearer-token field."
+        }
+        if components.fragment != nil {
+            return "WebSocket endpoint fragments are not supported."
+        }
+        return nil
+    }
+
     public static func isLoopbackWebSocketURL(_ url: URL) -> Bool {
         guard isAppServerWebSocketURL(url),
               let host = url.host()?.trimmingCharacters(in: CharacterSet(charactersIn: "[]")),
@@ -72,19 +141,23 @@ public struct AppServerRelayEndpoint: Codable, Identifiable, Hashable, Sendable 
         case name
         case url
         case bearerToken
+        case credentialReference
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try container.decode(HostID.self, forKey: .id)
         let decodedToken = try container.decodeIfPresent(String.self, forKey: .bearerToken)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
         let token = decodedToken == Self.redactedBearerTokenPlaceholder ? nil : decodedToken
         self.init(
-            id: try container.decode(HostID.self, forKey: .id),
+            id: id,
             name: try container.decode(String.self, forKey: .name),
             url: try container.decode(URL.self, forKey: .url),
-            bearerToken: token
+            bearerToken: token,
+            credentialReference: try container.decodeIfPresent(String.self, forKey: .credentialReference)
+                ?? (token == nil ? nil : Self.defaultCredentialReference(for: id))
         )
     }
 
@@ -93,12 +166,24 @@ public struct AppServerRelayEndpoint: Codable, Identifiable, Hashable, Sendable 
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
         try container.encode(url, forKey: .url)
-        if bearerToken?.isEmpty == false {
-            try container.encode(Self.redactedBearerTokenPlaceholder, forKey: .bearerToken)
-        }
+        try container.encodeIfPresent(credentialReference, forKey: .credentialReference)
     }
 
     private static let redactedBearerTokenPlaceholder = "__redacted__"
+
+    public static func defaultCredentialReference(for id: HostID) -> String {
+        "relay:\(id.rawValue)"
+    }
+
+    public func resolvingBearerToken(_ token: String?) -> AppServerRelayEndpoint {
+        AppServerRelayEndpoint(
+            id: id,
+            name: name,
+            url: url,
+            bearerToken: token,
+            credentialReference: credentialReference
+        )
+    }
 }
 
 public struct AppServerTranscriptLoadResult: Sendable {
@@ -111,17 +196,75 @@ public struct AppServerTranscriptLoadResult: Sendable {
     }
 }
 
+public struct AppServerWriteReconciliation: Sendable {
+    public var hostID: HostID
+    public var method: AppServerMethod
+    public var confirmedCommitted: Bool
+    public var affectedThreadRefs: [ThreadRef]
+    public var observedCatalogEntries: [ThreadCatalogEntry]
+    public var transcript: ThreadTranscript?
+
+    public init(
+        hostID: HostID,
+        method: AppServerMethod,
+        confirmedCommitted: Bool,
+        affectedThreadRefs: [ThreadRef] = [],
+        observedCatalogEntries: [ThreadCatalogEntry] = [],
+        transcript: ThreadTranscript? = nil
+    ) {
+        self.hostID = hostID
+        self.method = method
+        self.confirmedCommitted = confirmedCommitted
+        self.affectedThreadRefs = affectedThreadRefs
+        self.observedCatalogEntries = observedCatalogEntries
+        self.transcript = transcript
+    }
+}
+
+struct AppServerReconciliationObservation: Sendable {
+    var call: AppServerCall
+    var result: JSONValue
+}
+
 public actor AppServerWebSocketWorkflowRelay {
+    private enum ConnectionState: Equatable {
+        case stopped
+        case disconnected
+        case connecting(AppServerConnectionID)
+        case connected(AppServerConnectionID)
+
+        var connectionID: AppServerConnectionID? {
+            switch self {
+            case .connecting(let connectionID), .connected(let connectionID):
+                return connectionID
+            case .stopped, .disconnected:
+                return nil
+            }
+        }
+
+        var isStarted: Bool {
+            self != .stopped
+        }
+
+        var isConnected: Bool {
+            if case .connected = self { return true }
+            return false
+        }
+    }
+
     private let endpoint: AppServerRelayEndpoint
     private let supervisor: WorkflowSupervisor
+    private let accessTokenProvider: (any AppServerAccessTokenProviding)?
+    private let attachmentStagingRoot: String?
+    private let webSocketTaskFactory: @Sendable (URLRequest) -> URLSessionWebSocketTask
+    private let session = AppServerSession()
+    private var connectionState: ConnectionState = .stopped
+    private var connectionTask: Task<Bool, Never>?
     private var webSocketTask: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
+    private var accessTokenExpiryTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
-    private var nextRequestID = 1
-    private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
-    private var isStarted = false
-    private var isConnected = false
     private var desiredThreads: [String: ThreadRef] = [:]
     private var workflowDesiredThreads: [String: ThreadRef] = [:]
     private var subscriptionOwners: [String: [String: ThreadRef]] = [:]
@@ -137,28 +280,95 @@ public actor AppServerWebSocketWorkflowRelay {
     private let onAttentionResolved: (@Sendable (HostID, String) -> Void)?
     private let onNotification: (@Sendable (HostID, CodexServerNotification) -> Void)?
     private let onDisconnected: (@Sendable (HostID) -> Void)?
+    private let onWriteReconciled: (@Sendable (AppServerWriteReconciliation) -> Void)?
+
+    private var connectionID: AppServerConnectionID? {
+        connectionState.connectionID
+    }
+
+    private var isStarted: Bool {
+        connectionState.isStarted
+    }
+
+    private var isConnected: Bool {
+        connectionState.isConnected
+    }
 
     public init(
         endpoint: AppServerRelayEndpoint,
         supervisor: WorkflowSupervisor,
+        accessTokenProvider: (any AppServerAccessTokenProviding)? = nil,
+        attachmentStagingRoot: String? = nil,
+        webSocketTaskFactory: @escaping @Sendable (URLRequest) -> URLSessionWebSocketTask = {
+            URLSession.shared.webSocketTask(with: $0)
+        },
         reportsConnectionFailures: Bool = true,
         onAttentionRequest: (@Sendable (RuntimeAttentionRequest) -> Void)? = nil,
         onAttentionResolved: (@Sendable (HostID, String) -> Void)? = nil,
         onNotification: (@Sendable (HostID, CodexServerNotification) -> Void)? = nil,
-        onDisconnected: (@Sendable (HostID) -> Void)? = nil
+        onDisconnected: (@Sendable (HostID) -> Void)? = nil,
+        onWriteReconciled: (@Sendable (AppServerWriteReconciliation) -> Void)? = nil
     ) {
         self.endpoint = endpoint
         self.supervisor = supervisor
+        self.accessTokenProvider = accessTokenProvider
+        self.attachmentStagingRoot = attachmentStagingRoot?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        self.webSocketTaskFactory = webSocketTaskFactory
         self.reportsConnectionFailures = reportsConnectionFailures
         self.onAttentionRequest = onAttentionRequest
         self.onAttentionResolved = onAttentionResolved
         self.onNotification = onNotification
         self.onDisconnected = onDisconnected
+        self.onWriteReconciled = onWriteReconciled
     }
 
     public func start() async -> Bool {
-        guard !isStarted else { return isConnected }
-        isStarted = true
+        if !isStarted {
+            connectionState = .disconnected
+        }
+        return await connectIfNeeded()
+    }
+
+    private func connectIfNeeded() async -> Bool {
+        guard isStarted else { return false }
+        if isConnected {
+            return true
+        }
+        if let connectionTask {
+            let expectedConnectionID = connectionID
+            let didConnect = await connectionTask.value
+            guard isStarted,
+                  self.connectionID == expectedConnectionID,
+                  !Task.isCancelled else {
+                return false
+            }
+            return didConnect && isConnected
+        }
+
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        let connectionID = AppServerConnectionID()
+        connectionState = .connecting(connectionID)
+        let task = Task { [weak self] in
+            await self?.performConnectionAttempt(connectionID: connectionID) ?? false
+        }
+        connectionTask = task
+        let didConnect = await task.value
+        let attemptIsCurrent = isCurrentConnectionAttempt(connectionID)
+        if self.connectionID == connectionID || self.connectionID == nil {
+            connectionTask = nil
+        }
+        return didConnect && attemptIsCurrent && isConnected
+    }
+
+    private func performConnectionAttempt(connectionID: AppServerConnectionID) async -> Bool {
+        guard isStarted, self.connectionID == connectionID, !Task.isCancelled else {
+            return false
+        }
+
+        closeSocket(connectionID: nil, invalidateConnection: false)
 
         await supervisor.upsertMachine(
             SupervisorMachine(
@@ -169,30 +379,55 @@ public actor AppServerWebSocketWorkflowRelay {
             )
         )
 
-        return await connectWebSocket()
+        guard isCurrentConnectionAttempt(connectionID) else {
+            return false
+        }
+
+        let didConnect = await connectWebSocket(connectionID: connectionID)
+        return didConnect && isCurrentConnectionAttempt(connectionID) && isConnected
     }
 
-    private func connectWebSocket() async -> Bool {
-        if let securityError = endpoint.connectionSecurityError {
-            await markFailed(CodexAppServerError.transport(securityError))
+    private func connectWebSocket(connectionID: AppServerConnectionID) async -> Bool {
+        guard isCurrentConnectionAttempt(connectionID) else { return false }
+        let accessToken: AppServerAccessToken?
+        do {
+            accessToken = try await accessTokenProvider?.accessToken()
+                ?? endpoint.bearerToken.map { AppServerAccessToken(value: $0) }
+        } catch {
+            guard isCurrentConnectionAttempt(connectionID) else { return false }
+            await markFailed(error, connectionID: connectionID)
+            return false
+        }
+        guard isCurrentConnectionAttempt(connectionID) else { return false }
+        let bearerToken = accessToken?.value
+        if let securityError = AppServerRelayEndpoint.connectionSecurityError(
+            url: endpoint.url,
+            bearerToken: bearerToken
+        ) {
+            await markFailed(CodexAppServerError.transport(securityError), connectionID: connectionID)
             return false
         }
 
         var urlRequest = URLRequest(url: endpoint.url)
-        if let bearerToken = endpoint.bearerToken, !bearerToken.isEmpty {
+        if let bearerToken, !bearerToken.isEmpty {
             urlRequest.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
         }
-        let task = URLSession.shared.webSocketTask(with: urlRequest)
+        guard isCurrentConnectionAttempt(connectionID) else { return false }
+        let task = webSocketTaskFactory(urlRequest)
+        guard isCurrentConnectionAttempt(connectionID) else {
+            task.cancel(with: .goingAway, reason: nil)
+            return false
+        }
         webSocketTask = task
         task.resume()
 
         receiveTask = Task { [weak self] in
-            await self?.receiveLoop()
+            await self?.receiveLoop(webSocketTask: task, connectionID: connectionID)
         }
 
         do {
             let initializeResult = try await request(
-                method: "initialize",
+                method: .initialize,
                 params: .object([
                     "clientInfo": .object([
                         "name": .string("mapofagents-supervisor"),
@@ -205,42 +440,60 @@ public actor AppServerWebSocketWorkflowRelay {
                 ])
             )
 
+            guard isCurrentConnectionAttempt(connectionID) else {
+                closeSocket(connectionID: connectionID)
+                return false
+            }
+
             guard AppServerEndpointVerifier.isTrustedInitializeResult(initializeResult) else {
                 throw CodexAppServerError.invalidResponse
             }
 
             try await notify(method: "initialized")
-            isConnected = true
+            guard isCurrentConnectionAttempt(connectionID) else {
+                closeSocket(connectionID: connectionID)
+                return false
+            }
+            connectionState = .connected(connectionID)
             reconnectAttempts = 0
             lastFailureMessageValue = nil
             await supervisor.upsertMachine(machine(from: initializeResult, status: .connected))
-            startPingLoop()
+            guard isCurrentConnectionAttempt(connectionID), isConnected else {
+                closeSocket(connectionID: connectionID)
+                return false
+            }
+            startPingLoop(connectionID: connectionID)
+            scheduleAccessTokenExpiry(accessToken?.expiresAt, connectionID: connectionID)
             await subscribeDesiredThreads()
+            guard isCurrentConnectionAttempt(connectionID), isConnected else {
+                closeSocket(connectionID: connectionID)
+                return false
+            }
             return true
         } catch {
-            closeWebSocketAfterFailedHandshake()
-            await markFailed(error)
+            guard isCurrentConnectionAttempt(connectionID) else { return false }
+            await markFailed(error, connectionID: connectionID)
             return false
         }
     }
 
     public func stop(markDisconnected: Bool = true) async {
-        isStarted = false
-        isConnected = false
+        let activeConnectionID = connectionID
+        connectionState = .stopped
+        connectionTask?.cancel()
+        connectionTask = nil
         reconnectTask?.cancel()
         reconnectTask = nil
         pingTask?.cancel()
         pingTask = nil
+        accessTokenExpiryTask?.cancel()
+        accessTokenExpiryTask = nil
         subscriptionRetryTasks.values.forEach { $0.cancel() }
         subscriptionRetryTasks.removeAll()
         pendingSubscriptionThreadIDs.removeAll()
         subscribedThreadIDs.removeAll()
         subscriptionAttempts.removeAll()
-        receiveTask?.cancel()
-        receiveTask = nil
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
-        webSocketTask = nil
-        failPendingRequests()
+        closeSocket(connectionID: activeConnectionID)
         if markDisconnected {
             onDisconnected?(endpoint.id)
         }
@@ -255,6 +508,24 @@ public actor AppServerWebSocketWorkflowRelay {
 
     func setReportsConnectionFailures(_ reportsConnectionFailures: Bool) {
         self.reportsConnectionFailures = reportsConnectionFailures
+    }
+
+    func connectionLifecycleSnapshot() -> AppServerRelayConnectionSnapshot {
+        let phase: AppServerRelayConnectionPhase = switch connectionState {
+        case .stopped: .stopped
+        case .disconnected: .disconnected
+        case .connecting: .connecting
+        case .connected: .connected
+        }
+        return AppServerRelayConnectionSnapshot(
+            phase: phase,
+            connectionID: connectionID,
+            hasWebSocket: webSocketTask != nil
+        )
+    }
+
+    private func isCurrentConnectionAttempt(_ expectedConnectionID: AppServerConnectionID) -> Bool {
+        isStarted && connectionID == expectedConnectionID && !Task.isCancelled
     }
 
     public func updateWorkflowThreads(_ threadRefs: [ThreadRef]) async {
@@ -318,11 +589,33 @@ public actor AppServerWebSocketWorkflowRelay {
         reasoningEffort: String,
         permissions: CodexThreadPermissions = .default,
         initialPrompt: String
-    ) async throws -> ThreadRef {
+    ) async throws -> ThreadCreationOutcome {
         try await ensureConnected()
+        return try await createThreadUsingRequest(
+            cwd: cwd,
+            name: name,
+            model: model,
+            reasoningEffort: reasoningEffort,
+            permissions: permissions,
+            initialPrompt: initialPrompt
+        ) { [weak self] method, params in
+            guard let self else { throw CodexAppServerError.disconnected }
+            return try await self.request(method: method, params: params)
+        }
+    }
+
+    func createThreadUsingRequest(
+        cwd: String,
+        name: String,
+        model: String,
+        reasoningEffort: String,
+        permissions: CodexThreadPermissions = .default,
+        initialPrompt: String,
+        request: @escaping @Sendable (AppServerMethod, JSONValue) async throws -> JSONValue
+    ) async throws -> ThreadCreationOutcome {
         let result = try await request(
-            method: "thread/start",
-            params: .object(CodexRuntimeStore.threadStartParams(cwd: cwd, model: model, permissions: permissions))
+            .startThread,
+            .object(CodexRuntimeStore.threadStartParams(cwd: cwd, model: model, permissions: permissions))
         )
 
         guard
@@ -333,41 +626,53 @@ public actor AppServerWebSocketWorkflowRelay {
             throw CodexAppServerError.invalidResponse
         }
 
-        if !name.isEmpty {
-            _ = try await request(
-                method: "thread/name/set",
-                params: .object([
-                    "threadId": .string(threadID),
-                    "name": .string(name),
-                ])
-            )
-        }
-
-        let threadRef = ThreadRef(
+        var threadRef = ThreadRef(
             hostID: endpoint.id,
             threadID: threadID,
-            cwd: threadCwd,
-            name: name.isEmpty ? nil : name
+            cwd: threadCwd
         )
+        var warnings: [String] = []
+
+        if !name.isEmpty {
+            do {
+                _ = try await request(
+                    .setThreadName,
+                    .object([
+                        "threadId": .string(threadID),
+                        "name": .string(name),
+                    ])
+                )
+                threadRef.name = name
+            } catch {
+                warnings.append("Thread created, but its name could not be saved: \(error.localizedDescription)")
+            }
+        }
 
         let trimmedPrompt = initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrompt.isEmpty {
-            try await sendMessage(
-                trimmedPrompt,
-                to: threadRef,
-                model: model,
-                reasoningEffort: reasoningEffort,
-                permissions: permissions
-            )
+            do {
+                try await sendMessage(
+                    trimmedPrompt,
+                    to: threadRef,
+                    model: model,
+                    reasoningEffort: reasoningEffort,
+                    permissions: permissions
+                )
+            } catch {
+                warnings.append("Thread created, but the initial prompt could not be sent: \(error.localizedDescription)")
+            }
         }
 
-        return threadRef
+        return ThreadCreationOutcome(
+            threadRef: threadRef,
+            warning: warnings.isEmpty ? nil : warnings.joined(separator: " ")
+        )
     }
 
     public func listModels() async throws -> [CodexModelOption] {
         try await ensureConnected()
         let result = try await request(
-            method: "model/list",
+            method: .listModels,
             params: .object([
                 "limit": .number(100),
                 "includeHidden": .bool(false),
@@ -384,8 +689,8 @@ public actor AppServerWebSocketWorkflowRelay {
         }
 
         let catalogParams = CodexRuntimeStore.catalogParams(cwd: cwd)
-        async let skillsResult = optionalRequest(method: "skills/list", params: catalogParams)
-        async let pluginsResult = optionalRequest(method: "plugin/list", params: catalogParams)
+        async let skillsResult = optionalRequest(method: .listSkills, params: catalogParams)
+        async let pluginsResult = optionalRequest(method: .listPlugins, params: catalogParams)
         async let filesResult = remoteFileMentionCandidates(rootPath: cwd)
 
         return await CodexRuntimeStore.catalogMentionCandidates(
@@ -398,7 +703,7 @@ public actor AppServerWebSocketWorkflowRelay {
     public func threadCatalogEntries(limit: Int = 100, archived: Bool = false) async throws -> [ThreadCatalogEntry] {
         try await ensureConnected()
         let result = try await request(
-            method: "thread/list",
+            method: .listThreads,
             params: .object([
                 "limit": .number(Double(limit)),
                 "archived": .bool(archived),
@@ -419,7 +724,7 @@ public actor AppServerWebSocketWorkflowRelay {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         let result = try await request(
-            method: "thread/search",
+            method: .searchThreads,
             params: .object(CodexRuntimeStore.threadSearchParams(query: trimmed, limit: limit))
         )
 
@@ -440,7 +745,7 @@ public actor AppServerWebSocketWorkflowRelay {
         }
 
         guard let result = try? await request(
-            method: "thread/loaded/list",
+            method: .listLoadedThreads,
             params: .object(["limit": .number(Double(limit))])
         ) else {
             return []
@@ -469,7 +774,7 @@ public actor AppServerWebSocketWorkflowRelay {
 
     private func readThreadCatalogEntry(threadID: String, cwdHint: String?) async throws -> ThreadCatalogEntry? {
         let result = try await request(
-            method: "thread/read",
+            method: .readThread,
             params: .object([
                 "threadId": .string(threadID),
             ])
@@ -527,7 +832,7 @@ public actor AppServerWebSocketWorkflowRelay {
     ) async throws -> AppServerTranscriptLoadResult {
         try await ensureConnected()
         let threadReadResult = try? await request(
-            method: "thread/read",
+            method: .readThread,
             params: .object([
                 "threadId": .string(threadRef.threadID),
             ])
@@ -543,7 +848,7 @@ public actor AppServerWebSocketWorkflowRelay {
         }
 
         let result = try await request(
-            method: "thread/turns/list",
+            method: .listTurns,
             params: .object(params)
         )
         return AppServerTranscriptLoadResult(
@@ -554,7 +859,7 @@ public actor AppServerWebSocketWorkflowRelay {
 
     private func readThread(threadID: String, cwdHint: String?) async throws -> ThreadRef? {
         let result = try await request(
-            method: "thread/read",
+            method: .readThread,
             params: .object([
                 "threadId": .string(threadID),
             ])
@@ -564,7 +869,7 @@ public actor AppServerWebSocketWorkflowRelay {
 
     private func findThreadInList(threadID: String, limit: Int) async throws -> ThreadRef? {
         let result = try await request(
-            method: "thread/list",
+            method: .listThreads,
             params: .object([
                 "limit": .number(Double(limit)),
                 "archived": .bool(false),
@@ -579,7 +884,7 @@ public actor AppServerWebSocketWorkflowRelay {
     public func readFile(path: String) async throws -> Data {
         try await ensureConnected()
         let result = try await request(
-            method: "fs/readFile",
+            method: .readFile,
             params: .object([
                 "path": .string(path),
             ])
@@ -590,7 +895,7 @@ public actor AppServerWebSocketWorkflowRelay {
     public func createDirectory(path: String, recursive: Bool = true) async throws {
         try await ensureConnected()
         _ = try await request(
-            method: "fs/createDirectory",
+            method: .createDirectory,
             params: .object([
                 "path": .string(path),
                 "recursive": .bool(recursive),
@@ -601,7 +906,7 @@ public actor AppServerWebSocketWorkflowRelay {
     public func writeFile(path: String, data: Data) async throws {
         try await ensureConnected()
         _ = try await request(
-            method: "fs/writeFile",
+            method: .writeFile,
             params: .object([
                 "path": .string(path),
                 "dataBase64": .string(data.base64EncodedString()),
@@ -620,7 +925,7 @@ public actor AppServerWebSocketWorkflowRelay {
         }
 
         _ = try await request(
-            method: "turn/interrupt",
+            method: .interruptTurn,
             params: .object([
                 "threadId": .string(threadRef.threadID),
                 "turnId": .string(turnID),
@@ -657,7 +962,7 @@ public actor AppServerWebSocketWorkflowRelay {
             resumeParams.merge(permissions.threadParams()) { _, new in new }
         }
 
-        _ = try? await request(method: "thread/resume", params: .object(resumeParams))
+        _ = try await request(method: .resumeThread, params: .object(resumeParams))
 
         var params: [String: JSONValue] = [
             "threadId": .string(threadRef.threadID),
@@ -676,12 +981,12 @@ public actor AppServerWebSocketWorkflowRelay {
             params.merge(permissions.turnParams(cwd: threadRef.cwd)) { _, new in new }
         }
 
-        _ = try await request(method: "turn/start", params: .object(params))
+        _ = try await request(method: .startTurn, params: .object(params))
     }
 
     private func interruptibleTurnID(for threadRef: ThreadRef) async throws -> String {
         let result = try await request(
-            method: "thread/turns/list",
+            method: .listTurns,
             params: .object([
                 "threadId": .string(threadRef.threadID),
                 "limit": .number(5),
@@ -705,10 +1010,20 @@ public actor AppServerWebSocketWorkflowRelay {
         for threadRef: ThreadRef
     ) async throws -> [ResolvedChatInputAttachment] {
         guard !attachments.isEmpty else { return [] }
-        let directory = ChatInputAttachmentService.remoteAttachmentDirectory(
-            cwd: threadRef.cwd,
-            threadID: threadRef.threadID
-        )
+        let directory: String
+        if let attachmentStagingRoot {
+            directory = ChatInputAttachmentService.remoteAttachmentDirectory(
+                stagingRoot: attachmentStagingRoot,
+                hostID: endpoint.id,
+                threadID: threadRef.threadID
+            )
+        } else {
+            directory = try ChatInputAttachmentService.remoteAttachmentDirectory(
+                cwd: threadRef.cwd,
+                hostID: endpoint.id,
+                threadID: threadRef.threadID
+            )
+        }
         try await createDirectory(path: directory)
 
         var resolved: [ResolvedChatInputAttachment] = []
@@ -735,19 +1050,27 @@ public actor AppServerWebSocketWorkflowRelay {
     public func archiveThread(_ threadRef: ThreadRef) async throws {
         try await ensureConnected()
         _ = try await request(
-            method: "thread/archive",
+            method: .archiveThread,
             params: .object([
                 "threadId": .string(threadRef.threadID),
             ])
         )
     }
 
-    public func respondToServerRequest(id: JSONRPCRequestID, result: JSONValue) async throws {
-        try await ensureConnected()
+    public func respondToServerRequest(
+        id: JSONRPCRequestID,
+        result: JSONValue,
+        connectionID expectedConnectionID: AppServerConnectionID
+    ) async throws {
+        guard isStarted,
+              isConnected,
+              connectionID == expectedConnectionID else {
+            throw CodexAppServerError.staleServerRequest
+        }
         try await send(.object([
             "id": id.jsonValue,
             "result": result,
-        ]))
+        ]), connectionID: expectedConnectionID)
     }
 
     public func forkThread(_ threadRef: ThreadRef, model: String?) async throws -> ThreadRef {
@@ -760,7 +1083,7 @@ public actor AppServerWebSocketWorkflowRelay {
             params["model"] = .string(model)
         }
 
-        let result = try await request(method: "thread/fork", params: .object(params))
+        let result = try await request(method: .forkThread, params: .object(params))
         guard
             let thread = result["thread"],
             let threadID = thread["id"]?.stringValue,
@@ -777,73 +1100,399 @@ public actor AppServerWebSocketWorkflowRelay {
         )
     }
 
-    private func receiveLoop() async {
+    private func receiveLoop(
+        webSocketTask: URLSessionWebSocketTask,
+        connectionID: AppServerConnectionID
+    ) async {
         do {
             while !Task.isCancelled {
-                guard let webSocketTask else {
-                    return
-                }
                 let message = try await webSocketTask.receive()
-                try handle(message)
+                await handle(message, connectionID: connectionID)
             }
         } catch {
-            guard isStarted else { return }
-            await markFailed(error)
+            guard isStarted, self.connectionID == connectionID else { return }
+            await markFailed(error, connectionID: connectionID)
         }
     }
 
-    private func startPingLoop() {
+    private func startPingLoop(connectionID: AppServerConnectionID) {
         pingTask?.cancel()
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
-                await self?.sendPing()
+                await self?.sendPing(connectionID: connectionID)
             }
         }
     }
 
-    private func sendPing() {
-        guard isStarted, isConnected, let webSocketTask else { return }
+    private func scheduleAccessTokenExpiry(
+        _ expiresAt: Date?,
+        connectionID: AppServerConnectionID
+    ) {
+        accessTokenExpiryTask?.cancel()
+        accessTokenExpiryTask = nil
+        guard let expiresAt else { return }
+
+        let delay = AppServerAccessTokenExpiryPolicy.delay(until: expiresAt)
+        accessTokenExpiryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self?.rotateExpiredAccessToken(connectionID: connectionID)
+        }
+    }
+
+    private func rotateExpiredAccessToken(connectionID: AppServerConnectionID) async {
+        guard isStarted,
+              AppServerAccessTokenExpiryPolicy.applies(
+                expectedConnectionID: connectionID,
+                currentConnectionID: self.connectionID
+              ) else { return }
+
+        accessTokenExpiryTask = nil
+        closeSocket(connectionID: connectionID)
+        connectionTask?.cancel()
+        connectionTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        pingTask?.cancel()
+        pingTask = nil
+        pendingSubscriptionThreadIDs.removeAll()
+        subscribedThreadIDs.removeAll()
+        onDisconnected?(endpoint.id)
+        _ = await connectIfNeeded()
+    }
+
+    private func sendPing(connectionID: AppServerConnectionID) {
+        guard isStarted,
+              isConnected,
+              self.connectionID == connectionID,
+              let webSocketTask else { return }
         webSocketTask.sendPing { [weak self] error in
             guard let error else { return }
             Task {
-                await self?.markFailed(error)
+                await self?.markFailed(error, connectionID: connectionID)
             }
         }
     }
 
-    private func request(method: String, params: JSONValue = .object([:])) async throws -> JSONValue {
-        let requestID = nextRequestID
-        nextRequestID += 1
-
-        let message: JSONValue = .object([
-            "id": .number(Double(requestID)),
-            "method": .string(method),
-            "params": params,
-        ])
-
-        let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(CodexAppServerClient.timeoutSeconds(for: method) ?? 20))
-            await self?.timeoutRequest(id: requestID, method: method)
+    private func request(
+        method: AppServerMethod,
+        params: JSONValue = .object([:]),
+        mayReplayRead: Bool = true
+    ) async throws -> JSONValue {
+        guard let connectionID else {
+            throw CodexAppServerError.disconnected
         }
-
-        defer {
-            timeoutTask.cancel()
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = continuation
-            Task { [weak self] in
-                do {
-                    try await self?.send(message)
-                } catch {
-                    await self?.failRequest(id: requestID, error: error)
+        do {
+            return try await session.request(
+                AppServerCall(method, params: params),
+                connectionID: connectionID,
+                timeoutContext: .remote(endpoint.name)
+            ) { [weak self] message, expectedConnectionID in
+                guard let self else { throw CodexAppServerError.disconnected }
+                try await self.send(message, connectionID: expectedConnectionID)
+            }
+        } catch let error as CodexAppServerError {
+            if case .ambiguousWrite = error, method != .initialize {
+                if let reconciledResponse = await reconcileAmbiguousWrite(
+                    method: method,
+                    params: params
+                ) {
+                    return reconciledResponse
                 }
             }
+            if method.replaySafety == .replayableRead,
+               mayReplayRead,
+               Self.isRetryableReadFailure(error) {
+                guard await connectIfNeeded(), isConnected else { throw error }
+                return try await request(
+                    method: method,
+                    params: params,
+                    mayReplayRead: false
+                )
+            }
+            throw error
         }
     }
 
-    private func optionalRequest(method: String, params: JSONValue = .object([:])) async -> JSONValue? {
+    private nonisolated static func isRetryableReadFailure(_ error: CodexAppServerError) -> Bool {
+        switch error {
+        case .disconnected,
+             .invalidResponse,
+             .daemonProxyRequestTimedOut,
+             .transport:
+            return true
+        case .ambiguousWrite,
+             .unsupportedPlatform,
+             .codexNotInstalled,
+             .launchFailed,
+             .daemonProxyHandshakeFailed,
+             .staleServerRequest,
+             .server:
+            return false
+        }
+    }
+
+    private func reconcileAmbiguousWrite(
+        method: AppServerMethod,
+        params: JSONValue
+    ) async -> JSONValue? {
+        guard await connectIfNeeded(), isConnected else { return nil }
+        var observations: [AppServerReconciliationObservation] = []
+        for call in Self.reconciliationCalls(after: method, params: params) {
+            guard let result = try? await request(method: call.method, params: call.params) else {
+                continue
+            }
+            observations.append(AppServerReconciliationObservation(call: call, result: result))
+        }
+
+        let reconciledResponse = Self.reconciledResponse(
+            after: method,
+            params: params,
+            observations: observations
+        )
+        onWriteReconciled?(
+            reconciliationSnapshot(
+                method: method,
+                params: params,
+                observations: observations,
+                reconciledResponse: reconciledResponse
+            )
+        )
+        return reconciledResponse
+    }
+
+    nonisolated static func reconciliationCalls(
+        after method: AppServerMethod,
+        params: JSONValue
+    ) -> [AppServerCall] {
+        switch method {
+        case .startThread, .forkThread:
+            return [AppServerCall(
+                .listThreads,
+                params: .object(["limit": .number(200), "archived": .bool(false)])
+            )]
+        case .archiveThread:
+            return [false, true].map { archived in
+                AppServerCall(
+                    .listThreads,
+                    params: .object(["limit": .number(200), "archived": .bool(archived)])
+                )
+            }
+        case .startTurn, .interruptTurn:
+            guard let threadID = params["threadId"]?.stringValue else { return [] }
+            return [
+                AppServerCall(.readThread, params: .object(["threadId": .string(threadID)])),
+                AppServerCall(.listTurns, params: turnListParams(threadID: threadID)),
+            ]
+        case .setThreadName:
+            guard let threadID = params["threadId"]?.stringValue else { return [] }
+            return [AppServerCall(.readThread, params: .object(["threadId": .string(threadID)]))]
+        case .resumeThread:
+            return [AppServerCall(.listLoadedThreads, params: .object(["limit": .number(200)]))]
+        case .createDirectory:
+            guard let path = params["path"]?.stringValue else { return [] }
+            return [AppServerCall(.readDirectory, params: .object(["path": .string(path)]))]
+        case .writeFile:
+            guard let path = params["path"]?.stringValue else { return [] }
+            return [AppServerCall(.readFile, params: .object(["path": .string(path)]))]
+        case .unsubscribeThread:
+            return []
+        case .initialize,
+             .accountRead,
+             .readDirectory,
+             .readFile,
+             .listModels,
+             .listPlugins,
+             .listSkills,
+             .listThreads,
+             .listLoadedThreads,
+             .readThread,
+             .searchThreads,
+             .listTurns:
+            return []
+        }
+    }
+
+    nonisolated static func reconciledResponse(
+        after method: AppServerMethod,
+        params: JSONValue,
+        observations: [AppServerReconciliationObservation]
+    ) -> JSONValue? {
+        switch method {
+        case .startThread, .forkThread:
+            // A catalog delta has no request correlation. Another Codex client
+            // can create exactly one thread while our response is in flight,
+            // so binding that thread to this request would corrupt the graph.
+            return nil
+        case .startTurn:
+            // Turn lists likewise do not identify which client submitted a
+            // turn. Publish the refreshed transcript, but keep the write
+            // ambiguous until the protocol offers an idempotency key.
+            return nil
+        case .archiveThread:
+            guard let threadID = params["threadId"]?.stringValue else { return nil }
+            let archivedIDs = observations
+                .filter { $0.call.method == .listThreads && $0.call.params["archived"]?.boolValue == true }
+                .flatMap { values(in: $0.result) }
+                .compactMap(identifier(in:))
+            return archivedIDs.contains(threadID) ? .object([:]) : nil
+        case .setThreadName:
+            guard let expectedName = params["name"]?.stringValue,
+                  let result = observations.first(where: { $0.call.method == .readThread })?.result else {
+                return nil
+            }
+            let thread = result["thread"] ?? result
+            return thread["name"]?.stringValue == expectedName ? .object([:]) : nil
+        case .resumeThread:
+            guard let threadID = params["threadId"]?.stringValue,
+                  let result = observations.first(where: { $0.call.method == .listLoadedThreads })?.result else {
+                return nil
+            }
+            return ThreadCatalogEntry.loadedThreadIDs(from: result).contains(threadID) ? .object([:]) : nil
+        case .interruptTurn:
+            guard let turnID = params["turnId"]?.stringValue else { return nil }
+            let turn = observations
+                .filter { $0.call.method == .listTurns }
+                .flatMap { values(in: $0.result) }
+                .first { identifier(in: $0) == turnID }
+            guard let turn, turnIsTerminal(turn) else { return nil }
+            return .object([:])
+        case .createDirectory:
+            return observations.contains(where: { $0.call.method == .readDirectory }) ? .object([:]) : nil
+        case .writeFile:
+            guard let expectedBase64 = params["dataBase64"]?.stringValue,
+                  let expected = Data(base64Encoded: expectedBase64),
+                  let readResult = observations.first(where: { $0.call.method == .readFile })?.result,
+                  let actual = try? CodexAppServerClient.fileData(fromReadFileResponse: readResult) else {
+                return nil
+            }
+            return actual == expected ? .object([:]) : nil
+        case .unsubscribeThread,
+             .initialize,
+             .accountRead,
+             .readDirectory,
+             .readFile,
+             .listModels,
+             .listPlugins,
+             .listSkills,
+             .listThreads,
+             .listLoadedThreads,
+             .readThread,
+             .searchThreads,
+             .listTurns:
+            return nil
+        }
+    }
+
+    private func reconciliationSnapshot(
+        method: AppServerMethod,
+        params: JSONValue,
+        observations: [AppServerReconciliationObservation],
+        reconciledResponse: JSONValue?
+    ) -> AppServerWriteReconciliation {
+        let catalogEntries = observations
+            .filter { $0.call.method == .listThreads }
+            .flatMap { Self.values(in: $0.result) }
+            .compactMap {
+                ThreadCatalogEntry.appServerThread(
+                    from: $0,
+                    hostID: endpoint.id,
+                    hostName: endpoint.name
+                )
+            }
+
+        var affectedThreadRefs: [ThreadRef] = []
+        if let thread = reconciledResponse?["thread"],
+           let threadRef = CodexRuntimeStore.threadRef(
+                from: thread,
+                hostID: endpoint.id,
+                cwdHint: params["cwd"]?.stringValue
+           ) {
+            affectedThreadRefs.append(threadRef)
+        } else if let threadID = params["threadId"]?.stringValue {
+            let readResult = observations.first(where: { $0.call.method == .readThread })?.result
+            let threadRef = readResult.flatMap {
+                CodexRuntimeStore.threadRef(
+                    from: $0["thread"] ?? $0,
+                    hostID: endpoint.id,
+                    cwdHint: params["cwd"]?.stringValue
+                )
+            } ?? desiredThreads[threadID] ?? ThreadRef(
+                hostID: endpoint.id,
+                threadID: threadID,
+                cwd: params["cwd"]?.stringValue ?? "",
+                name: nil
+            )
+            affectedThreadRefs.append(threadRef)
+        }
+
+        let transcript: ThreadTranscript?
+        if let threadRef = affectedThreadRefs.first,
+           let turnsResult = observations.first(where: { $0.call.method == .listTurns })?.result {
+            transcript = ThreadTranscriptParser.transcript(
+                from: turnsResult,
+                threadRef: threadRef
+            ).sortedChronologically()
+        } else {
+            transcript = nil
+        }
+
+        return AppServerWriteReconciliation(
+            hostID: endpoint.id,
+            method: method,
+            confirmedCommitted: reconciledResponse != nil,
+            affectedThreadRefs: affectedThreadRefs,
+            observedCatalogEntries: catalogEntries,
+            transcript: transcript
+        )
+    }
+
+    private nonisolated static func turnListParams(threadID: String) -> JSONValue {
+        .object([
+            "threadId": .string(threadID),
+            "limit": .number(100),
+            "sortDirection": .string("desc"),
+            "itemsView": .string("full"),
+        ])
+    }
+
+    private nonisolated static func values(in result: JSONValue) -> [JSONValue] {
+        result["data"]?.arrayValue
+            ?? result["threads"]?.arrayValue
+            ?? result["turns"]?.arrayValue
+            ?? []
+    }
+
+    private nonisolated static func identifier(in value: JSONValue) -> String? {
+        value["id"]?.stringValue
+            ?? value["threadId"]?.stringValue
+            ?? value["turnId"]?.stringValue
+            ?? value["thread"]?["id"]?.stringValue
+            ?? value["turn"]?["id"]?.stringValue
+    }
+
+    private nonisolated static func turnIsTerminal(_ value: JSONValue) -> Bool {
+        let turn = value["turn"] ?? value
+        if turn["completedAt"] != nil || turn["completed_at"] != nil {
+            return true
+        }
+        guard let status = turn["status"]?.stringValue?.lowercased() else { return false }
+        return ["complete", "completed", "cancelled", "canceled", "failed", "interrupted"].contains(status)
+    }
+
+    private func optionalRequest(
+        method: AppServerMethod,
+        params: JSONValue = .object([:])
+    ) async -> JSONValue? {
+        precondition(
+            method.replaySafety == .replayableRead,
+            "optionalRequest may only retry protocol-declared reads"
+        )
         do {
             return try await request(method: method, params: params)
         } catch {
@@ -868,7 +1517,7 @@ public actor AppServerWebSocketWorkflowRelay {
             guard visited.insert(current.path).inserted else { continue }
 
             guard let result = try? await request(
-                method: "fs/readDirectory",
+                method: .readDirectory,
                 params: .object(["path": .string(current.path)])
             ) else {
                 continue
@@ -913,11 +1562,14 @@ public actor AppServerWebSocketWorkflowRelay {
         if let params {
             body["params"] = params
         }
-        try await send(.object(body))
+        guard let connectionID else {
+            throw CodexAppServerError.disconnected
+        }
+        try await send(.object(body), connectionID: connectionID)
     }
 
-    private func send(_ value: JSONValue) async throws {
-        guard let webSocketTask else {
+    private func send(_ value: JSONValue, connectionID: AppServerConnectionID) async throws {
+        guard self.connectionID == connectionID, let webSocketTask else {
             throw CodexAppServerError.disconnected
         }
         let data = try JSONEncoder().encode(value)
@@ -934,13 +1586,17 @@ public actor AppServerWebSocketWorkflowRelay {
         if isConnected {
             return
         }
-        await reconnect()
-        guard isConnected else {
+        let didConnect = await connectIfNeeded()
+        guard didConnect, isConnected else {
             throw CodexAppServerError.disconnected
         }
     }
 
-    private func handle(_ message: URLSessionWebSocketTask.Message) throws {
+    private func handle(
+        _ message: URLSessionWebSocketTask.Message,
+        connectionID: AppServerConnectionID
+    ) async {
+        guard self.connectionID == connectionID else { return }
         let data: Data
         switch message {
         case .data(let messageData):
@@ -951,43 +1607,14 @@ public actor AppServerWebSocketWorkflowRelay {
             return
         }
 
-        guard
-            let value = try? JSONDecoder().decode(JSONValue.self, from: data),
-            let object = value.objectValue
-        else {
-            return
-        }
-
-        if let requestID = JSONRPCRequestID(object["id"]), let method = object["method"]?.stringValue {
-            let notification = CodexServerNotification(
-                method: method,
-                params: object["params"],
-                requestID: requestID
-            )
+        switch await session.receive(data, connectionID: connectionID) {
+        case .notification(let notification):
             handleNotification(notification)
-            return
+        case .diagnostic:
+            break
+        case nil:
+            break
         }
-
-        if let id = object["id"]?.intValue {
-            let continuation = pending.removeValue(forKey: id)
-            if let error = object["error"] {
-                continuation?.resume(throwing: CodexAppServerError.server(error.readableDescription))
-            } else {
-                continuation?.resume(returning: object["result"] ?? .null)
-            }
-            return
-        }
-
-        guard let method = object["method"]?.stringValue else {
-            return
-        }
-
-        handleNotification(
-            CodexServerNotification(
-                method: method,
-                params: object["params"]
-            )
-        )
     }
 
     private func handleNotification(_ notification: CodexServerNotification) {
@@ -1038,7 +1665,7 @@ public actor AppServerWebSocketWorkflowRelay {
 
         do {
             _ = try await request(
-                method: "thread/resume",
+                method: .resumeThread,
                 params: .object([
                     "threadId": .string(threadRef.threadID),
                     "cwd": .string(threadRef.cwd),
@@ -1047,7 +1674,7 @@ public actor AppServerWebSocketWorkflowRelay {
 
             guard desiredThreads[threadRef.threadID] == threadRef else {
                 _ = try? await request(
-                    method: "thread/unsubscribe",
+                    method: .unsubscribeThread,
                     params: .object(["threadId": .string(threadRef.threadID)])
                 )
                 return
@@ -1073,7 +1700,7 @@ public actor AppServerWebSocketWorkflowRelay {
         guard isConnected, wasSubscribed else { return }
 
         _ = try? await request(
-            method: "thread/unsubscribe",
+            method: .unsubscribeThread,
             params: .object(["threadId": .string(threadID)])
         )
     }
@@ -1146,42 +1773,41 @@ public actor AppServerWebSocketWorkflowRelay {
         }
     }
 
-    private func timeoutRequest(id: Int, method: String) {
-        guard let continuation = pending.removeValue(forKey: id) else {
+    private func closeSocket(
+        connectionID expectedConnectionID: AppServerConnectionID?,
+        invalidateConnection: Bool = true
+    ) {
+        if let expectedConnectionID, connectionID != expectedConnectionID {
             return
         }
-        continuation.resume(
-            throwing: CodexAppServerError.transport("Timed out waiting for \(method) response from remote Codex App Server.")
-        )
-    }
-
-    private func failRequest(id: Int, error: Error) {
-        guard let continuation = pending.removeValue(forKey: id) else {
-            return
-        }
-        continuation.resume(throwing: error)
-    }
-
-    private func closeWebSocketAfterFailedHandshake() {
         receiveTask?.cancel()
         receiveTask = nil
+        accessTokenExpiryTask?.cancel()
+        accessTokenExpiryTask = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
-        failPendingRequests()
+        if let expectedConnectionID {
+            Task {
+                await session.failPending(connectionID: expectedConnectionID)
+            }
+        }
+        if invalidateConnection {
+            connectionState = isStarted ? .disconnected : .stopped
+        }
     }
 
-    private func markFailed(_ error: Error) async {
-        guard isStarted else { return }
-        isConnected = false
+    private func markFailed(_ error: Error, connectionID: AppServerConnectionID) async {
+        guard isStarted, self.connectionID == connectionID else { return }
+        closeSocket(connectionID: connectionID)
         lastFailureMessageValue = error.localizedDescription
         pingTask?.cancel()
         pingTask = nil
         pendingSubscriptionThreadIDs.removeAll()
         subscribedThreadIDs.removeAll()
-        failPendingRequests()
         onDisconnected?(endpoint.id)
         if reportsConnectionFailures {
             await supervisor.updateMachineFailure(endpoint.id, message: error.localizedDescription)
+            guard isStarted, self.connectionID == nil, !Task.isCancelled else { return }
             scheduleReconnect()
         }
     }
@@ -1200,29 +1826,7 @@ public actor AppServerWebSocketWorkflowRelay {
     private func reconnect() async {
         reconnectTask = nil
         guard isStarted else { return }
-
-        receiveTask?.cancel()
-        receiveTask = nil
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
-        webSocketTask = nil
-        failPendingRequests()
-        pendingSubscriptionThreadIDs.removeAll()
-        subscribedThreadIDs.removeAll()
-
-        await supervisor.upsertMachine(
-            SupervisorMachine(
-                id: endpoint.id,
-                name: endpoint.name,
-                endpointDescription: endpoint.url.absoluteString,
-                status: .connecting
-            )
-        )
-        _ = await connectWebSocket()
-    }
-
-    private func failPendingRequests() {
-        pending.values.forEach { $0.resume(throwing: CodexAppServerError.disconnected) }
-        pending.removeAll()
+        _ = await connectIfNeeded()
     }
 
     private static func threadID(from params: JSONValue?) -> String? {
@@ -1277,25 +1881,6 @@ private struct RemoteDirectoryEntry {
         self.fileName = fileName
         self.isDirectory = value["isDirectory"]?.boolValue ?? value["is_directory"]?.boolValue ?? false
         self.isFile = value["isFile"]?.boolValue ?? value["is_file"]?.boolValue ?? false
-    }
-}
-
-private extension JSONValue {
-    var readableDescription: String {
-        switch self {
-        case .object(let object):
-            return object["message"]?.stringValue ?? String(describing: object)
-        case .array(let array):
-            return String(describing: array)
-        case .string(let string):
-            return string
-        case .number(let number):
-            return String(number)
-        case .bool(let bool):
-            return String(bool)
-        case .null:
-            return "Unknown App Server error"
-        }
     }
 }
 

@@ -52,13 +52,15 @@ public enum MapofAgentsWorkflowBridgeSkill {
         5. Send `turn/start` with `threadId=<targetThreadID>`, the message as a text input item, and the target model/effort when provided.
 
         Materialized child-thread hook event:
-        - Append one JSON line to `$HOME/.codex/mapofagents/hook-events.jsonl` on the host where the source thread is running, or call the project helper `script/mapofagents-hook-event.sh thread.created` when available.
+        - Send the JSON shape below on stdin to the hardened project helper `script/mapofagents-hook-event.sh thread.created` on the host where the source thread is running.
+        - Never append to `$HOME/.codex/mapofagents/hook-events.jsonl` directly. If the hardened helper is unavailable, do not create or modify the event file; report that the hook event could not be emitted.
         - Shape:
           `{"type":"thread.created","sourceHostID":"<sourceHostID>","sourceThreadID":"<sourceThreadID>","sourceTurnID":"<sourceTurnID>","childHostID":"<childHostID>","childThreadID":"<childThreadID>","cwd":"<childCWD>","title":"<childTitle>","kind":"thread"}`
         - Only emit this after an actual App Server `thread/start` response. Do not emit it for Codex subagents, sample IDs, rollout metadata, or unverified prose.
 
         Materialized folder hook event:
-        - Append one JSON line to `$HOME/.codex/mapofagents/hook-events.jsonl` on the host where the source thread is running, or call the project helper `script/mapofagents-hook-event.sh folder.created` when available.
+        - Send the JSON shape below on stdin to the hardened project helper `script/mapofagents-hook-event.sh folder.created` on the host where the source thread is running.
+        - Never append to `$HOME/.codex/mapofagents/hook-events.jsonl` directly. If the hardened helper is unavailable, do not create or modify the event file; report that the hook event could not be emitted.
         - Shape:
           `{"type":"folder.created","sourceHostID":"<sourceHostID>","sourceThreadID":"<sourceThreadID>","sourceTurnID":"<sourceTurnID>","childHostID":"<childHostID>","folderPath":"<absoluteFolderPath>","title":"<folderTitle>"}`
         - Only emit this for an intentionally materialized workspace/project root, such as a new repo, worktree, experiment folder, or remote Desktop/project folder. Do not emit it for subfolders under a workflow folder.

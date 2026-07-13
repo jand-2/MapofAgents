@@ -8,12 +8,6 @@ import UIKit
 #endif
 
 public struct GraphCanvasView: View {
-    private struct PendingUserTurnStart: Hashable {
-        var hostID: HostID
-        var threadID: String
-        var createdAt: Date
-    }
-
     private enum PendingDestructiveAction: Identifiable {
         case archiveThread(CanvasNode)
         case deleteNode(CanvasNode)
@@ -73,9 +67,6 @@ public struct GraphCanvasView: View {
         var mode: RemoteFolderPickerView.Mode = .chooseProject
     }
 
-    private static let userTurnMarkerLeadWindow: TimeInterval = 5
-    private static let userTurnMarkerFollowWindow: TimeInterval = 5 * 60
-    private static let userTurnAttributionRetention: TimeInterval = 20 * 60
     private static let threadAutomationRefreshInterval: Duration = .seconds(10)
 
     @Bindable private var graphStore: GraphStore
@@ -97,37 +88,17 @@ public struct GraphCanvasView: View {
     @Binding private var readingThreadCount: Int
     @Binding private var isMachineRecoveryPresented: Bool
     private var onCanvasSizeChange: (CGSize) -> Void
-    @State private var dragOffsets: [NodeID: CGSize] = [:]
-    @State private var transcript: ThreadTranscript?
-    @State private var isLoadingTranscript = false
-    @State private var isLoadingOlderTranscript = false
-    @State private var transcriptLoadPhase: TranscriptLoadPhase = .idle
-    @State private var transcriptError: String?
+    @State private var viewportInteraction = CanvasViewportInteractionModel()
+    @State private var workflowEventLedger = CanvasWorkflowEventLedger()
+    @State private var transcriptSessions = TranscriptSessionStore()
     @State private var readingThreadIDs: [NodeID] = []
-    @State private var readingTranscripts: [NodeID: ThreadTranscript] = [:]
-    @State private var readingErrors: [NodeID: String] = [:]
-    @State private var readingLoadingThreadIDs: Set<NodeID> = []
-    @State private var readingLoadingOlderThreadIDs: Set<NodeID> = []
-    @State private var readingLoadPhases: [NodeID: TranscriptLoadPhase] = [:]
-    @State private var awaitingResponseThreadKeys: Set<String> = []
     @State private var stoppingThreadKeys: Set<String> = []
-    @State private var liveRefreshThreadKeys: Set<String> = []
-    @State private var viewportDragOffset: CGSize = .zero
-    @State private var handledWorkflowEventIDs: Set<String> = []
-    @State private var handledWorkflowEventIDOrder: [String] = []
-    @State private var workflowEventStateStartedAt = Date()
-    @State private var pendingUserTurnStarts: [PendingUserTurnStart] = []
-    @State private var userStartedTurnKeys: [String: Date] = [:]
     @State private var pendingDestructiveAction: PendingDestructiveAction?
     @State private var transientThreadNode: CanvasNode?
     @State private var inboxSubscriptionRefs: [String: ThreadRef] = [:]
     @State private var hoveredInboxNodeID: NodeID?
-    @State private var activeTranscriptLoadKey: String?
-    @State private var transcriptLoadGeneration: UInt64 = 0
     @State private var transientOpenGeneration: UInt64 = 0
     @State private var suppressedNodeControlTapID: NodeID?
-    @State private var transientViewport: CanvasViewport?
-    @State private var viewportCommitTask: Task<Void, Never>?
     @State private var remoteFolderPickerRequest: RemoteFolderPickerRequest?
     @State private var threadAutomationsByThreadID: [String: CodexAutomationSummary] = [:]
     @State private var activeThreadAutomationNodeID: NodeID?
@@ -179,6 +150,12 @@ public struct GraphCanvasView: View {
 
     public var body: some View {
         GeometryReader { proxy in
+            let canvasPresentation = CanvasPresentationModel(
+                graph: graphStore.graph,
+                allEdges: graphStore.allEdges,
+                showsSubagents: showsSubagents,
+                focusedNodeID: focusedCanvasNodeID
+            )
             ZStack(alignment: .topLeading) {
                 let activeThreadNode = isReadingModePresented ? nil : (transientThreadNode ?? selectedThreadNode)
                 let showsInspector = shouldShowSelectionInspector
@@ -208,22 +185,15 @@ public struct GraphCanvasView: View {
                 CanvasBackground(reducedDetail: activeThreadNode != nil || selectedManualEdge != nil)
                     .contentShape(Rectangle())
                     .gesture(viewportPanGesture)
+                    .simultaneousGesture(viewportMagnificationGesture)
                     .onTapGesture {
-                        releaseTransientThreadSubscriptionIfNeeded()
-                        transientOpenGeneration &+= 1
-                        transientThreadNode = nil
-                        activeThreadAutomationNodeID = nil
-                        graphStore.clearSelection()
-                        resetThreadPopoverData()
+                        closeActiveThreadPopover()
                     }
                     .overlay {
                         scrollWheelZoomLayer(ignoredRects: ignoredScrollRects)
                     }
 
-                graphContentLayer(viewport: viewport)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .scaleEffect(viewport.scale, anchor: .topLeading)
-                .offset(x: viewport.offset.x, y: viewport.offset.y)
+                positionedGraphContentLayer(viewport: viewport, presentation: canvasPresentation)
 
                 if let threadNode = activeThreadNode {
                     threadPopoverLayer(
@@ -288,12 +258,21 @@ public struct GraphCanvasView: View {
                         .padding(.bottom, 14)
                 }
             }
-            .onChange(of: selectedThreadKey) { _, _ in
+            .onChange(of: selectedThreadKey) { previousKey, _ in
+                if let previousKey {
+                    let remainsOpenInReader = readingThreadIDs.contains { nodeID in
+                        graphStore.graph.nodes[nodeID]?.metadata.threadRef?.qualifiedID == previousKey
+                    }
+                    if !remainsOpenInReader {
+                        cancelLiveTranscriptRefresh(for: previousKey)
+                    }
+                }
                 if selectedThreadKey != nil {
                     transientOpenGeneration &+= 1
                     transientThreadNode = nil
                 }
                 guard let selectedThreadNode else {
+                    transcriptSessions.cancelPopoverLoad()
                     if transientThreadNode == nil {
                         resetThreadPopoverData()
                     }
@@ -317,9 +296,7 @@ public struct GraphCanvasView: View {
                 Task { await refreshThreadInbox() }
             }
             .onChange(of: graphStore.graph.viewport) { _, viewport in
-                if transientViewport == viewport {
-                    transientViewport = nil
-                }
+                viewportInteraction.reconcilePersistedViewport(viewport)
             }
             .onChange(of: showsSubagents) { _, isShowing in
                 guard !isShowing else { return }
@@ -333,6 +310,10 @@ public struct GraphCanvasView: View {
             }
             .task(id: threadAutomationRefreshSignature) {
                 await refreshThreadAutomationsPeriodically()
+            }
+            .onDisappear {
+                transcriptSessions.cancelAll()
+                viewportInteraction.cancel()
             }
             .confirmationDialog(
                 pendingDestructiveAction?.title ?? "Confirm Action",
@@ -432,28 +413,24 @@ public struct GraphCanvasView: View {
         selectedThreadNode?.metadata.threadRef?.qualifiedID ?? selectedThreadNode?.id.rawValue
     }
 
-    private var visibleSortedNodes: [CanvasNode] {
-        graphStore.graph.sortedNodes.filter(shouldShowNode)
+    private var transcript: ThreadTranscript? {
+        transcriptSessions.popover.transcript
     }
 
-    private var visibleCanvasNodes: [NodeID: CanvasNode] {
-        Dictionary(uniqueKeysWithValues: visibleSortedNodes.map { ($0.id, $0) })
+    private var isLoadingTranscript: Bool {
+        transcriptSessions.popover.isLoading
     }
 
-    private func visibleCanvasEdges(in nodes: [NodeID: CanvasNode]) -> [CanvasEdge] {
-        graphStore.allEdges.filter { edge in
-            nodes[edge.source] != nil && nodes[edge.target] != nil
-        }
+    private var isLoadingOlderTranscript: Bool {
+        transcriptSessions.popover.isLoadingOlder
     }
 
-    private func visibleManualEdges(in nodes: [NodeID: CanvasNode]) -> [CanvasEdge] {
-        graphStore.graph.manualEdges.values
-            .filter { edge in nodes[edge.source] != nil && nodes[edge.target] != nil }
-            .sorted { $0.id.rawValue < $1.id.rawValue }
+    private var transcriptLoadPhase: TranscriptLoadPhase {
+        transcriptSessions.popover.loadPhase
     }
 
-    private func shouldShowNode(_ node: CanvasNode) -> Bool {
-        showsSubagents || !isSubagentNode(node)
+    private var transcriptError: String? {
+        transcriptSessions.popover.errorMessage
     }
 
     private func isSubagentNode(_ node: CanvasNode) -> Bool {
@@ -478,11 +455,7 @@ public struct GraphCanvasView: View {
         }
 
         readingThreadIDs.removeAll { hiddenIDs.contains($0) }
-        readingTranscripts = readingTranscripts.filter { !hiddenIDs.contains($0.key) }
-        readingErrors = readingErrors.filter { !hiddenIDs.contains($0.key) }
-        readingLoadingThreadIDs.subtract(hiddenIDs)
-        readingLoadingOlderThreadIDs.subtract(hiddenIDs)
-        readingLoadPhases = readingLoadPhases.filter { !hiddenIDs.contains($0.key) }
+        transcriptSessions.removeReaders(hiddenIDs)
 
         if shouldResetTranscript {
             resetThreadPopoverData()
@@ -606,19 +579,20 @@ public struct GraphCanvasView: View {
             guard let node = graphStore.graph.nodes[nodeID], node.kind == .codexThread else {
                 return nil
             }
+            let session = transcriptSessions.readerState(for: nodeID)
 
             return ThreadReadingItem(
                 node: node,
-                transcript: readingTranscripts[nodeID],
+                transcript: session.transcript,
                 liveAssistantText: liveAssistantText(for: node),
                 liveStateSummary: liveStateSummary(for: node),
-                isLoading: readingLoadingThreadIDs.contains(nodeID),
-                isLoadingOlder: readingLoadingOlderThreadIDs.contains(nodeID),
-                loadPhase: readingLoadPhases[nodeID] ?? .idle,
+                isLoading: session.isLoading,
+                isLoadingOlder: session.isLoadingOlder,
+                loadPhase: session.loadPhase,
                 isAwaitingResponse: isAwaitingResponse(for: node),
                 canStopTurn: canStopThread(node),
                 isStoppingTurn: isStoppingThread(node),
-                errorMessage: readingErrors[nodeID],
+                errorMessage: session.errorMessage,
                 threadMentionCandidates: allMentionCandidates(for: node),
                 attentionRequests: attentionRequests(for: node)
             )
@@ -640,27 +614,59 @@ public struct GraphCanvasView: View {
     }
 
     @ViewBuilder
-    private func graphContentLayer(viewport: CanvasViewport) -> some View {
-        let nodes = visibleCanvasNodes
-        let edges = visibleCanvasEdges(in: nodes)
-        let manualEdges = visibleManualEdges(in: nodes)
+    private func positionedGraphContentLayer(
+        viewport: CanvasViewport,
+        presentation: CanvasPresentationModel
+    ) -> some View {
+        #if os(iOS)
+        graphContentLayer(
+            viewport: viewport,
+            presentation: presentation,
+            displayNodes: CanvasScreenSpaceProjection.nodes(
+                presentation.nodesByID,
+                viewport: viewport
+            )
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        #else
+        graphContentLayer(
+            viewport: viewport,
+            presentation: presentation,
+            displayNodes: presentation.nodesByID
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .scaleEffect(viewport.scale, anchor: .topLeading)
+        .offset(x: viewport.offset.x, y: viewport.offset.y)
+        #endif
+    }
+
+    @ViewBuilder
+    private func graphContentLayer(
+        viewport: CanvasViewport,
+        presentation: CanvasPresentationModel,
+        displayNodes: [NodeID: CanvasNode]
+    ) -> some View {
         ZStack(alignment: .topLeading) {
             EdgeLayer(
-                nodes: nodes,
-                edges: edges,
+                nodes: displayNodes,
+                edges: presentation.edges,
                 selectedEdge: selectedEdgeID,
-                focusedNodeID: focusedCanvasNodeID,
+                focusedNodeID: presentation.focusedNodeID,
                 onSelect: graphStore.selectEdge
             )
 
             EdgeControlLayer(
-                nodes: nodes,
-                edges: manualEdges,
+                nodes: displayNodes,
+                edges: presentation.manualEdges,
                 selectedEdge: selectedEdgeID,
                 onSelect: graphStore.selectEdge
             )
 
-            canvasNodesLayer(viewport: viewport)
+            canvasNodesLayer(
+                viewport: viewport,
+                presentation: presentation,
+                displayNodes: displayNodes
+            )
         }
     }
 
@@ -759,10 +765,21 @@ public struct GraphCanvasView: View {
     }
 
     @ViewBuilder
-    private func canvasNodesLayer(viewport: CanvasViewport) -> some View {
-        let nodes = visibleSortedNodes
-        ForEach(nodes) { node in
-            canvasNodeView(for: node, viewport: viewport)
+    private func canvasNodesLayer(
+        viewport: CanvasViewport,
+        presentation: CanvasPresentationModel,
+        displayNodes: [NodeID: CanvasNode]
+    ) -> some View {
+        ForEach(presentation.nodes) { node in
+            if let displayNode = displayNodes[node.id] {
+                canvasNodeView(
+                    for: node,
+                    displayNode: displayNode,
+                    viewport: viewport,
+                    focusedNodeID: presentation.focusedNodeID,
+                    focusedNeighborhood: presentation.focusedNeighborhood
+                )
+            }
         }
     }
 
@@ -771,17 +788,6 @@ public struct GraphCanvasView: View {
             return (transientThreadNode ?? selectedThreadNode)?.id
         }
         return nil
-    }
-
-    private var focusedCanvasNeighborhood: Set<NodeID> {
-        guard let focusedCanvasNodeID else { return [] }
-        var ids: Set<NodeID> = [focusedCanvasNodeID]
-        let nodes = visibleCanvasNodes
-        for edge in visibleCanvasEdges(in: nodes) where edge.source == focusedCanvasNodeID || edge.target == focusedCanvasNodeID {
-            ids.insert(edge.source)
-            ids.insert(edge.target)
-        }
-        return ids
     }
 
     #if os(macOS)
@@ -807,7 +813,7 @@ public struct GraphCanvasView: View {
                 Task { await loadOlderReadingTranscript(for: nodeID) }
             },
             onUseCachedTranscript: { nodeID in
-                readingErrors[nodeID] = nil
+                transcriptSessions.clearError(for: .reader(nodeID))
             },
             onSend: { nodeID, text, attachments in
                 await sendReadingMessage(text, attachments: attachments, from: nodeID)
@@ -879,7 +885,13 @@ public struct GraphCanvasView: View {
     }
 
     @ViewBuilder
-    private func canvasNodeView(for node: CanvasNode, viewport: CanvasViewport) -> some View {
+    private func canvasNodeView(
+        for node: CanvasNode,
+        displayNode: CanvasNode,
+        viewport: CanvasViewport,
+        focusedNodeID: NodeID?,
+        focusedNeighborhood: Set<NodeID>
+    ) -> some View {
         NodeView(
             node: node,
             isSelected: selectedNodeID == node.id,
@@ -903,11 +915,22 @@ public struct GraphCanvasView: View {
             },
             onControlTap: {
                 suppressNextNodeTap(for: node.id)
+            },
+            onActivate: {
+                handleNodeTap(node)
             }
         )
-        .frame(width: node.size.width, height: node.size.height)
-        .position(node.position.translated(by: dragOffsets[node.id] ?? .zero).cgPoint)
-        .opacity(nodeOpacity(for: node))
+        .frame(width: displayNode.size.width, height: displayNode.size.height)
+        .position(canvasNodePosition(
+            for: node,
+            displayNode: displayNode,
+            viewport: viewport
+        ))
+        .opacity(nodeOpacity(
+            for: node,
+            focusedNodeID: focusedNodeID,
+            focusedNeighborhood: focusedNeighborhood
+        ))
         .gesture(nodeDragGesture(for: node, scale: viewport.scale))
         .simultaneousGesture(TapGesture().onEnded {
             handleNodeTap(node)
@@ -917,9 +940,29 @@ public struct GraphCanvasView: View {
         }
     }
 
-    private func nodeOpacity(for node: CanvasNode) -> Double {
-        guard focusedCanvasNodeID != nil else { return 1 }
-        return focusedCanvasNeighborhood.contains(node.id) ? 1 : 0.36
+    private func canvasNodePosition(
+        for node: CanvasNode,
+        displayNode: CanvasNode,
+        viewport: CanvasViewport
+    ) -> CGPoint {
+        let dragOffset = viewportInteraction.nodeDragOffsets[node.id] ?? .zero
+        #if os(iOS)
+        return CanvasScreenSpaceProjection.point(
+            node.position.translated(by: dragOffset),
+            viewport: viewport
+        ).cgPoint
+        #else
+        return displayNode.position.translated(by: dragOffset).cgPoint
+        #endif
+    }
+
+    private func nodeOpacity(
+        for node: CanvasNode,
+        focusedNodeID: NodeID?,
+        focusedNeighborhood: Set<NodeID>
+    ) -> Double {
+        guard focusedNodeID != nil else { return 1 }
+        return focusedNeighborhood.contains(node.id) ? 1 : 0.36
     }
 
     private func handleNodeTap(_ node: CanvasNode) {
@@ -935,7 +978,6 @@ public struct GraphCanvasView: View {
                 await openThreadInReader(node)
             } else {
                 await markThreadReadIfNeeded(node)
-                await loadTranscriptIfNeeded(for: node)
             }
         }
     }
@@ -989,7 +1031,7 @@ public struct GraphCanvasView: View {
                 Task { await loadOlderTranscript(for: threadNode) }
             },
             onUseCachedTranscript: {
-                transcriptError = nil
+                transcriptSessions.clearError(for: .popover)
             },
             onSend: { text, attachments in
                 await send(text, attachments: attachments, from: threadNode)
@@ -1050,7 +1092,7 @@ public struct GraphCanvasView: View {
                 Task { await loadOlderTranscript(for: threadNode) }
             },
             onUseCachedTranscript: {
-                transcriptError = nil
+                transcriptSessions.clearError(for: .popover)
             },
             onSend: { text, attachments in
                 await send(text, attachments: attachments, from: threadNode)
@@ -1081,60 +1123,53 @@ public struct GraphCanvasView: View {
     }
 
     private var displayedViewport: CanvasViewport {
-        let viewport = transientViewport ?? graphStore.graph.viewport
-        return CanvasViewport(
-            scale: viewport.scale,
-            offset: viewport.offset.offsetBy(
-                dx: viewportDragOffset.width,
-                dy: viewportDragOffset.height
-            )
-        )
+        viewportInteraction.displayedViewport(base: graphStore.graph.viewport)
     }
 
     private var viewportPanGesture: some Gesture {
         DragGesture(minimumDistance: 4)
             .onChanged { value in
-                viewportDragOffset = value.translation
+                viewportInteraction.updatePan(translation: value.translation)
             }
             .onEnded { value in
-                let baseViewport = transientViewport ?? graphStore.graph.viewport
-                let committedViewport = CanvasViewport(
-                    scale: baseViewport.scale,
-                    offset: baseViewport.offset.offsetBy(
-                        dx: value.translation.width,
-                        dy: value.translation.height
-                    )
+                let committedViewport = viewportInteraction.finishPan(
+                    translation: value.translation,
+                    base: graphStore.graph.viewport
                 )
-                viewportDragOffset = .zero
-                viewportCommitTask?.cancel()
-                transientViewport = nil
                 Task {
                     await graphStore.updateViewport(committedViewport)
                 }
             }
     }
 
+    private var viewportMagnificationGesture: some Gesture {
+        MagnifyGesture(minimumScaleDelta: 0.01)
+            .onChanged { value in
+                viewportInteraction.updateMagnification(
+                    Double(value.magnification),
+                    base: graphStore.graph.viewport
+                )
+            }
+            .onEnded { value in
+                let committedViewport = viewportInteraction.finishMagnification(
+                    Double(value.magnification),
+                    base: graphStore.graph.viewport
+                )
+                scheduleViewportCommit(committedViewport)
+            }
+    }
+
     private func zoomWithScrollWheel(_ delta: Double) {
-        let clampedDelta = min(80, max(-80, delta))
-        let factor = pow(1.0028, clampedDelta)
-        let baseViewport = transientViewport ?? graphStore.graph.viewport
-        let nextViewport = CanvasViewport(
-            scale: min(1.8, max(0.45, baseViewport.scale * factor)),
-            offset: baseViewport.offset
+        let nextViewport = viewportInteraction.scrollWheelViewport(
+            delta: delta,
+            base: graphStore.graph.viewport
         )
-        transientViewport = nextViewport
         scheduleViewportCommit(nextViewport)
     }
 
     private func scheduleViewportCommit(_ viewport: CanvasViewport) {
-        viewportCommitTask?.cancel()
-        viewportCommitTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(160))
-            guard !Task.isCancelled else { return }
+        viewportInteraction.scheduleCommit(viewport) { viewport in
             await graphStore.updateViewport(viewport)
-            if transientViewport == viewport {
-                transientViewport = nil
-            }
         }
     }
 
@@ -1149,21 +1184,18 @@ public struct GraphCanvasView: View {
     private func nodeDragGesture(for node: CanvasNode, scale: Double) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
-                let safeScale = max(0.1, scale)
-                dragOffsets[node.id] = CGSize(
-                    width: value.translation.width / safeScale,
-                    height: value.translation.height / safeScale
+                viewportInteraction.updateNodeDrag(
+                    node.id,
+                    translation: value.translation,
+                    scale: scale
                 )
             }
             .onEnded { value in
-                let safeScale = max(0.1, scale)
-                let target = node.position.translated(
-                    by: CGSize(
-                        width: value.translation.width / safeScale,
-                        height: value.translation.height / safeScale
-                    )
+                let target = viewportInteraction.finishNodeDrag(
+                    node,
+                    translation: value.translation,
+                    scale: scale
                 )
-                dragOffsets[node.id] = nil
                 Task { await graphStore.moveNode(id: node.id, to: target) }
             }
     }
@@ -1347,66 +1379,51 @@ public struct GraphCanvasView: View {
         )
     }
 
-    private func loadTranscriptIfNeeded(for node: CanvasNode) async {
-        guard node.kind == .codexThread else { return }
-        await loadTranscript(for: node, force: false)
-    }
-
     private func startTranscriptLoad(for node: CanvasNode, force: Bool, markRead: Bool = false) {
-        Task {
-            if markRead {
-                await markThreadReadIfNeeded(node)
-            }
-            await loadTranscript(for: node, force: force)
-        }
+        _ = transcriptLoadTask(for: node, force: force, markRead: markRead)
     }
 
     private func loadTranscript(for node: CanvasNode, force: Bool) async {
-        guard let threadRef = node.metadata.threadRef else { return }
-        if transcript?.threadRef == threadRef, !force {
-            return
-        }
+        await transcriptLoadTask(for: node, force: force).value
+    }
 
-        resetThreadPopoverDataIfNeeded(for: threadRef)
-        let loadGeneration = beginTranscriptLoad(for: threadRef)
-        isLoadingTranscript = true
-        isLoadingOlderTranscript = false
-        transcriptLoadPhase = transcript?.threadRef == threadRef && transcript?.messages.isEmpty == false ? .refreshing : .connectingHost
-        transcriptError = nil
-        defer {
-            if isCurrentTranscriptLoad(threadRef, generation: loadGeneration) {
-                isLoadingTranscript = false
-                transcriptLoadPhase = .idle
+    private func transcriptLoadTask(
+        for node: CanvasNode,
+        force: Bool,
+        markRead: Bool = false
+    ) -> Task<Void, Never> {
+        guard let threadRef = node.metadata.threadRef else { return Task {} }
+        return transcriptSessions.load(
+            .popover,
+            threadRef: threadRef,
+            force: force,
+            prepare: {
+                if markRead {
+                    await markThreadReadIfNeeded(node)
+                }
+                guard !Task.isCancelled else { return }
+                await materializeLocalSubagentsFromRolloutIfAvailable(for: node)
+            },
+            loader: {
+                try await loadTranscript(for: threadRef)
+            },
+            errorMessage: { error in
+                displayMessage(for: error, threadRef: threadRef)
+            },
+            onLoaded: { _ in
+                reconcileAwaitingResponse(for: threadRef)
+            },
+            onFailure: { error, _ in
+                if error.isCodexThreadNotFound {
+                    await recordThreadFailure(
+                        threadRef: threadRef,
+                        method: "thread/turns/list",
+                        summary: "Saved canvas thread was not found in this Codex runtime."
+                    )
+                }
+                reconcileAwaitingResponse(for: threadRef)
             }
-        }
-
-        do {
-            await materializeLocalSubagentsFromRolloutIfAvailable(for: node)
-            guard isCurrentTranscriptLoad(threadRef, generation: loadGeneration) else { return }
-            transcriptLoadPhase = .loadingHistory
-            let loadedTranscript = try await loadTranscript(for: threadRef)
-            guard isCurrentTranscriptLoad(threadRef, generation: loadGeneration) else { return }
-            transcriptLoadPhase = .hydratingArtifacts
-            transcript = loadedTranscript
-            guard isCurrentTranscriptLoad(threadRef, generation: loadGeneration) else { return }
-            reconcileAwaitingResponse(for: threadRef)
-        } catch {
-            guard isCurrentTranscriptLoad(threadRef, generation: loadGeneration) else { return }
-            let message = displayMessage(for: error, threadRef: threadRef)
-            transcriptError = message
-            if transcript?.threadRef != threadRef || transcript?.messages.isEmpty != false {
-                transcript = ThreadTranscript(threadRef: threadRef)
-            }
-
-            if error.isCodexThreadNotFound {
-                await recordThreadFailure(
-                    threadRef: threadRef,
-                    method: "thread/turns/list",
-                    summary: "Saved canvas thread was not found in this Codex runtime."
-                )
-            }
-            reconcileAwaitingResponse(for: threadRef)
-        }
+        )
     }
 
     private func resetThreadPopoverDataIfNeeded(for threadRef: ThreadRef?) {
@@ -1417,29 +1434,7 @@ public struct GraphCanvasView: View {
     }
 
     private func resetThreadPopoverData() {
-        invalidateTranscriptLoad()
-        transcript = nil
-        transcriptError = nil
-        isLoadingTranscript = false
-        isLoadingOlderTranscript = false
-        transcriptLoadPhase = .idle
-    }
-
-    private func beginTranscriptLoad(for threadRef: ThreadRef) -> UInt64 {
-        transcriptLoadGeneration &+= 1
-        activeTranscriptLoadKey = threadRef.qualifiedID
-        return transcriptLoadGeneration
-    }
-
-    private func invalidateTranscriptLoad() {
-        transcriptLoadGeneration &+= 1
-        activeTranscriptLoadKey = nil
-    }
-
-    private func isCurrentTranscriptLoad(_ threadRef: ThreadRef, generation: UInt64) -> Bool {
-        activeTranscriptLoadKey == threadRef.qualifiedID
-            && transcriptLoadGeneration == generation
-            && activePopoverThreadRef?.matches(hostID: threadRef.hostID, threadID: threadRef.threadID) == true
+        transcriptSessions.resetPopover()
     }
 
     private var activePopoverThreadRef: ThreadRef? {
@@ -1447,12 +1442,16 @@ public struct GraphCanvasView: View {
     }
 
     private func closeActiveThreadPopover() {
+        let closingThreadRef = activePopoverThreadRef
         releaseTransientThreadSubscriptionIfNeeded()
         transientOpenGeneration &+= 1
         transientThreadNode = nil
         activeThreadAutomationNodeID = nil
         resetThreadPopoverData()
         graphStore.clearSelection()
+        if let closingThreadRef {
+            cancelLiveTranscriptRefreshIfClosed(closingThreadRef)
+        }
     }
 
     private func openThreadInReader(_ node: CanvasNode) async {
@@ -1474,28 +1473,20 @@ public struct GraphCanvasView: View {
     private func closeThreadInReader(_ nodeID: NodeID) {
         let threadRef = graphStore.graph.nodes[nodeID]?.metadata.threadRef
         readingThreadIDs.removeAll { $0 == nodeID }
-        readingTranscripts[nodeID] = nil
-        readingErrors[nodeID] = nil
-        readingLoadingThreadIDs.remove(nodeID)
-        readingLoadingOlderThreadIDs.remove(nodeID)
-        readingLoadPhases[nodeID] = nil
+        transcriptSessions.removeReader(nodeID)
         if let threadRef, !isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID) {
-            awaitingResponseThreadKeys.remove(threadRef.qualifiedID)
-            liveRefreshThreadKeys.remove(threadRef.qualifiedID)
+            workflowEventLedger.clearAwaiting(threadRef)
+            cancelLiveTranscriptRefresh(for: threadRef.qualifiedID)
         }
     }
 
     private func clearReader() {
         let refs = readingThreadIDs.compactMap { graphStore.graph.nodes[$0]?.metadata.threadRef }
         readingThreadIDs.removeAll()
-        readingTranscripts.removeAll()
-        readingErrors.removeAll()
-        readingLoadingThreadIDs.removeAll()
-        readingLoadingOlderThreadIDs.removeAll()
-        readingLoadPhases.removeAll()
+        transcriptSessions.removeAllReaders()
         for threadRef in refs where !isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID) {
-            awaitingResponseThreadKeys.remove(threadRef.qualifiedID)
-            liveRefreshThreadKeys.remove(threadRef.qualifiedID)
+            workflowEventLedger.clearAwaiting(threadRef)
+            cancelLiveTranscriptRefresh(for: threadRef.qualifiedID)
         }
     }
 
@@ -1518,119 +1509,78 @@ public struct GraphCanvasView: View {
             return
         }
 
-        if readingTranscripts[nodeID]?.threadRef == threadRef, !force {
-            return
-        }
-
-        readingLoadingThreadIDs.insert(nodeID)
-        readingLoadingOlderThreadIDs.remove(nodeID)
-        readingLoadPhases[nodeID] = readingTranscripts[nodeID]?.threadRef == threadRef && readingTranscripts[nodeID]?.messages.isEmpty == false
-            ? .refreshing
-            : .connectingHost
-        readingErrors[nodeID] = nil
-        defer {
-            readingLoadingThreadIDs.remove(nodeID)
-            readingLoadPhases[nodeID] = .idle
-        }
-
-        do {
-            await materializeLocalSubagentsFromRolloutIfAvailable(for: node)
-            guard readingThreadIDs.contains(nodeID) else { return }
-            readingLoadPhases[nodeID] = .loadingHistory
-            let loadedTranscript = try await loadTranscript(for: threadRef)
-            guard readingThreadIDs.contains(nodeID) else { return }
-            readingLoadPhases[nodeID] = .hydratingArtifacts
-            readingTranscripts[nodeID] = loadedTranscript
-            guard readingThreadIDs.contains(nodeID) else { return }
-            reconcileAwaitingResponse(for: threadRef)
-        } catch {
-            guard readingThreadIDs.contains(nodeID) else { return }
-            let message = displayMessage(for: error, threadRef: threadRef)
-            readingErrors[nodeID] = message
-            if readingTranscripts[nodeID]?.threadRef != threadRef || readingTranscripts[nodeID]?.messages.isEmpty != false {
-                readingTranscripts[nodeID] = ThreadTranscript(threadRef: threadRef)
+        await transcriptSessions.load(
+            .reader(nodeID),
+            threadRef: threadRef,
+            force: force,
+            prepare: {
+                await materializeLocalSubagentsFromRolloutIfAvailable(for: node)
+            },
+            loader: {
+                try await loadTranscript(for: threadRef)
+            },
+            errorMessage: { error in
+                displayMessage(for: error, threadRef: threadRef)
+            },
+            onLoaded: { _ in
+                reconcileAwaitingResponse(for: threadRef)
+            },
+            onFailure: { error, _ in
+                if error.isCodexThreadNotFound {
+                    await recordThreadFailure(
+                        threadRef: threadRef,
+                        method: "thread/turns/list",
+                        summary: "Saved canvas thread was not found in this Codex runtime."
+                    )
+                }
+                reconcileAwaitingResponse(for: threadRef)
             }
-
-            if error.isCodexThreadNotFound {
-                await recordThreadFailure(
-                    threadRef: threadRef,
-                    method: "thread/turns/list",
-                    summary: "Saved canvas thread was not found in this Codex runtime."
-                )
-            }
-            reconcileAwaitingResponse(for: threadRef)
-        }
+        ).value
     }
 
     private func loadOlderReadingTranscript(for nodeID: NodeID) async {
         guard
-            !readingLoadingOlderThreadIDs.contains(nodeID),
             let node = graphStore.graph.nodes[nodeID],
             let threadRef = node.metadata.threadRef,
-            readingTranscripts[nodeID]?.threadRef == threadRef,
-            let cursor = readingTranscripts[nodeID]?.nextCursor,
-            !cursor.isEmpty
+            transcriptSessions.readerState(for: nodeID).threadRef == threadRef
         else {
             return
         }
-
-        readingLoadingOlderThreadIDs.insert(nodeID)
-        readingLoadPhases[nodeID] = .loadingOlder
-        defer {
-            readingLoadingOlderThreadIDs.remove(nodeID)
-            readingLoadPhases[nodeID] = .idle
-        }
-
-        do {
-            let olderPage: ThreadTranscript
-            if isLocalThread(threadRef) {
-                olderPage = try await runtimeStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
-            } else {
-                olderPage = try await supervisorStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
+        await transcriptSessions.loadOlder(
+            .reader(nodeID),
+            threadRef: threadRef,
+            loader: { cursor in
+                if isLocalThread(threadRef) {
+                    return try await runtimeStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
+                }
+                return try await supervisorStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
+            },
+            errorMessage: { error in
+                displayMessage(for: error, threadRef: threadRef)
             }
-
-            guard readingThreadIDs.contains(nodeID),
-                  readingTranscripts[nodeID]?.threadRef == threadRef else { return }
-            readingTranscripts[nodeID] = readingTranscripts[nodeID]?.prependingOlderPage(olderPage) ?? olderPage
-            readingErrors[nodeID] = nil
-        } catch {
-            guard readingThreadIDs.contains(nodeID) else { return }
-            readingErrors[nodeID] = displayMessage(for: error, threadRef: threadRef)
-        }
+        )?.value
     }
 
     private func loadOlderTranscript(for node: CanvasNode) async {
         guard
-            !isLoadingOlderTranscript,
             let threadRef = node.metadata.threadRef,
-            transcript?.threadRef == threadRef,
-            let cursor = transcript?.nextCursor,
-            !cursor.isEmpty
+            transcript?.threadRef == threadRef
         else {
             return
         }
-
-        isLoadingOlderTranscript = true
-        transcriptLoadPhase = .loadingOlder
-        defer {
-            isLoadingOlderTranscript = false
-            transcriptLoadPhase = .idle
-        }
-
-        do {
-            let olderPage: ThreadTranscript
-            if isLocalThread(threadRef) {
-                olderPage = try await runtimeStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
-            } else {
-                olderPage = try await supervisorStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
+        await transcriptSessions.loadOlder(
+            .popover,
+            threadRef: threadRef,
+            loader: { cursor in
+                if isLocalThread(threadRef) {
+                    return try await runtimeStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
+                }
+                return try await supervisorStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
+            },
+            errorMessage: { error in
+                displayMessage(for: error, threadRef: threadRef)
             }
-
-            guard transcript?.threadRef == threadRef else { return }
-            transcript = transcript?.prependingOlderPage(olderPage) ?? olderPage
-            transcriptError = nil
-        } catch {
-            transcriptError = displayMessage(for: error, threadRef: threadRef)
-        }
+        )?.value
     }
 
     private func send(_ text: String, attachments: [ChatInputAttachment] = [], from node: CanvasNode) async -> Bool {
@@ -1640,14 +1590,13 @@ public struct GraphCanvasView: View {
         let mentionedFolders = workflowFolderMentions(in: text)
 
         let localMessageID = "local-\(UUID().uuidString)"
-        var workingTranscript = transcript ?? ThreadTranscript(threadRef: threadRef)
-        workingTranscript.messages.append(
-            ThreadMessage(id: localMessageID, role: .user, text: localEchoText(for: text, attachments: attachments))
+        transcriptSessions.appendLocalMessage(
+            ThreadMessage(id: localMessageID, role: .user, text: localEchoText(for: text, attachments: attachments)),
+            to: .popover,
+            threadRef: threadRef
         )
-        transcript = workingTranscript
-        let previousAssistantCount = workingTranscript.messages.filter { $0.role == .assistant }.count
         markNextTurnStartedByUser(threadRef)
-        awaitingResponseThreadKeys.insert(threadRef.qualifiedID)
+        workflowEventLedger.markAwaiting(threadRef)
         var didStartTurn = false
 
         do {
@@ -1671,11 +1620,11 @@ public struct GraphCanvasView: View {
                 attachments: attachments
             )
             didStartTurn = true
-            await refreshTranscriptUntilAssistantResponse(for: node, previousAssistantCount: previousAssistantCount)
+            startLiveTranscriptRefreshIfNeeded(for: threadRef)
         } catch {
             removeLocalMessage(id: localMessageID, threadRef: threadRef)
             let message = displayMessage(for: error, threadRef: threadRef)
-            transcriptError = message
+            transcriptSessions.setError(message, for: .popover)
             await recordThreadFailure(
                 threadRef: threadRef,
                 method: "turn/start",
@@ -1705,14 +1654,13 @@ public struct GraphCanvasView: View {
         let mentionedFolders = workflowFolderMentions(in: text)
 
         let localMessageID = "local-\(UUID().uuidString)"
-        var workingTranscript = readingTranscripts[nodeID] ?? ThreadTranscript(threadRef: threadRef)
-        workingTranscript.messages.append(
-            ThreadMessage(id: localMessageID, role: .user, text: localEchoText(for: text, attachments: attachments))
+        transcriptSessions.appendLocalMessage(
+            ThreadMessage(id: localMessageID, role: .user, text: localEchoText(for: text, attachments: attachments)),
+            to: .reader(nodeID),
+            threadRef: threadRef
         )
-        readingTranscripts[nodeID] = workingTranscript
-        let previousAssistantCount = workingTranscript.messages.filter { $0.role == .assistant }.count
         markNextTurnStartedByUser(threadRef)
-        awaitingResponseThreadKeys.insert(threadRef.qualifiedID)
+        workflowEventLedger.markAwaiting(threadRef)
         var didStartTurn = false
 
         do {
@@ -1736,11 +1684,11 @@ public struct GraphCanvasView: View {
                 attachments: attachments
             )
             didStartTurn = true
-            await refreshReadingTranscriptUntilAssistantResponse(for: nodeID, previousAssistantCount: previousAssistantCount)
+            startLiveTranscriptRefreshIfNeeded(for: threadRef)
         } catch {
             removeLocalMessage(id: localMessageID, threadRef: threadRef, nodeID: nodeID)
             let message = displayMessage(for: error, threadRef: threadRef)
-            readingErrors[nodeID] = message
+            transcriptSessions.setError(message, for: .reader(nodeID))
             await recordThreadFailure(
                 threadRef: threadRef,
                 method: "turn/start",
@@ -1760,81 +1708,6 @@ public struct GraphCanvasView: View {
         let names = attachments.map(\.name).joined(separator: ", ")
         let suffix = "Attached: \(names)"
         return trimmed.isEmpty ? suffix : "\(text)\n\n\(suffix)"
-    }
-
-    private func refreshTranscriptUntilAssistantResponse(for node: CanvasNode, previousAssistantCount: Int) async {
-        guard let threadRef = node.metadata.threadRef else { return }
-
-        for _ in 0..<240 {
-            try? await Task.sleep(for: .milliseconds(900))
-            guard !Task.isCancelled,
-                  isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID) else { return }
-
-            do {
-                let refreshedTranscript = try await loadTranscript(for: threadRef)
-                let mergedTranscript = transcriptMergedWithLocalMessages(serverTranscript: refreshedTranscript)
-                if activePopoverThreadRef?.matches(hostID: threadRef.hostID, threadID: threadRef.threadID) == true {
-                    transcript = mergedTranscript
-                    transcriptError = nil
-                }
-
-                let assistantCount = refreshedTranscript.messages.filter { $0.role == .assistant }.count
-                if assistantCount > previousAssistantCount && !isThreadActivelyRunning(threadRef) {
-                    return
-                }
-            } catch {
-                transcriptError = displayMessage(for: error, threadRef: threadRef)
-                if error.isCodexThreadNotFound {
-                    await recordThreadFailure(
-                        threadRef: threadRef,
-                        method: "thread/turns/list",
-                        summary: "Saved canvas thread was not found in this Codex runtime."
-                    )
-                }
-                return
-            }
-        }
-    }
-
-    private func refreshReadingTranscriptUntilAssistantResponse(for nodeID: NodeID, previousAssistantCount: Int) async {
-        guard
-            let node = graphStore.graph.nodes[nodeID],
-            let threadRef = node.metadata.threadRef
-        else {
-            return
-        }
-
-        for _ in 0..<240 {
-            try? await Task.sleep(for: .milliseconds(900))
-            guard !Task.isCancelled,
-                  readingThreadIDs.contains(nodeID) else { return }
-
-            do {
-                let refreshedTranscript = try await loadTranscript(for: threadRef)
-                guard readingThreadIDs.contains(nodeID) else { return }
-                readingTranscripts[nodeID] = transcriptMergedWithLocalMessages(
-                    existing: readingTranscripts[nodeID],
-                    serverTranscript: refreshedTranscript
-                )
-                readingErrors[nodeID] = nil
-
-                let assistantCount = refreshedTranscript.messages.filter { $0.role == .assistant }.count
-                if assistantCount > previousAssistantCount && !isThreadActivelyRunning(threadRef) {
-                    return
-                }
-            } catch {
-                guard readingThreadIDs.contains(nodeID) else { return }
-                readingErrors[nodeID] = displayMessage(for: error, threadRef: threadRef)
-                if error.isCodexThreadNotFound {
-                    await recordThreadFailure(
-                        threadRef: threadRef,
-                        method: "thread/turns/list",
-                        summary: "Saved canvas thread was not found in this Codex runtime."
-                    )
-                }
-                return
-            }
-        }
     }
 
     private func displayMessage(for error: Error, threadRef: ThreadRef) -> String {
@@ -2017,9 +1890,6 @@ public struct GraphCanvasView: View {
             transientOpenGeneration &+= 1
             transientThreadNode = nil
             graphStore.selectNode(nodeID)
-            if let node = graphStore.graph.nodes[nodeID] {
-                startTranscriptLoad(for: node, force: true, markRead: true)
-            }
             return
         }
 
@@ -2516,10 +2386,6 @@ public struct GraphCanvasView: View {
         if node.kind == .codexThread {
             Button {
                 graphStore.selectNode(node.id)
-                Task {
-                    await markThreadReadIfNeeded(node)
-                    await loadTranscript(for: node, force: true)
-                }
             } label: {
                 Label("Open Chat", systemImage: "bubble.left.and.bubble.right")
             }
@@ -2703,7 +2569,7 @@ public struct GraphCanvasView: View {
                 turnID = try await supervisorStore.interruptThread(threadRef)
             }
 
-            awaitingResponseThreadKeys.remove(key)
+            workflowEventLedger.clearAwaiting(key: key)
             let event = WorkflowEvent(
                 kind: .turnCompleted,
                 hostID: threadRef.hostID,
@@ -2721,7 +2587,7 @@ public struct GraphCanvasView: View {
             await refreshOpenTranscripts(for: threadRef)
         } catch {
             let message = displayMessage(for: error, threadRef: threadRef)
-            transcriptError = message
+            transcriptSessions.setError(message, for: .popover)
             graphStore.errorMessage = message
         }
     }
@@ -2740,7 +2606,7 @@ public struct GraphCanvasView: View {
             await deleteCanvasNode(node)
         } catch {
             graphStore.errorMessage = error.localizedDescription
-            transcriptError = error.localizedDescription
+            transcriptSessions.setError(error.localizedDescription, for: .popover)
         }
     }
 
@@ -2766,7 +2632,7 @@ public struct GraphCanvasView: View {
             )
         } catch {
             graphStore.errorMessage = error.localizedDescription
-            transcriptError = error.localizedDescription
+            transcriptSessions.setError(error.localizedDescription, for: .popover)
         }
     }
 
@@ -2808,8 +2674,7 @@ public struct GraphCanvasView: View {
 
     private func deleteCanvasNode(_ node: CanvasNode) async {
         if selectedNodeID == node.id {
-            transcript = nil
-            transcriptError = nil
+            transcriptSessions.resetPopover()
             graphStore.clearSelection()
         }
 
@@ -2990,22 +2855,15 @@ public struct GraphCanvasView: View {
         guard let threadRef = node.metadata.threadRef else {
             return false
         }
-        return awaitingResponseThreadKeys.contains(threadRef.qualifiedID)
-            && (isThreadActivelyRunning(threadRef)
-                || hasPendingUserTurnStart(for: threadRef))
+        return workflowEventLedger.isAwaiting(
+            threadRef,
+            isRunning: isThreadActivelyRunning(threadRef)
+        )
     }
 
     private func reconcileAwaitingResponse(for threadRef: ThreadRef) {
         if !isThreadActivelyRunning(threadRef) {
-            awaitingResponseThreadKeys.remove(threadRef.qualifiedID)
-        }
-    }
-
-    private func hasPendingUserTurnStart(for threadRef: ThreadRef, now: Date = Date()) -> Bool {
-        pendingUserTurnStarts.contains { marker in
-            marker.threadID == threadRef.threadID
-                && marker.hostID == threadRef.hostID
-                && now.timeIntervalSince(marker.createdAt) <= Self.userTurnMarkerFollowWindow
+            workflowEventLedger.clearAwaiting(threadRef)
         }
     }
 
@@ -3016,52 +2874,44 @@ public struct GraphCanvasView: View {
         switch event.kind {
         case .turnStarted:
             guard shouldApplyEventToRunState(event), isThreadActivelyRunning(threadRef) else {
-                awaitingResponseThreadKeys.remove(key)
+                workflowEventLedger.clearAwaiting(key: key)
                 return
             }
-            awaitingResponseThreadKeys.insert(key)
+            workflowEventLedger.markAwaiting(threadRef)
             startLiveTranscriptRefreshIfNeeded(for: threadRef)
         case .turnCompleted, .failed, .needsInput:
             await refreshOpenTranscripts(for: threadRef)
-            awaitingResponseThreadKeys.remove(key)
+            workflowEventLedger.clearAwaiting(key: key)
         case .threadCreated, .folderCreated:
             break
         }
     }
 
     private func startLiveTranscriptRefreshIfNeeded(for threadRef: ThreadRef) {
-        let key = threadRef.qualifiedID
-        guard isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID),
-              !liveRefreshThreadKeys.contains(key) else {
-            return
-        }
-
-        liveRefreshThreadKeys.insert(key)
-        Task {
-            await liveTranscriptRefreshLoop(for: threadRef, key: key)
-        }
+        transcriptSessions.startLiveRefresh(
+            for: threadRef,
+            isOpen: {
+                isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID)
+            },
+            refresh: {
+                await refreshOpenTranscripts(for: threadRef)
+            },
+            shouldContinue: {
+                isThreadActivelyRunning(threadRef)
+            },
+            onFinished: {
+                workflowEventLedger.clearAwaiting(threadRef)
+            }
+        )
     }
 
-    private func liveTranscriptRefreshLoop(for threadRef: ThreadRef, key: String) async {
-        defer {
-            liveRefreshThreadKeys.remove(key)
-        }
+    private func cancelLiveTranscriptRefreshIfClosed(_ threadRef: ThreadRef) {
+        guard !isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID) else { return }
+        cancelLiveTranscriptRefresh(for: threadRef.qualifiedID)
+    }
 
-        for _ in 0..<240 {
-            try? await Task.sleep(for: .milliseconds(900))
-            guard isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID) else {
-                return
-            }
-
-            await refreshOpenTranscripts(for: threadRef)
-
-            if !isThreadActivelyRunning(threadRef) {
-                awaitingResponseThreadKeys.remove(key)
-                return
-            }
-        }
-
-        awaitingResponseThreadKeys.remove(key)
+    private func cancelLiveTranscriptRefresh(for key: String) {
+        transcriptSessions.cancelLiveRefresh(for: key)
     }
 
     private func refreshOpenTranscripts(for threadRef: ThreadRef) async {
@@ -3072,16 +2922,11 @@ public struct GraphCanvasView: View {
         do {
             let refreshedTranscript = try await loadTranscript(for: threadRef)
             if (transientThreadNode ?? selectedThreadNode)?.metadata.threadRef?.matches(hostID: threadRef.hostID, threadID: threadRef.threadID) == true {
-                transcript = transcriptMergedWithLocalMessages(serverTranscript: refreshedTranscript)
-                transcriptError = nil
+                transcriptSessions.merge(refreshedTranscript, into: .popover)
             }
 
             for nodeID in readingThreadIDs where graphStore.graph.nodes[nodeID]?.metadata.threadRef?.matches(hostID: threadRef.hostID, threadID: threadRef.threadID) == true {
-                readingTranscripts[nodeID] = transcriptMergedWithLocalMessages(
-                    existing: readingTranscripts[nodeID],
-                    serverTranscript: refreshedTranscript
-                )
-                readingErrors[nodeID] = nil
+                transcriptSessions.merge(refreshedTranscript, into: .reader(nodeID))
             }
 
             applyThreadCatalogRuntimeState()
@@ -3090,10 +2935,10 @@ public struct GraphCanvasView: View {
         } catch {
             let message = displayMessage(for: error, threadRef: threadRef)
             if (transientThreadNode ?? selectedThreadNode)?.metadata.threadRef?.matches(hostID: threadRef.hostID, threadID: threadRef.threadID) == true {
-                transcriptError = message
+                transcriptSessions.setError(message, for: .popover)
             }
             for nodeID in readingThreadIDs where graphStore.graph.nodes[nodeID]?.metadata.threadRef?.matches(hostID: threadRef.hostID, threadID: threadRef.threadID) == true {
-                readingErrors[nodeID] = message
+                transcriptSessions.setError(message, for: .reader(nodeID))
             }
             reconcileAwaitingResponse(for: threadRef)
         }
@@ -3107,91 +2952,22 @@ public struct GraphCanvasView: View {
         await graphStore.updateThreadRunStatus(for: threadRef, status: state.status)
     }
 
-    private func transcriptMergedWithLocalMessages(serverTranscript: ThreadTranscript) -> ThreadTranscript {
-        transcriptMergedWithLocalMessages(existing: transcript, serverTranscript: serverTranscript)
-    }
-
     private func removeLocalMessage(id: String, threadRef: ThreadRef, nodeID: NodeID? = nil) {
-        if transcript?.threadRef == threadRef {
-            transcript?.messages.removeAll { $0.id == id }
-        }
+        transcriptSessions.removeLocalMessage(id: id, from: .popover, threadRef: threadRef)
 
         if let nodeID {
-            readingTranscripts[nodeID]?.messages.removeAll { $0.id == id }
+            transcriptSessions.removeLocalMessage(id: id, from: .reader(nodeID), threadRef: threadRef)
         }
-    }
-
-    private func transcriptMergedWithLocalMessages(
-        existing: ThreadTranscript?,
-        serverTranscript: ThreadTranscript
-    ) -> ThreadTranscript {
-        guard existing?.threadRef == serverTranscript.threadRef else {
-            return serverTranscript
-        }
-
-        var mergedTranscript = serverTranscript
-        var seenIDs = Set(serverTranscript.messages.map(\.id))
-        let existingLoadedMessages = existing?.messages.filter { message in
-            !message.id.hasPrefix("local-") && seenIDs.insert(message.id).inserted
-        } ?? []
-        let localOnlyMessages = existing?.messages.filter { message in
-            message.id.hasPrefix("local-")
-                && !serverTranscript.messages.contains { serverMessage in
-                    serverMessageRepresentsLocalMessage(serverMessage, localMessage: message)
-                }
-        } ?? []
-        mergedTranscript.messages = (existingLoadedMessages + serverTranscript.messages + localOnlyMessages)
-            .enumerated()
-            .sorted { lhs, rhs in
-                if lhs.element.createdAt == rhs.element.createdAt {
-                    return lhs.offset < rhs.offset
-                }
-                return lhs.element.createdAt < rhs.element.createdAt
-            }
-            .map(\.element)
-        if (existing?.messages.count ?? 0) > serverTranscript.messages.count {
-            mergedTranscript.nextCursor = existing?.nextCursor
-        }
-        return mergedTranscript
-    }
-
-    private func serverMessageRepresentsLocalMessage(_ serverMessage: ThreadMessage, localMessage: ThreadMessage) -> Bool {
-        guard serverMessage.role == localMessage.role else {
-            return false
-        }
-        if serverMessage.text == localMessage.text {
-            return true
-        }
-        guard localMessage.role == .user,
-              !localMessage.text.isEmpty,
-              serverMessage.text.hasPrefix(localMessage.text),
-              (
-                serverMessage.text.contains("Workflow chat references:")
-                    || serverMessage.text.contains("Workflow folder references:")
-              )
-        else {
-            return false
-        }
-        return true
     }
 
     private func handleWorkflowEvents(_ events: [WorkflowEvent]) async {
-        let unhandledEvents = events
-            .reversed()
-            .filter { !handledWorkflowEventIDs.contains($0.dedupeKey) }
-
-        for event in unhandledEvents {
-            let isLiveEvent = event.createdAt >= workflowEventStateStartedAt
-            let eventKey = event.dedupeKey
-            handledWorkflowEventIDs.insert(eventKey)
-            handledWorkflowEventIDOrder.append(eventKey)
-            captureUserStartedTurnIfNeeded(for: event)
-            pruneUserTurnAttribution(now: event.createdAt)
+        for delivery in workflowEventLedger.deliveries(for: events) {
+            let event = delivery.event
             let threadTitle = threadTitle(for: event)
             if shouldApplyEventToRunState(event) {
                 await graphStore.applyWorkflowEvent(event, markUnread: shouldMarkUnread(for: event))
             }
-            if isLiveEvent {
+            if delivery.isLive {
                 await materializeCreatedFolderIfNeeded(from: event)
                 await materializeCreatedThreadIfNeeded(from: event)
                 await refreshVisibleTranscripts(after: event)
@@ -3202,20 +2978,12 @@ public struct GraphCanvasView: View {
             }
         }
 
-        if handledWorkflowEventIDs.count > 160 {
-            handledWorkflowEventIDOrder = Array(handledWorkflowEventIDOrder.suffix(80))
-            handledWorkflowEventIDs = Set(handledWorkflowEventIDOrder)
-        }
-
         applyThreadCatalogRuntimeState()
         await syncInboxSubscriptions()
     }
 
     private func primeHandledWorkflowEvents(_ events: [WorkflowEvent]) {
-        workflowEventStateStartedAt = Date()
-        let primedEvents = events.reversed()
-        handledWorkflowEventIDs = Set(primedEvents.map(\.dedupeKey))
-        handledWorkflowEventIDOrder = Array(primedEvents.map(\.dedupeKey).suffix(80))
+        workflowEventLedger.prime(events)
     }
 
     private func applyThreadCatalogRuntimeState() {
@@ -3322,16 +3090,13 @@ public struct GraphCanvasView: View {
     }
 
     private func shouldApplyEventToRunState(_ event: WorkflowEvent) -> Bool {
-        guard event.kind != .threadCreated && event.kind != .folderCreated else {
-            return false
-        }
-        return event.kind != .turnStarted || event.createdAt >= workflowEventStateStartedAt
+        workflowEventLedger.shouldApplyToRunState(event)
     }
 
     private func shouldMarkUnread(for event: WorkflowEvent) -> Bool {
         guard
             event.kind == .turnCompleted,
-            event.createdAt >= workflowEventStateStartedAt,
+            workflowEventLedger.isLive(event),
             let threadID = event.threadID
         else {
             return false
@@ -3433,7 +3198,7 @@ public struct GraphCanvasView: View {
     }
 
     private func turnOriginTitle(for event: WorkflowEvent) -> String? {
-        if isUserStartedTurn(event) {
+        if workflowEventLedger.isUserStartedTurn(event, in: workflowEvents) {
             return "you"
         }
 
@@ -3443,81 +3208,7 @@ public struct GraphCanvasView: View {
     }
 
     private func markNextTurnStartedByUser(_ threadRef: ThreadRef) {
-        pendingUserTurnStarts.removeAll { marker in
-            Date().timeIntervalSince(marker.createdAt) > Self.userTurnMarkerFollowWindow
-        }
-        pendingUserTurnStarts.append(
-            PendingUserTurnStart(
-                hostID: threadRef.hostID,
-                threadID: threadRef.threadID,
-                createdAt: Date()
-            )
-        )
-    }
-
-    private func captureUserStartedTurnIfNeeded(for event: WorkflowEvent) {
-        guard event.kind == .turnStarted,
-              let threadID = event.threadID,
-              let key = userTurnKey(for: event) else {
-            return
-        }
-
-        guard let index = pendingUserTurnStarts.firstIndex(where: { marker in
-            marker.threadID == threadID
-                && (event.hostID == nil || marker.hostID == event.hostID)
-                && event.createdAt.timeIntervalSince(marker.createdAt) >= -Self.userTurnMarkerLeadWindow
-                && event.createdAt.timeIntervalSince(marker.createdAt) <= Self.userTurnMarkerFollowWindow
-        }) else {
-            return
-        }
-
-        pendingUserTurnStarts.remove(at: index)
-        userStartedTurnKeys[key] = event.createdAt
-    }
-
-    private func isUserStartedTurn(_ event: WorkflowEvent) -> Bool {
-        guard let basisEvent = userStartedBasisEvent(for: event),
-              let key = userTurnKey(for: basisEvent) else {
-            return false
-        }
-        return userStartedTurnKeys[key] != nil
-    }
-
-    private func userStartedBasisEvent(for event: WorkflowEvent) -> WorkflowEvent? {
-        guard event.kind == .turnCompleted else {
-            return event.kind == .turnStarted ? event : nil
-        }
-
-        return workflowEvents
-            .filter { candidate in
-                candidate.kind == .turnStarted
-                    && candidate.threadID == event.threadID
-                    && (event.hostID == nil || candidate.hostID == nil || candidate.hostID == event.hostID)
-                    && (event.turnID == nil || candidate.turnID == event.turnID)
-                    && candidate.createdAt <= event.createdAt
-            }
-            .max { $0.createdAt < $1.createdAt }
-    }
-
-    private func userTurnKey(for event: WorkflowEvent) -> String? {
-        guard let threadID = event.threadID else {
-            return nil
-        }
-
-        let hostID = event.hostID?.rawValue ?? "unknown"
-        if let turnID = event.turnID, !turnID.isEmpty {
-            return "\(hostID)::\(threadID)::\(turnID)"
-        }
-        return "\(hostID)::\(threadID)::\(event.dedupeKey)"
-    }
-
-    private func pruneUserTurnAttribution(now: Date = Date()) {
-        pendingUserTurnStarts.removeAll { marker in
-            now.timeIntervalSince(marker.createdAt) > Self.userTurnMarkerFollowWindow
-        }
-        userStartedTurnKeys = userStartedTurnKeys.filter { _, createdAt in
-            now.timeIntervalSince(createdAt) <= Self.userTurnAttributionRetention
-        }
+        workflowEventLedger.markNextTurnStartedByUser(threadRef)
     }
 
     private func workflowThreadMentions(in text: String, excluding currentThreadRef: ThreadRef?) -> [WorkflowThreadMentionContext] {
@@ -3988,6 +3679,7 @@ private struct EdgeNotePopoverView: View {
     var onClose: () -> Void
 
     @State private var draftLabel = ""
+    @FocusState private var isLabelFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -4006,12 +3698,15 @@ private struct EdgeNotePopoverView: View {
                     Image(systemName: "xmark")
                 }
                 .buttonStyle(.plain)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
                 .help("Close")
                 .accessibilityLabel("Close line editor")
             }
 
             TextField("Label", text: $draftLabel)
                 .textFieldStyle(.roundedBorder)
+                .focused($isLabelFocused)
                 .onSubmit { onSave(draftLabel) }
 
             if !routes.isEmpty {
@@ -4072,6 +3767,7 @@ private struct EdgeNotePopoverView: View {
         .shadow(color: .black.opacity(0.16), radius: 12, x: 0, y: 6)
         .onAppear {
             draftLabel = edge.label ?? ""
+            isLabelFocused = true
         }
         .onChange(of: edge.id) { _, _ in
             draftLabel = edge.label ?? ""

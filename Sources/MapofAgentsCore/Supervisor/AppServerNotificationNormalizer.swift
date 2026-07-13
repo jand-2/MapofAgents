@@ -64,6 +64,7 @@ public enum AppServerNotificationNormalizer {
             id: stableID,
             hostID: hostID,
             requestID: requestID,
+            connectionID: notification.connectionID,
             method: notification.method,
             threadID: threadID(from: notification.params),
             turnID: turnID(from: notification.params),

@@ -1,14 +1,33 @@
 import Foundation
 
+#if os(macOS)
+import Darwin
+#endif
+
+public struct AppServerConnectionID: RawRepresentable, Codable, Hashable, Sendable {
+    public var rawValue: UUID
+
+    public init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
+}
+
 public struct CodexServerNotification: Sendable, Hashable {
     public var method: String
     public var params: JSONValue?
     public var requestID: JSONRPCRequestID?
+    public var connectionID: AppServerConnectionID?
 
-    public init(method: String, params: JSONValue?, requestID: JSONRPCRequestID? = nil) {
+    public init(
+        method: String,
+        params: JSONValue?,
+        requestID: JSONRPCRequestID? = nil,
+        connectionID: AppServerConnectionID? = nil
+    ) {
         self.method = method
         self.params = params
         self.requestID = requestID
+        self.connectionID = connectionID
     }
 }
 
@@ -20,6 +39,8 @@ public enum CodexAppServerError: Error, LocalizedError, Sendable {
     case invalidResponse
     case daemonProxyHandshakeFailed(String)
     case daemonProxyRequestTimedOut(method: String)
+    case ambiguousWrite(method: String)
+    case staleServerRequest
     case server(String)
     case transport(String)
 
@@ -39,6 +60,10 @@ public enum CodexAppServerError: Error, LocalizedError, Sendable {
             return "Daemon proxy handshake failed: \(message)"
         case .daemonProxyRequestTimedOut(let method):
             return "Timed out waiting for \(method) response from daemon proxy Codex App Server."
+        case .ambiguousWrite(let method):
+            return "The connection ended before Codex confirmed \(method). The request was not replayed because it may already have completed; runtime state was refreshed before another attempt."
+        case .staleServerRequest:
+            return "This request belongs to an App Server connection that is no longer active."
         case .server(let message):
             return message
         case .transport(let message):
@@ -78,8 +103,7 @@ public extension Error {
 }
 
 public actor CodexAppServerClient {
-    private var nextRequestID = 1
-    private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
+    private let session = AppServerSession()
     private var notificationHandler: (@Sendable (CodexServerNotification) -> Void)?
     private var launchDescription = "not started"
     private var daemonDiagnostic: String?
@@ -89,8 +113,11 @@ public actor CodexAppServerClient {
     #if os(macOS)
     private var framing: Framing = .jsonLines
     private var preferStdioFallbackUntil: Date?
+    private var connectionID: AppServerConnectionID?
     private var process: Process?
     private var stdinPipe: Pipe?
+    private var stdoutPipe: Pipe?
+    private var stderrPipe: Pipe?
     private var stdoutBuffer = Data()
     #endif
 
@@ -128,6 +155,14 @@ public actor CodexAppServerClient {
         #endif
     }
 
+    public func currentConnectionID() -> AppServerConnectionID? {
+        #if os(macOS)
+        connectionID
+        #else
+        nil
+        #endif
+    }
+
     public func markInitialized() {
         didInitialize = true
     }
@@ -137,6 +172,8 @@ public actor CodexAppServerClient {
         if process?.isRunning == true {
             return
         }
+
+        invalidateConnection(terminate: false)
 
         guard let codexPath = LocalCodexDiscovery.findCodexExecutable() else {
             throw CodexAppServerError.codexNotInstalled
@@ -154,22 +191,26 @@ public actor CodexAppServerClient {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
+        let connectionID = AppServerConnectionID()
+        process.terminationHandler = { [weak self] _ in
+            Task { await self?.handleProcessExit(connectionID: connectionID) }
+        }
+
         do {
             try process.run()
         } catch {
             throw CodexAppServerError.launchFailed(error.localizedDescription)
         }
 
+        self.connectionID = connectionID
         self.process = process
         self.stdinPipe = stdinPipe
+        self.stdoutPipe = stdoutPipe
+        self.stderrPipe = stderrPipe
         self.launchDescription = launchMode.description
         self.framing = launchMode.framing
         self.didInitialize = false
         self.stdoutBuffer.removeAll(keepingCapacity: true)
-
-        process.terminationHandler = { [weak self] _ in
-            Task { await self?.handleProcessExit() }
-        }
 
         if launchMode.framing == .webSocketFrames {
             do {
@@ -181,11 +222,7 @@ public actor CodexAppServerClient {
             } catch {
                 preferStdioFallbackUntil = Date().addingTimeInterval(60)
                 daemonDiagnostic = error.localizedDescription
-                process.terminate()
-                self.process = nil
-                self.stdinPipe = nil
-                self.didInitialize = false
-                self.stdoutBuffer.removeAll(keepingCapacity: true)
+                invalidateConnection(connectionID: connectionID, terminate: true)
                 throw error
             }
         }
@@ -193,17 +230,24 @@ public actor CodexAppServerClient {
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            Task { await self?.ingest(data) }
+            Task { await self?.ingest(data, connectionID: connectionID) }
         }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            Task { await self?.appendProtocolDiagnostic(Self.stderrDiagnostic(from: data)) }
+            Task {
+                await self?.appendProtocolDiagnostic(
+                    Self.stderrDiagnostic(from: data),
+                    connectionID: connectionID
+                )
+            }
         }
 
         if !stdoutBuffer.isEmpty {
-            ingest(Data())
+            Task { [weak self] in
+                await self?.ingest(Data(), connectionID: connectionID)
+            }
         }
         #else
         throw CodexAppServerError.unsupportedPlatform
@@ -212,81 +256,70 @@ public actor CodexAppServerClient {
 
     public func stop() {
         #if os(macOS)
-        process?.terminate()
-        process = nil
-        stdinPipe = nil
-        didInitialize = false
-        pending.values.forEach { $0.resume(throwing: CodexAppServerError.disconnected) }
-        pending.removeAll()
+        invalidateConnection(terminate: true)
         #endif
     }
 
-    public func request(method: String, params: JSONValue = .object([:])) async throws -> JSONValue {
+    public func request(_ call: AppServerCall) async throws -> JSONValue {
         try start()
-
-        let requestID = nextRequestID
-        nextRequestID += 1
-
-        let message: JSONValue = .object([
-            "id": .number(Double(requestID)),
-            "method": .string(method),
-            "params": params,
-        ])
-
         #if os(macOS)
-        let timeoutTask = Self.timeoutSeconds(for: method).map { seconds in
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(seconds))
-                await self?.timeoutRequest(id: requestID, method: method)
+        guard let connectionID else { throw CodexAppServerError.disconnected }
+        let timeoutContext: AppServerSessionTimeoutContext = framing == .webSocketFrames
+            ? .localDaemonProxy
+            : .localStdio
+        do {
+            return try await session.request(
+                call,
+                connectionID: connectionID,
+                timeoutContext: timeoutContext
+            ) { [weak self] message, expectedConnectionID in
+                guard let self else { throw CodexAppServerError.disconnected }
+                try await self.sendSessionMessage(message, connectionID: expectedConnectionID)
             }
+        } catch {
+            if self.connectionID == connectionID,
+               framing == .webSocketFrames,
+               Self.isSessionTimeout(error, method: call.method) {
+                preferStdioFallbackUntil = Date().addingTimeInterval(60)
+                if call.method == .initialize {
+                    invalidateConnection(connectionID: connectionID, terminate: true)
+                }
+            }
+            throw error
         }
         #else
-        let timeoutTask: Task<Void, Never>? = nil
+        throw CodexAppServerError.unsupportedPlatform
         #endif
-        defer {
-            timeoutTask?.cancel()
-        }
-
-        let result = try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = continuation
-            do {
-                try writeMessage(message)
-            } catch {
-                pending[requestID] = nil
-                continuation.resume(throwing: error)
-            }
-        }
-        return result
     }
 
     public func readFile(path: String) async throws -> Data {
-        let result = try await request(
-            method: "fs/readFile",
+        let result = try await request(AppServerCall(
+            .readFile,
             params: .object([
                 "path": .string(path),
             ])
-        )
+        ))
         return try Self.fileData(fromReadFileResponse: result)
     }
 
     public func createDirectory(path: String, recursive: Bool = true) async throws {
-        _ = try await request(
-            method: "fs/createDirectory",
+        _ = try await request(AppServerCall(
+            .createDirectory,
             params: .object([
                 "path": .string(path),
                 "recursive": .bool(recursive),
             ])
-        )
+        ))
     }
 
     public func writeFile(path: String, data: Data) async throws {
-        _ = try await request(
-            method: "fs/writeFile",
+        _ = try await request(AppServerCall(
+            .writeFile,
             params: .object([
                 "path": .string(path),
                 "dataBase64": .string(data.base64EncodedString()),
             ])
-        )
+        ))
     }
 
     public static func fileData(fromReadFileResponse result: JSONValue) throws -> Data {
@@ -295,17 +328,6 @@ public actor CodexAppServerClient {
             throw CodexAppServerError.invalidResponse
         }
         return data
-    }
-
-    nonisolated static func timeoutSeconds(for method: String) -> Int? {
-        switch method {
-        case "initialize":
-            return 6
-        case "turn/start":
-            return 60 * 30
-        default:
-            return 20
-        }
     }
 
     public func notify(method: String, params: JSONValue? = nil) throws {
@@ -317,12 +339,25 @@ public actor CodexAppServerClient {
         try writeMessage(.object(body))
     }
 
-    public func respondToServerRequest(id: JSONRPCRequestID, result: JSONValue) throws {
-        try start()
+    public func respondToServerRequest(
+        id: JSONRPCRequestID,
+        result: JSONValue,
+        connectionID expectedConnectionID: AppServerConnectionID
+    ) throws {
+        #if os(macOS)
+        guard connectionID == expectedConnectionID,
+              process?.isRunning == true,
+              didInitialize,
+              stdinPipe != nil else {
+            throw CodexAppServerError.staleServerRequest
+        }
         try writeMessage(.object([
             "id": id.jsonValue,
             "result": result,
         ]))
+        #else
+        throw CodexAppServerError.unsupportedPlatform
+        #endif
     }
 
     private func writeMessage(_ message: JSONValue) throws {
@@ -339,7 +374,21 @@ public actor CodexAppServerClient {
         case .webSocketFrames:
             data = Self.webSocketFrame(opcode: 0x1, payload: payload, masked: true)
         }
-        stdinPipe.fileHandleForWriting.write(data)
+        try Self.writePipeData(data, to: stdinPipe.fileHandleForWriting)
+        #else
+        throw CodexAppServerError.unsupportedPlatform
+        #endif
+    }
+
+    private func sendSessionMessage(
+        _ message: JSONValue,
+        connectionID expectedConnectionID: AppServerConnectionID
+    ) throws {
+        #if os(macOS)
+        guard connectionID == expectedConnectionID else {
+            throw CodexAppServerError.disconnected
+        }
+        try writeMessage(message)
         #else
         throw CodexAppServerError.unsupportedPlatform
         #endif
@@ -417,31 +466,47 @@ public actor CodexAppServerClient {
         }
     }
 
-    private func handleProcessExit() {
-        process = nil
-        stdinPipe = nil
-        didInitialize = false
-        pending.values.forEach { $0.resume(throwing: CodexAppServerError.disconnected) }
-        pending.removeAll()
+    private func handleProcessExit(connectionID: AppServerConnectionID) {
+        invalidateConnection(connectionID: connectionID, terminate: false)
     }
 
-    private func timeoutRequest(id: Int, method: String) {
-        guard let continuation = pending.removeValue(forKey: id) else {
+    private func invalidateConnection(
+        connectionID expectedConnectionID: AppServerConnectionID? = nil,
+        terminate: Bool
+    ) {
+        if let expectedConnectionID, connectionID != expectedConnectionID {
             return
         }
 
-        if framing == .webSocketFrames {
-            preferStdioFallbackUntil = Date().addingTimeInterval(60)
+        let processToTerminate = process
+        let invalidatedConnectionID = connectionID
+        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        connectionID = nil
+        process = nil
+        stdinPipe = nil
+        stdoutPipe = nil
+        stderrPipe = nil
+        didInitialize = false
+        stdoutBuffer.removeAll(keepingCapacity: true)
+        if let invalidatedConnectionID {
+            Task {
+                await session.failPending(connectionID: invalidatedConnectionID)
+            }
         }
+        if terminate, processToTerminate?.isRunning == true {
+            processToTerminate?.terminate()
+        }
+    }
 
-        let error: CodexAppServerError = framing == .webSocketFrames
-            ? .daemonProxyRequestTimedOut(method: method)
-            : .transport("Timed out waiting for \(method) response from Codex App Server.")
-
-        continuation.resume(throwing: error)
-
-        if method == "initialize" {
-            stop()
+    private static func isSessionTimeout(_ error: Error, method: AppServerMethod) -> Bool {
+        switch error as? CodexAppServerError {
+        case .daemonProxyRequestTimedOut:
+            return true
+        case .ambiguousWrite(let timedOutMethod):
+            return timedOutMethod == method.rawValue
+        default:
+            return false
         }
     }
 
@@ -469,7 +534,7 @@ public actor CodexAppServerClient {
             }
         }
 
-        input.write(Data(request.utf8))
+        try Self.writePipeData(Data(request.utf8), to: input)
 
         let result = semaphore.wait(timeout: .now() + 5)
         output.readabilityHandler = nil
@@ -497,33 +562,39 @@ public actor CodexAppServerClient {
         return Data(response[leftoverStart...])
     }
 
-    private func ingest(_ data: Data) {
+    private func ingest(_ data: Data, connectionID: AppServerConnectionID) async {
+        guard self.connectionID == connectionID else { return }
         stdoutBuffer.append(data)
+        guard stdoutBuffer.count <= Self.maximumInboundBufferBytes else {
+            appendProtocolDiagnostic("Codex App Server exceeded the maximum inbound buffer size.")
+            invalidateConnection(connectionID: connectionID, terminate: true)
+            return
+        }
 
         switch framing {
         case .jsonLines:
-            ingestJSONLines()
+            await ingestJSONLines(connectionID: connectionID)
         case .webSocketFrames:
-            ingestWebSocketFrames()
+            await ingestWebSocketFrames(connectionID: connectionID)
         }
     }
 
-    private func ingestJSONLines() {
+    private func ingestJSONLines(connectionID: AppServerConnectionID) async {
         while let newlineIndex = stdoutBuffer.firstIndex(of: 0x0A) {
             let line = stdoutBuffer[..<newlineIndex]
             stdoutBuffer.removeSubrange(...newlineIndex)
             guard !line.isEmpty else { continue }
-            handleLine(Data(line))
+            await handleLine(Data(line), connectionID: connectionID)
         }
     }
 
-    private func ingestWebSocketFrames() {
+    private func ingestWebSocketFrames(connectionID: AppServerConnectionID) async {
         while let frame = nextWebSocketFrame() {
             switch frame.opcode {
             case 0x1:
-                handleLine(frame.payload)
+                await handleLine(frame.payload, connectionID: connectionID)
             case 0x8:
-                handleProcessExit()
+                handleProcessExit(connectionID: connectionID)
             case 0x9:
                 try? writeWebSocketFrame(opcode: 0xA, payload: frame.payload)
             case 0xA:
@@ -570,7 +641,8 @@ public actor CodexAppServerClient {
 
         guard length <= UInt64(Int.max) else { return nil }
         let payloadLength = Int(length)
-        let frameLength = offset + payloadLength
+        let (frameLength, overflow) = offset.addingReportingOverflow(payloadLength)
+        guard !overflow else { return nil }
         guard bytes.count >= frameLength else { return nil }
 
         var payload = Array(bytes[offset..<frameLength])
@@ -588,7 +660,28 @@ public actor CodexAppServerClient {
         guard let stdinPipe else {
             throw CodexAppServerError.disconnected
         }
-        stdinPipe.fileHandleForWriting.write(Self.webSocketFrame(opcode: opcode, payload: payload, masked: true))
+        try Self.writePipeData(
+            Self.webSocketFrame(opcode: opcode, payload: payload, masked: true),
+            to: stdinPipe.fileHandleForWriting
+        )
+    }
+
+    /// A closed child-process pipe normally raises SIGPIPE before Foundation can
+    /// surface its throwing write error. Disable that signal for this descriptor
+    /// so request sends fail through `AppServerSession`, which can classify an
+    /// unacknowledged write as ambiguous and a read as disconnected.
+    nonisolated static func writePipeData(_ data: Data, to handle: FileHandle) throws {
+        let descriptor = handle.fileDescriptor
+        guard descriptor >= 0,
+              Darwin.fcntl(descriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            throw CodexAppServerError.disconnected
+        }
+
+        do {
+            try handle.write(contentsOf: data)
+        } catch {
+            throw CodexAppServerError.disconnected
+        }
     }
 
     private static func webSocketFrame(opcode: UInt8, payload: Data, masked: Bool) -> Data {
@@ -629,71 +722,20 @@ public actor CodexAppServerClient {
         return Data(bytes).base64EncodedString()
     }
 
-    private func handleLine(_ data: Data) {
-        switch Self.parseInboundMessage(data) {
-        case .serverRequest(let notification):
-            notificationHandler?(notification)
-        case .response(let id, let result, let error):
-            let continuation = pending.removeValue(forKey: id)
-            if let error {
-                continuation?.resume(throwing: CodexAppServerError.server(error.readableDescription))
-            } else {
-                continuation?.resume(returning: result ?? .null)
-            }
+    private func handleLine(_ data: Data, connectionID: AppServerConnectionID) async {
+        switch await session.receive(data, connectionID: connectionID) {
         case .notification(let notification):
             notificationHandler?(notification)
-        case .invalid(let diagnostic):
+        case .diagnostic(let diagnostic):
             appendProtocolDiagnostic(diagnostic)
+        case nil:
+            break
         }
     }
 
-    enum InboundMessage: Sendable {
-        case serverRequest(CodexServerNotification)
-        case response(id: Int, result: JSONValue?, error: JSONValue?)
-        case notification(CodexServerNotification)
-        case invalid(String)
-    }
-
-    nonisolated static func parseInboundMessage(_ data: Data) -> InboundMessage {
-        guard
-            let value = try? JSONDecoder().decode(JSONValue.self, from: data),
-            let object = value.objectValue
-        else {
-            let preview = String(data: data, encoding: .utf8)?.trimmedForDisplay ?? "<non-UTF8 payload>"
-            return .invalid("Invalid JSON-RPC frame from Codex App Server: \(preview)")
-        }
-
-        if let requestID = JSONRPCRequestID(object["id"]), let method = object["method"]?.stringValue {
-            return .serverRequest(
-                CodexServerNotification(
-                    method: method,
-                    params: object["params"],
-                    requestID: requestID
-                )
-            )
-        }
-
-        if let rawID = object["id"] {
-            guard let id = rawID.intValue else {
-                return .invalid("Unsupported JSON-RPC response id from Codex App Server: \(rawID.readableDescription)")
-            }
-            return .response(id: id, result: object["result"], error: object["error"])
-        }
-
-        guard let method = object["method"]?.stringValue else {
-            return .invalid("Codex App Server message had neither method nor response id.")
-        }
-
-        return .notification(
-            CodexServerNotification(
-                method: method,
-                params: object["params"]
-            )
-        )
-    }
-
-    func ingestTestLine(_ data: Data) {
-        handleLine(data)
+    func ingestTestLine(_ data: Data) async {
+        let connectionID = self.connectionID ?? AppServerConnectionID()
+        await handleLine(data, connectionID: connectionID)
     }
 
     private static func stderrDiagnostic(from data: Data) -> String {
@@ -701,7 +743,13 @@ public actor CodexAppServerClient {
         return "Codex App Server stderr: \(text.trimmedForDisplay)"
     }
 
-    private func appendProtocolDiagnostic(_ diagnostic: String) {
+    private func appendProtocolDiagnostic(
+        _ diagnostic: String,
+        connectionID expectedConnectionID: AppServerConnectionID? = nil
+    ) {
+        if let expectedConnectionID, connectionID != expectedConnectionID {
+            return
+        }
         let trimmed = diagnostic.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         protocolDiagnostics.insert(trimmed, at: 0)
@@ -709,6 +757,8 @@ public actor CodexAppServerClient {
             protocolDiagnostics.removeLast(protocolDiagnostics.count - 20)
         }
     }
+
+    private static let maximumInboundBufferBytes = 32 * 1_024 * 1_024
     #endif
 }
 
@@ -759,22 +809,3 @@ private extension String {
     }
 }
 #endif
-
-private extension JSONValue {
-    var readableDescription: String {
-        switch self {
-        case .object(let object):
-            return object["message"]?.stringValue ?? String(describing: object)
-        case .array(let array):
-            return String(describing: array)
-        case .string(let string):
-            return string
-        case .number(let number):
-            return String(number)
-        case .bool(let bool):
-            return String(bool)
-        case .null:
-            return "Unknown App Server error"
-        }
-    }
-}

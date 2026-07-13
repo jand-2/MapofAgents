@@ -100,6 +100,8 @@ public enum CodexAutomationStoreError: Error, LocalizedError, Sendable {
     case automationNotFound(String)
     case invalidAutomation(path: String)
     case invalidAutomationDirectory(String)
+    case invalidAutomationID(String)
+    case automationOutsideRoot(String)
 
     public var errorDescription: String? {
         switch self {
@@ -109,6 +111,10 @@ public enum CodexAutomationStoreError: Error, LocalizedError, Sendable {
             return "Codex automation file is missing required fields."
         case .invalidAutomationDirectory:
             return "Codex automation directory is unavailable."
+        case .invalidAutomationID(let id):
+            return "Codex automation ID \(id.debugDescription) is not a safe directory name."
+        case .automationOutsideRoot(let id):
+            return "Codex automation \(id.debugDescription) resolves outside the automations directory."
         }
     }
 }
@@ -122,13 +128,15 @@ public struct CodexAutomationStore: Sendable {
 
     public static func defaultCodexHome(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+        homeDirectory: URL? = nil
     ) -> URL {
         if let value = environment["CODEX_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty {
             return URL(fileURLWithPath: value, isDirectory: true)
         }
-        return homeDirectory.appendingPathComponent(".codex", isDirectory: true)
+        let resolvedHomeDirectory = homeDirectory
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        return resolvedHomeDirectory.appendingPathComponent(".codex", isDirectory: true)
     }
 
     public func loadAutomations() throws -> [CodexAutomationSummary] {
@@ -177,6 +185,7 @@ public struct CodexAutomationStore: Sendable {
     }
 
     public func save(_ edit: CodexAutomationEdit) throws -> CodexAutomationSummary {
+        try Self.validateAutomationID(edit.id)
         let automationsURL = codexHome.appendingPathComponent("automations", isDirectory: true)
         let fileURL = automationsURL
             .appendingPathComponent(edit.id, isDirectory: true)
@@ -184,11 +193,36 @@ public struct CodexAutomationStore: Sendable {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw CodexAutomationStoreError.automationNotFound(edit.id)
         }
+        guard Self.isContained(fileURL, in: automationsURL) else {
+            throw CodexAutomationStoreError.automationOutsideRoot(edit.id)
+        }
 
         let original = try String(contentsOf: fileURL, encoding: .utf8)
         let updated = Self.updatingAutomationTOML(original, with: edit, updatedAt: Date())
         try updated.write(to: fileURL, atomically: true, encoding: .utf8)
         return try Self.loadAutomation(at: fileURL)
+    }
+
+    private static func validateAutomationID(_ id: String) throws {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty,
+              id == trimmed,
+              id != ".",
+              id != "..",
+              !id.contains("/"),
+              !id.contains("\\"),
+              !id.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw CodexAutomationStoreError.invalidAutomationID(id)
+        }
+    }
+
+    private static func isContained(_ fileURL: URL, in rootURL: URL) -> Bool {
+        let resolvedRoot = rootURL.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedFile = fileURL.standardizedFileURL.resolvingSymlinksInPath()
+        let rootComponents = resolvedRoot.pathComponents
+        let fileComponents = resolvedFile.pathComponents
+        return fileComponents.count > rootComponents.count
+            && fileComponents.starts(with: rootComponents)
     }
 
     private static func loadAutomation(at fileURL: URL) throws -> CodexAutomationSummary {

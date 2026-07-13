@@ -3,6 +3,38 @@ import Testing
 @testable import MapofAgentsCore
 
 @Test
+func accessTokenExpiryPolicyClampsExpiredTokensAndRejectsStaleConnections() {
+    let now = Date(timeIntervalSince1970: 1_000)
+    #expect(
+        AppServerAccessTokenExpiryPolicy.delay(
+            until: now.addingTimeInterval(45),
+            now: now
+        ) == 45
+    )
+    #expect(
+        AppServerAccessTokenExpiryPolicy.delay(
+            until: now.addingTimeInterval(-1),
+            now: now
+        ) == 0
+    )
+
+    let current = AppServerConnectionID()
+    let stale = AppServerConnectionID()
+    #expect(
+        AppServerAccessTokenExpiryPolicy.applies(
+            expectedConnectionID: current,
+            currentConnectionID: current
+        )
+    )
+    #expect(
+        !AppServerAccessTokenExpiryPolicy.applies(
+            expectedConnectionID: stale,
+            currentConnectionID: current
+        )
+    )
+}
+
+@Test
 func relayEndpointCanBeRecoveredFromConnectedMachine() throws {
     let machine = SupervisorMachine(
         id: HostID(rawValue: "codex-remote-windows"),

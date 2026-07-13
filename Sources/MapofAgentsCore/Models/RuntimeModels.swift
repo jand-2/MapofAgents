@@ -837,6 +837,7 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
     public var id: String
     public var hostID: HostID?
     public var requestID: JSONRPCRequestID?
+    public var connectionID: AppServerConnectionID?
     public var method: String
     public var threadID: String?
     public var turnID: String?
@@ -848,6 +849,7 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
         id: String,
         hostID: HostID? = nil,
         requestID: JSONRPCRequestID? = nil,
+        connectionID: AppServerConnectionID? = nil,
         method: String,
         threadID: String?,
         turnID: String? = nil,
@@ -858,6 +860,7 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
         self.id = id
         self.hostID = hostID
         self.requestID = requestID
+        self.connectionID = connectionID
         self.method = method
         self.threadID = threadID
         self.turnID = turnID

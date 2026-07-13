@@ -54,9 +54,12 @@ public final class WorkflowSupervisorStore {
     public private(set) var codexRemoteDiagnostics: [HostID: [RuntimeDiagnosticStep]] = [:]
     public private(set) var pendingAttentionRequests: [RuntimeAttentionRequest] = []
     public private(set) var threadRuntimeStates: [String: ThreadRuntimeState] = [:]
+    public private(set) var lastWriteReconciliations: [HostID: AppServerWriteReconciliation] = [:]
+    public private(set) var reconciledThreadCatalogEntries: [String: ThreadCatalogEntry] = [:]
 
     private let supervisor: WorkflowSupervisor
     private var relays: [HostID: AppServerWebSocketWorkflowRelay] = [:]
+    private var relayGenerations: [HostID: UUID] = [:]
     private var remoteTunnels: [HostID: CodexRemoteTunnel] = [:]
     private var activeRelayEndpointsByHostID: [HostID: AppServerRelayEndpoint] = [:]
     private var codexRemoteRecoveryFailures: [HostID: Int] = [:]
@@ -124,6 +127,8 @@ public final class WorkflowSupervisorStore {
         name: String,
         endpoint: String,
         bearerToken: String? = nil,
+        accessTokenProvider: (any AppServerAccessTokenProviding)? = nil,
+        attachmentStagingRoot: String? = nil,
         markFailureOnFailure: Bool = true
     ) async -> HostID? {
         await connectRemote(
@@ -131,6 +136,8 @@ public final class WorkflowSupervisorStore {
             name: name,
             endpoint: endpoint,
             bearerToken: bearerToken,
+            accessTokenProvider: accessTokenProvider,
+            attachmentStagingRoot: attachmentStagingRoot,
             markFailureOnFailure: markFailureOnFailure
         )
     }
@@ -141,10 +148,13 @@ public final class WorkflowSupervisorStore {
         name: String,
         endpoint: String,
         bearerToken: String? = nil,
+        accessTokenProvider: (any AppServerAccessTokenProviding)? = nil,
+        attachmentStagingRoot: String? = nil,
         markFailureOnFailure: Bool = true
     ) async -> HostID? {
         let trimmedEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmedEndpoint) else {
+        guard let url = URL(string: trimmedEndpoint),
+              AppServerRelayEndpoint.endpointStructureError(url) == nil else {
             return nil
         }
 
@@ -161,7 +171,10 @@ public final class WorkflowSupervisorStore {
             bearerToken: bearerToken
         )
 
-        if let securityError = relayEndpoint.connectionSecurityError {
+        if let securityError = AppServerRelayEndpoint.connectionSecurityError(
+            url: relayEndpoint.url,
+            bearerToken: accessTokenProvider == nil ? relayEndpoint.bearerToken : "provided-at-connect"
+        ) {
             await supervisor.upsertMachine(
                 SupervisorMachine(
                     id: machineID,
@@ -175,7 +188,12 @@ public final class WorkflowSupervisorStore {
             return nil
         }
 
-        await connectRemote(relayEndpoint, markFailureOnFailure: markFailureOnFailure)
+        await connectRemote(
+            relayEndpoint,
+            accessTokenProvider: accessTokenProvider,
+            attachmentStagingRoot: attachmentStagingRoot,
+            markFailureOnFailure: markFailureOnFailure
+        )
         return machineID
     }
 
@@ -587,7 +605,7 @@ public final class WorkflowSupervisorStore {
         reasoningEffort: String,
         permissions: CodexThreadPermissions = .default,
         initialPrompt: String
-    ) async throws -> ThreadRef {
+    ) async throws -> ThreadCreationOutcome {
         guard let relay = relays[hostID] else {
             throw CodexAppServerError.disconnected
         }
@@ -888,12 +906,6 @@ public final class WorkflowSupervisorStore {
         guard let relay = relays[threadRef.hostID] else {
             throw CodexAppServerError.disconnected
         }
-        upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
-            state.status = .running
-            state.activeFlags.insert(.running)
-            state.liveAssistantText = ""
-            state.lastActivityAt = Date()
-        }
         try await relay.sendMessage(
             text,
             to: threadRef,
@@ -902,6 +914,12 @@ public final class WorkflowSupervisorStore {
             permissions: permissions,
             attachments: attachments
         )
+        upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
+            state.status = .running
+            state.activeFlags.insert(.running)
+            state.liveAssistantText = ""
+            state.lastActivityAt = Date()
+        }
     }
 
     public func interruptThread(_ threadRef: ThreadRef) async throws -> String {
@@ -931,13 +949,15 @@ public final class WorkflowSupervisorStore {
         }
         guard let hostID = request.hostID,
               let requestID = request.requestID,
+              let connectionID = request.connectionID,
               let relay = relays[hostID] else {
-            throw CodexAppServerError.disconnected
+            throw CodexAppServerError.staleServerRequest
         }
 
         try await relay.respondToServerRequest(
             id: requestID,
-            result: request.appServerApprovalResult(allow: allow)
+            result: request.appServerApprovalResult(allow: allow),
+            connectionID: connectionID
         )
         removeAttentionRequest(hostID: hostID, requestID: requestID.stringValue)
     }
@@ -948,13 +968,15 @@ public final class WorkflowSupervisorStore {
         }
         guard let hostID = request.hostID,
               let requestID = request.requestID,
+              let connectionID = request.connectionID,
               let relay = relays[hostID] else {
-            throw CodexAppServerError.disconnected
+            throw CodexAppServerError.staleServerRequest
         }
 
         try await relay.respondToServerRequest(
             id: requestID,
-            result: request.appServerTextResponseResult(text)
+            result: request.appServerTextResponseResult(text),
+            connectionID: connectionID
         )
         removeAttentionRequest(hostID: hostID, requestID: requestID.stringValue)
     }
@@ -965,13 +987,15 @@ public final class WorkflowSupervisorStore {
         }
         guard let hostID = request.hostID,
               let requestID = request.requestID,
+              let connectionID = request.connectionID,
               let relay = relays[hostID] else {
-            throw CodexAppServerError.disconnected
+            throw CodexAppServerError.staleServerRequest
         }
 
         try await relay.respondToServerRequest(
             id: requestID,
-            result: request.appServerTextDeclineResult()
+            result: request.appServerTextDeclineResult(),
+            connectionID: connectionID
         )
         removeAttentionRequest(hostID: hostID, requestID: requestID.stringValue)
     }
@@ -1014,10 +1038,15 @@ public final class WorkflowSupervisorStore {
     @discardableResult
     private func connectRemote(
         _ relayEndpoint: AppServerRelayEndpoint,
+        accessTokenProvider: (any AppServerAccessTokenProviding)? = nil,
+        attachmentStagingRoot: String? = nil,
         markFailureOnFailure: Bool = true,
         respectBackoff: Bool = false
     ) async -> Bool {
-        if let securityError = relayEndpoint.connectionSecurityError {
+        if let securityError = AppServerRelayEndpoint.connectionSecurityError(
+            url: relayEndpoint.url,
+            bearerToken: accessTokenProvider == nil ? relayEndpoint.bearerToken : "provided-at-connect"
+        ) {
             await supervisor.upsertMachine(
                 SupervisorMachine(
                     id: relayEndpoint.id,
@@ -1042,28 +1071,42 @@ public final class WorkflowSupervisorStore {
         }
 
         await stageRelayEndpointAttempt(relayEndpoint)
+        let relayGeneration = UUID()
+        relayGenerations[relayEndpoint.id] = relayGeneration
         let relay = AppServerWebSocketWorkflowRelay(
             endpoint: relayEndpoint,
             supervisor: supervisor,
+            accessTokenProvider: accessTokenProvider,
+            attachmentStagingRoot: attachmentStagingRoot,
             reportsConnectionFailures: markFailureOnFailure,
             onAttentionRequest: { [weak self] request in
                 Task { @MainActor in
+                    guard self?.relayGenerations[relayEndpoint.id] == relayGeneration else { return }
                     self?.upsertAttentionRequest(request)
                 }
             },
             onAttentionResolved: { [weak self] hostID, requestID in
                 Task { @MainActor in
+                    guard self?.relayGenerations[hostID] == relayGeneration else { return }
                     self?.removeAttentionRequest(hostID: hostID, requestID: requestID)
                 }
             },
             onNotification: { [weak self] hostID, notification in
                 Task { @MainActor in
+                    guard self?.relayGenerations[hostID] == relayGeneration else { return }
                     self?.handleRemoteNotification(notification, hostID: hostID)
                 }
             },
             onDisconnected: { [weak self] hostID in
                 Task { @MainActor in
+                    guard self?.relayGenerations[hostID] == relayGeneration else { return }
                     await self?.handleRelayDisconnected(hostID: hostID)
+                }
+            },
+            onWriteReconciled: { [weak self] reconciliation in
+                Task { @MainActor in
+                    guard self?.relayGenerations[reconciliation.hostID] == relayGeneration else { return }
+                    self?.applyWriteReconciliation(reconciliation)
                 }
             }
         )
@@ -1089,6 +1132,7 @@ public final class WorkflowSupervisorStore {
             tunnel.stop()
         }
         activeRelayEndpointsByHostID[machineID] = nil
+        relayGenerations[machineID] = nil
         clearHostScopedRuntimeState(hostID: machineID)
         if let relay = relays.removeValue(forKey: machineID) {
             await relay.stop()
@@ -1125,6 +1169,42 @@ public final class WorkflowSupervisorStore {
         reduceRuntimeState(notification: notification, hostID: hostID)
     }
 
+    func applyWriteReconciliation(_ reconciliation: AppServerWriteReconciliation) {
+        lastWriteReconciliations[reconciliation.hostID] = reconciliation
+        for entry in reconciliation.observedCatalogEntries {
+            reconciledThreadCatalogEntries[entry.id] = entry
+        }
+
+        if let transcript = reconciliation.transcript,
+           let threadRef = reconciliation.affectedThreadRefs.first {
+            upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
+                state.reconcileAfterLatestTranscriptRead(transcript)
+                state.currentActivitySummary = reconciliation.confirmedCommitted
+                    ? "State confirmed after reconnect"
+                    : "State refreshed after an unconfirmed write"
+            }
+        } else if reconciliation.confirmedCommitted {
+            for threadRef in reconciliation.affectedThreadRefs {
+                upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
+                    state.lastActivityAt = Date()
+                    state.currentActivitySummary = "State confirmed after reconnect"
+                    if reconciliation.method == .startTurn {
+                        state.status = .running
+                        state.activeFlags.insert(.running)
+                    }
+                }
+            }
+        }
+
+        if reconciliation.method == .archiveThread,
+           reconciliation.confirmedCommitted,
+           let threadID = reconciliation.affectedThreadRefs.first?.threadID {
+            let key = ThreadRef.qualifiedID(hostID: reconciliation.hostID, threadID: threadID)
+            threadRuntimeStates[key] = nil
+            reconciledThreadCatalogEntries[key] = nil
+        }
+    }
+
     private func handleRelayDisconnected(hostID: HostID) async {
         clearHostScopedRuntimeState(hostID: hostID)
         guard remoteTunnels[hostID] != nil else {
@@ -1132,6 +1212,7 @@ public final class WorkflowSupervisorStore {
         }
 
         let failedRelay = relays.removeValue(forKey: hostID)
+        relayGenerations[hostID] = nil
         let failedTunnel = remoteTunnels.removeValue(forKey: hostID)
         activeRelayEndpointsByHostID[hostID] = nil
         failedTunnel?.stop()
@@ -1209,6 +1290,10 @@ public final class WorkflowSupervisorStore {
 
     private func clearHostScopedRuntimeState(hostID: HostID) {
         pendingAttentionRequests.removeAll { $0.hostID == hostID }
+        lastWriteReconciliations[hostID] = nil
+        reconciledThreadCatalogEntries = reconciledThreadCatalogEntries.filter {
+            $0.value.threadRef.hostID != hostID
+        }
         threadRuntimeStates = threadRuntimeStates.filter { key, state in
             state.hostID != hostID && !key.hasPrefix("\(hostID.rawValue)::")
         }

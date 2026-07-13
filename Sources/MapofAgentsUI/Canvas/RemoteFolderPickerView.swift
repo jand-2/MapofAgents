@@ -93,6 +93,8 @@ struct RemoteFolderPickerView: View {
             .controlSize(.small)
             .disabled(isLoading || listing?.parentPath == nil)
             .help("Parent folder")
+            .accessibilityLabel("Parent folder")
+            .minimumAccessibleHitTarget()
 
             Button {
                 Task { await load(path: initialPath) }
@@ -104,6 +106,8 @@ struct RemoteFolderPickerView: View {
             .controlSize(.small)
             .disabled(isLoading)
             .help("Home folder")
+            .accessibilityLabel("Home folder")
+            .minimumAccessibleHitTarget()
 
             TextField("Folder path", text: $draftPath)
                 .textFieldStyle(.roundedBorder)
@@ -122,6 +126,8 @@ struct RemoteFolderPickerView: View {
             .controlSize(.small)
             .disabled(isLoading || draftPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .help("Open path")
+            .accessibilityLabel("Open path")
+            .minimumAccessibleHitTarget()
 
             Button {
                 Task { await load(path: currentPath) }
@@ -133,6 +139,8 @@ struct RemoteFolderPickerView: View {
             .controlSize(.small)
             .disabled(isLoading)
             .help("Refresh")
+            .accessibilityLabel("Refresh")
+            .minimumAccessibleHitTarget()
         }
     }
 
@@ -237,6 +245,8 @@ struct RemoteFolderPickerView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .help("Add this folder")
+                .accessibilityLabel("Add this folder")
+                .minimumAccessibleHitTarget()
             }
         }
         .padding(.horizontal, 12)

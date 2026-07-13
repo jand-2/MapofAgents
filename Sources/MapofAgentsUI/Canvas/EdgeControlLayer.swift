@@ -28,6 +28,7 @@ struct EdgeControlLayer: View {
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .frame(minWidth: 44, minHeight: 28)
+                    .minimumAccessibleHitTarget()
                     .background {
                         Capsule()
                             .fill(selectedEdge == edge.id ? style.tint.opacity(0.92) : Color.black.opacity(0.72))

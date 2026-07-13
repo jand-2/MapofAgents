@@ -110,8 +110,10 @@ public static class MentionCatalog
 
     public static IReadOnlyList<MentionCatalogCandidate> LocalFileMentionCandidates(
         string? rootPath,
-        int limit = 120)
+        int limit = 120,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(rootPath) || limit <= 0 || !Directory.Exists(rootPath))
         {
             return [];
@@ -125,6 +127,7 @@ public static class MentionCatalog
 
         while (queue.Count > 0 && candidates.Count < limit)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var current = queue.Dequeue();
             if (!visited.Add(current))
             {
@@ -143,8 +146,11 @@ public static class MentionCatalog
                 continue;
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
+
             foreach (var entry in entries)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (candidates.Count >= limit)
                 {
                     break;

@@ -1,0 +1,11 @@
+{
+  "id": "event-turn-completed-1",
+  "source": "codex-hook",
+  "type": "turn.completed",
+  "method": "turn/completed",
+  "summary": "Turn completed",
+  "hostID": "local",
+  "threadID": "thread-1",
+  "turnID": "turn-1",
+  "createdAt": "2026-05-28T10:15:30Z"
+}

@@ -1,0 +1,8 @@
+{
+  "type": "folder.created",
+  "sourceHostID": "local",
+  "sourceThreadID": "source-thread",
+  "childHostID": "example-host",
+  "folderPath": "/Users/example/project",
+  "unexpected": true
+}

@@ -104,6 +104,91 @@ func codexAutomationStoreSavesEditableFieldsWithoutDroppingIdentity() throws {
     #expect(saved.nextRun(after: Date(), calendar: utcCalendar) == nil)
 }
 
+@Test
+func codexAutomationStoreRejectsTraversalAutomationID() throws {
+    let root = try temporaryCodexHome()
+    let outsideDirectory = root.appendingPathComponent("outside", isDirectory: true)
+    try FileManager.default.createDirectory(at: outsideDirectory, withIntermediateDirectories: true)
+    let outsideFile = outsideDirectory.appendingPathComponent("automation.toml", isDirectory: false)
+    let original = """
+    id = "outside"
+    name = "Outside"
+    status = "ACTIVE"
+    rrule = "FREQ=HOURLY"
+    """
+    try original.write(to: outsideFile, atomically: true, encoding: .utf8)
+
+    let store = CodexAutomationStore(codexHome: root)
+    do {
+        _ = try store.save(CodexAutomationEdit(
+            id: "../../outside",
+            name: "Modified",
+            prompt: "Should not be written",
+            status: "PAUSED",
+            rrule: "FREQ=DAILY"
+        ))
+        Issue.record("Expected a traversal automation ID to be rejected.")
+    } catch let error as CodexAutomationStoreError {
+        guard case .invalidAutomationID("../../outside") = error else {
+            Issue.record("Expected invalidAutomationID, got \(error).")
+            return
+        }
+    }
+
+    #expect(try String(contentsOf: outsideFile, encoding: .utf8) == original)
+}
+
+@Test
+func codexAutomationStoreRejectsAutomationDirectorySymlinkEscape() throws {
+    let root = try temporaryCodexHome()
+    let automations = root.appendingPathComponent("automations", isDirectory: true)
+    let outsideDirectory = root.appendingPathComponent("outside", isDirectory: true)
+    try FileManager.default.createDirectory(at: automations, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outsideDirectory, withIntermediateDirectories: true)
+    let outsideFile = outsideDirectory.appendingPathComponent("automation.toml", isDirectory: false)
+    let original = """
+    id = "linked"
+    name = "Outside"
+    status = "ACTIVE"
+    rrule = "FREQ=HOURLY"
+    """
+    try original.write(to: outsideFile, atomically: true, encoding: .utf8)
+    try FileManager.default.createSymbolicLink(
+        at: automations.appendingPathComponent("linked", isDirectory: true),
+        withDestinationURL: outsideDirectory
+    )
+
+    let store = CodexAutomationStore(codexHome: root)
+    do {
+        _ = try store.save(CodexAutomationEdit(
+            id: "linked",
+            name: "Modified",
+            prompt: "Should not be written",
+            status: "PAUSED",
+            rrule: "FREQ=DAILY"
+        ))
+        Issue.record("Expected an automation symlink escape to be rejected.")
+    } catch let error as CodexAutomationStoreError {
+        guard case .automationOutsideRoot("linked") = error else {
+            Issue.record("Expected automationOutsideRoot, got \(error).")
+            return
+        }
+    }
+
+    #expect(try String(contentsOf: outsideFile, encoding: .utf8) == original)
+}
+
+@Test
+func codexAutomationStoreUsesInjectedHomeDirectoryWithoutCodexHomeOverride() {
+    let home = URL(fileURLWithPath: "/Users/example", isDirectory: true)
+    let result = CodexAutomationStore.defaultCodexHome(
+        environment: [:],
+        homeDirectory: home
+    )
+
+    #expect(result == home.appendingPathComponent(".codex", isDirectory: true))
+}
+
 private var utcCalendar: Calendar {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!

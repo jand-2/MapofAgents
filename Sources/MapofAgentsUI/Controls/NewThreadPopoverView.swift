@@ -159,8 +159,6 @@ public struct NewThreadPopoverView: View {
         .onChange(of: selectedModelID) { _, _ in syncReasoningDefault() }
         .task(id: selectedFolderPath ?? "") {
             onSelectedFolderChanged(selectedTargetNode)
-            guard selectedTargetUsesLocalCatalog else { return }
-            await runtimeStore.refreshMentionCandidates(cwd: selectedFolderPath)
         }
     }
 
@@ -204,6 +202,7 @@ public struct NewThreadPopoverView: View {
             .buttonStyle(.plain)
             .help("Close")
             .accessibilityLabel("Close new thread")
+            .minimumAccessibleHitTarget()
         }
         .padding(14)
     }
@@ -362,7 +361,8 @@ public struct NewThreadPopoverView: View {
                         + mentionCandidatesForFolder(selectedTargetNode),
                     minLines: 4,
                     maxLines: 9,
-                    usesLocalMentionCatalog: selectedTargetUsesLocalCatalog
+                    usesLocalMentionCatalog: selectedTargetUsesLocalCatalog,
+                    initiallyFocused: true
                 )
                 .disabled(isCreating)
 
@@ -383,6 +383,8 @@ public struct NewThreadPopoverView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .help(createUnavailableReason ?? "Create thread")
+                .accessibilityLabel("Create thread")
+                .minimumAccessibleHitTarget()
             }
         }
         .padding(14)

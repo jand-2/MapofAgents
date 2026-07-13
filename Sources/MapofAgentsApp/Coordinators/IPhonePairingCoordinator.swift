@@ -6,6 +6,14 @@ import Observation
 @MainActor
 @Observable
 final class IPhonePairingCoordinator {
+    private enum PairingPersistenceError: LocalizedError {
+        case synchronizationFailed
+
+        var errorDescription: String? {
+            "Pairing state could not be flushed to durable storage."
+        }
+    }
+
     struct PendingPairingApproval: Identifiable {
         let id = UUID()
         let payload: MapofAgentsPairingPayload
@@ -32,13 +40,26 @@ final class IPhonePairingCoordinator {
     private var didAttemptLaunchConfiguredRemote = false
     private let storedHostKey: String
     private let userDefaults: UserDefaults
+    private let credentialExchange: any MapofAgentsCredentialExchanging
+    private let credentialVault: any MapofAgentsPairingCredentialVault
+    private let deviceName: @Sendable () -> String
+
+    private var pendingRetirementsKey: String {
+        "\(storedHostKey).pendingCredentialRetirements"
+    }
 
     init(
         storedHostKey: String = "mapofagents.primaryPairedHost",
-        userDefaults: UserDefaults = .standard
+        userDefaults: UserDefaults = .standard,
+        credentialExchange: any MapofAgentsCredentialExchanging = MapofAgentsURLSessionCredentialExchangeClient(),
+        credentialVault: any MapofAgentsPairingCredentialVault = KeychainMapofAgentsPairingCredentialVault(),
+        deviceName: @escaping @Sendable () -> String = { "iPhone" }
     ) {
         self.storedHostKey = storedHostKey
         self.userDefaults = userDefaults
+        self.credentialExchange = credentialExchange
+        self.credentialVault = credentialVault
+        self.deviceName = deviceName
     }
 
     func loadStoredPairedHost() {
@@ -57,8 +78,17 @@ final class IPhonePairingCoordinator {
         }
 
         do {
-            pairedHost = try pairedHostWithResolvedToken(decoded)
+            let resolved = try pairedHostWithResolvedToken(decoded)
+            if decoded.persistenceVersion < MapofAgentsPairedHost.currentPersistenceVersion
+                || !decoded.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try persistPairedHost(resolved)
+            } else {
+                pairedHost = resolved
+            }
         } catch {
+            if !decoded.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                storedPairedHost = ""
+            }
             pairedHost = decoded
             errorMessage = "Could not secure the saved paired Mac token: \(error.localizedDescription)"
         }
@@ -71,40 +101,40 @@ final class IPhonePairingCoordinator {
         graphStore: GraphStore,
         supervisorStore: WorkflowSupervisorStore,
         syncWorkflowFromMac: @escaping (HostID, MapofAgentsPairedHost?) async -> Bool
-    ) {
+    ) async -> Bool {
         let endpointURL: URL
         do {
             endpointURL = try validatedIPhoneEndpoint(endpoint)
         } catch {
             errorMessage = error.localizedDescription
-            return
+            return false
         }
 
-        Task {
-            syncMessage = "Connecting to \(name)..."
-            let hostID = await supervisorStore.connectRemote(
-                name: name,
-                endpoint: endpointURL.absoluteString,
-                bearerToken: bearerToken
-            )
-            await graphStore.applySupervisorMachines(supervisorStore.machines)
-            await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
+        syncMessage = "Connecting to \(name)..."
+        errorMessage = nil
+        let hostID = await supervisorStore.connectRemote(
+            name: name,
+            endpoint: endpointURL.absoluteString,
+            bearerToken: bearerToken
+        )
+        await graphStore.applySupervisorMachines(supervisorStore.machines)
+        await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
 
-            guard let hostID,
-                  let machine = supervisorStore.machines.first(where: { $0.id == hostID }),
-                  machine.status == .connected else {
-                syncMessage = nil
-                errorMessage = "Could not connect to \(endpointURL.absoluteString)."
-                return
-            }
-
-            if machine.platform == .macOS || machine.name.localizedCaseInsensitiveContains("mac") {
-                _ = await syncWorkflowFromMac(hostID, nil)
-            } else {
-                syncMessage = "Connected to \(machine.name)."
-                errorMessage = nil
-            }
+        guard let hostID,
+              let machine = supervisorStore.machines.first(where: { $0.id == hostID }),
+              machine.status == .connected else {
+            syncMessage = nil
+            errorMessage = "Could not connect to \(endpointURL.absoluteString)."
+            return false
         }
+
+        if machine.platform == .macOS || machine.name.localizedCaseInsensitiveContains("mac") {
+            _ = await syncWorkflowFromMac(hostID, nil)
+        } else {
+            syncMessage = "Connected to \(machine.name)."
+            errorMessage = nil
+        }
+        return true
     }
 
     func connectLaunchConfiguredRemoteIfNeeded(
@@ -114,6 +144,7 @@ final class IPhonePairingCoordinator {
     ) async {
         guard !didAttemptLaunchConfiguredRemote else { return }
         didAttemptLaunchConfiguredRemote = true
+        let retirementWarning = await retirePendingPairings(excluding: pairedHost)
 
         let environment = ProcessInfo.processInfo.environment
         guard let endpoint = environment["MAPOFAGENTS_REMOTE_ENDPOINT"]?
@@ -128,6 +159,7 @@ final class IPhonePairingCoordinator {
                     syncWorkflowFromMac: syncWorkflowFromMac
                 )
             }
+            appendRetirementWarning(retirementWarning)
             return
         }
 
@@ -165,6 +197,7 @@ final class IPhonePairingCoordinator {
             syncMessage = "Connected to \(name)."
             errorMessage = nil
         }
+        appendRetirementWarning(retirementWarning)
     }
 
     func connectPairingCode(
@@ -267,22 +300,47 @@ final class IPhonePairingCoordinator {
         }
     }
 
-    func forgetPairing(disconnect: (HostID) -> Void) {
+    func forgetPairing(disconnect: @escaping (HostID) -> Void) {
         guard let host = pairedHost else {
             storedPairedHost = ""
             return
         }
-        do {
-            try MapofAgentsPairingTokenVault.delete(for: host.id)
-        } catch {
-            errorMessage = error.localizedDescription
-            return
+        Task {
+            do {
+                if let deviceID = host.deviceID {
+                    guard let exchangeURL = host.credentialExchangeURL,
+                          let refreshCredential = try credentialVault.loadRefreshCredential(
+                        hostID: host.id,
+                        deviceID: deviceID
+                    ) else {
+                        throw MapofAgentsCredentialExchangeError.refreshCredentialMissing
+                    }
+                    try await credentialExchange.revoke(
+                        at: exchangeURL,
+                        request: MapofAgentsRefreshRequest(
+                            hostID: host.id,
+                            deviceID: deviceID,
+                            refreshCredential: refreshCredential
+                        )
+                    )
+                    try credentialVault.deleteRefreshCredential(hostID: host.id, deviceID: deviceID)
+                }
+                try? MapofAgentsPairingTokenVault.delete(for: host.id)
+            } catch {
+                errorMessage = "Could not revoke this paired device, so the pairing was kept. \(error.localizedDescription)"
+                return
+            }
+
+            guard pairedHost?.id == host.id,
+                  pairedHost?.deviceID == host.deviceID else {
+                return
+            }
+            pairedHost = nil
+            storedPairedHost = ""
+            syncMessage = nil
+            errorMessage = nil
+            disconnect(host.id)
         }
-        pairedHost = nil
-        storedPairedHost = ""
-        syncMessage = nil
-        errorMessage = nil
-        disconnect(host.id)
     }
 
     private func connectPairingString(
@@ -312,6 +370,90 @@ final class IPhonePairingCoordinator {
         syncWorkflowFromMac: @escaping (HostID, MapofAgentsPairedHost?) async -> Bool
     ) async throws {
         try payload.validateForImport()
+        if payload.version >= MapofAgentsPairingPayload.currentVersion {
+            let previousPairedHost = pairedHost
+            guard let enrollmentToken = payload.enrollmentToken,
+                  let exchangeURL = payload.credentialExchangeURL else {
+                throw MapofAgentsPairingError.invalidPairingCode
+            }
+            syncMessage = "Enrolling this iPhone with \(payload.name)..."
+            let enrollment = try await credentialExchange.enroll(
+                at: exchangeURL,
+                enrollmentToken: enrollmentToken,
+                deviceName: deviceName()
+            )
+            guard enrollment.hostID == payload.hostID else {
+                throw MapofAgentsCredentialExchangeError.hostMismatch
+            }
+            guard !enrollment.endpoints.isEmpty,
+                  enrollment.endpoints.allSatisfy(\.isIPhoneCompanionConnectable),
+                  enrollment.endpoints.contains(where: {
+                      $0.kind == .tailnet
+                          && $0.url.scheme?.lowercased() == "wss"
+                          && $0.url.host?.lowercased() == exchangeURL.host?.lowercased()
+                  }) else {
+                throw MapofAgentsPairingError.missingEndpoint
+            }
+
+            let pairedHost = MapofAgentsPairedHost(
+                id: enrollment.hostID,
+                name: payload.name,
+                endpoints: enrollment.endpoints,
+                bearerToken: enrollment.accessToken,
+                credentialExchangeURL: exchangeURL,
+                deviceID: enrollment.deviceID,
+                mapofagentsSupportDirectory: enrollment.mapofagentsSupportDirectory
+                    ?? payload.mapofagentsSupportDirectory
+            )
+            do {
+                try credentialVault.saveRefreshCredential(
+                    enrollment.refreshCredential,
+                    hostID: enrollment.hostID,
+                    deviceID: enrollment.deviceID
+                )
+                if let previousPairedHost,
+                   !Self.samePairingIdentity(previousPairedHost, pairedHost) {
+                    try enqueuePendingRetirement(previousPairedHost)
+                }
+                try persistPairedHost(pairedHost)
+            } catch {
+                if let previousPairedHost {
+                    try? discardPendingRetirement(previousPairedHost)
+                }
+                try? await credentialExchange.revoke(
+                    at: exchangeURL,
+                    request: MapofAgentsRefreshRequest(
+                        hostID: enrollment.hostID,
+                        deviceID: enrollment.deviceID,
+                        refreshCredential: enrollment.refreshCredential
+                    )
+                )
+                try? credentialVault.deleteRefreshCredential(
+                    hostID: enrollment.hostID,
+                    deviceID: enrollment.deviceID
+                )
+                throw error
+            }
+
+            var retirementWarning: String?
+            if let previousPairedHost,
+               !Self.samePairingIdentity(previousPairedHost, pairedHost) {
+                retirementWarning = await retirePendingPairings(excluding: pairedHost)
+            }
+
+            try await connectPairedHost(
+                pairedHost,
+                initialAccessToken: enrollment.accessToken,
+                initialAccessTokenExpiresAt: enrollment.accessTokenExpiresAt,
+                syncWorkflow: true,
+                graphStore: graphStore,
+                supervisorStore: supervisorStore,
+                syncWorkflowFromMac: syncWorkflowFromMac
+            )
+            appendRetirementWarning(retirementWarning)
+            return
+        }
+
         let pairedHost = MapofAgentsPairedHost(payload: payload)
 
         try await connectPairedHost(
@@ -347,6 +489,8 @@ final class IPhonePairingCoordinator {
 
     private func connectPairedHost(
         _ pairedHost: MapofAgentsPairedHost,
+        initialAccessToken: String? = nil,
+        initialAccessTokenExpiresAt: Date? = nil,
         syncWorkflow: Bool,
         graphStore: GraphStore,
         supervisorStore: WorkflowSupervisorStore,
@@ -354,6 +498,22 @@ final class IPhonePairingCoordinator {
     ) async throws {
         guard !isConnectingPairedHost else { return }
         var workingHost = pairedHost
+        let accessTokenProvider: (any AppServerAccessTokenProviding)?
+        if let deviceID = workingHost.deviceID,
+           let exchangeURL = workingHost.credentialExchangeURL {
+            accessTokenProvider = MapofAgentsPairedHostAccessTokenProvider(
+                hostID: workingHost.id,
+                deviceID: deviceID,
+                exchangeURL: exchangeURL,
+                initialAccessToken: initialAccessToken,
+                initialAccessTokenExpiresAt: initialAccessTokenExpiresAt,
+                credentialVault: credentialVault,
+                exchangeClient: credentialExchange
+            )
+            workingHost.bearerToken = ""
+        } else {
+            accessTokenProvider = nil
+        }
         var validationFailures: [String] = []
         let endpoints = workingHost.preferredEndpoints
             .compactMap { endpoint -> MapofAgentsPairingEndpoint? in
@@ -384,6 +544,13 @@ final class IPhonePairingCoordinator {
                 name: workingHost.name,
                 endpoint: endpoint.url.absoluteString,
                 bearerToken: workingHost.bearerToken,
+                accessTokenProvider: accessTokenProvider,
+                attachmentStagingRoot: workingHost.mapofagentsSupportDirectory.map {
+                    ChatInputAttachmentService.joinedPath(
+                        directory: $0,
+                        fileName: ChatInputAttachmentService.stagingDirectoryName
+                    )
+                },
                 markFailureOnFailure: false
             )
             await graphStore.applySupervisorMachines(supervisorStore.machines)
@@ -447,17 +614,117 @@ final class IPhonePairingCoordinator {
         set { userDefaults.set(newValue, forKey: storedHostKey) }
     }
 
+    private func enqueuePendingRetirement(_ host: MapofAgentsPairedHost) throws {
+        guard host.deviceID != nil, host.credentialExchangeURL != nil else {
+            try? MapofAgentsPairingTokenVault.delete(for: host.id)
+            return
+        }
+
+        var pending = loadPendingRetirements()
+        guard !pending.contains(where: { Self.samePairingIdentity($0, host) }) else {
+            return
+        }
+        pending.append(host)
+        try savePendingRetirements(pending)
+    }
+
+    private func discardPendingRetirement(_ host: MapofAgentsPairedHost) throws {
+        try savePendingRetirements(
+            loadPendingRetirements().filter { !Self.samePairingIdentity($0, host) }
+        )
+    }
+
+    private func retirePendingPairings(excluding activeHost: MapofAgentsPairedHost?) async -> String? {
+        var pending = loadPendingRetirements()
+        guard !pending.isEmpty else { return nil }
+
+        var retained: [MapofAgentsPairedHost] = []
+        var failures: [String] = []
+        for host in pending {
+            if let activeHost, Self.samePairingIdentity(host, activeHost) {
+                continue
+            }
+            do {
+                try await MapofAgentsPairingCredentialRetirement.retire(
+                    host,
+                    credentialVault: credentialVault,
+                    credentialExchange: credentialExchange
+                )
+            } catch {
+                retained.append(host)
+                failures.append("\(host.name): \(error.localizedDescription)")
+            }
+        }
+        pending = retained
+        do {
+            try savePendingRetirements(pending)
+        } catch {
+            failures.append(error.localizedDescription)
+        }
+
+        guard !failures.isEmpty else { return nil }
+        return "The replacement pairing is saved, but a prior device credential is still awaiting revocation. MapofAgents will retry automatically. \(failures.joined(separator: " "))"
+    }
+
+    private func loadPendingRetirements() -> [MapofAgentsPairedHost] {
+        (userDefaults.stringArray(forKey: pendingRetirementsKey) ?? []).compactMap {
+            try? MapofAgentsPairedHost.decode(from: $0)
+        }
+    }
+
+    private func savePendingRetirements(_ hosts: [MapofAgentsPairedHost]) throws {
+        let encoded = hosts.compactMap { try? $0.encodedString() }
+        if encoded.isEmpty {
+            userDefaults.removeObject(forKey: pendingRetirementsKey)
+        } else {
+            userDefaults.set(encoded, forKey: pendingRetirementsKey)
+        }
+        guard userDefaults.synchronize() else {
+            throw PairingPersistenceError.synchronizationFailed
+        }
+    }
+
+    private func appendRetirementWarning(_ warning: String?) {
+        guard let warning else { return }
+        if let errorMessage, !errorMessage.isEmpty {
+            self.errorMessage = "\(errorMessage) \(warning)"
+        } else {
+            errorMessage = warning
+        }
+    }
+
+    private static func samePairingIdentity(
+        _ lhs: MapofAgentsPairedHost,
+        _ rhs: MapofAgentsPairedHost
+    ) -> Bool {
+        lhs.id == rhs.id && lhs.deviceID == rhs.deviceID
+    }
+
     private func persistPairedHost(_ host: MapofAgentsPairedHost) throws {
         var upgradedHost = host
         upgradedHost.persistenceVersion = MapofAgentsPairedHost.currentPersistenceVersion
-        try MapofAgentsPairingTokenVault.save(upgradedHost.bearerToken, for: upgradedHost.id)
+        if upgradedHost.deviceID == nil,
+           !upgradedHost.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try MapofAgentsPairingTokenVault.save(upgradedHost.bearerToken, for: upgradedHost.id)
+        }
         var storedHost = upgradedHost
         storedHost.bearerToken = ""
+        let previousStoredHost = storedPairedHost
         storedPairedHost = try storedHost.encodedString()
-        pairedHost = upgradedHost
+        guard userDefaults.synchronize() else {
+            storedPairedHost = previousStoredHost
+            _ = userDefaults.synchronize()
+            throw PairingPersistenceError.synchronizationFailed
+        }
+        pairedHost = upgradedHost.deviceID == nil ? upgradedHost : storedHost
     }
 
     private func pairedHostWithResolvedToken(_ host: MapofAgentsPairedHost) throws -> MapofAgentsPairedHost {
+        if host.deviceID != nil, host.credentialExchangeURL != nil {
+            var durableHost = host
+            durableHost.bearerToken = ""
+            return durableHost
+        }
         guard host.bearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             try MapofAgentsPairingTokenVault.save(host.bearerToken, for: host.id)
             return host
@@ -515,7 +782,7 @@ private enum IPhoneEndpointValidationError: LocalizedError {
         case .empty:
             return "Enter an absolute ws:// or wss:// App Server endpoint."
         case .absoluteWebSocketRequired:
-            return "Enter an absolute ws:// or wss:// App Server URL, for example ws://mac-mini.tailnet.ts.net:18945."
+            return "Enter an absolute ws:// or wss:// App Server URL, for example wss://example-host.local."
         case .unsupportedScheme(let scheme):
             return "Use ws:// or wss:// for remote App Server endpoints. \(scheme):// is not supported."
         case .missingHost:

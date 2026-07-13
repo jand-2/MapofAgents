@@ -15,6 +15,7 @@ struct NodeView: View {
     var onOpenThreadAutomation: () -> Void = {}
     var onLinkAction: () -> Void
     var onControlTap: () -> Void = {}
+    var onActivate: () -> Void = {}
 
     @State private var isShowingFolderPath = false
     @State private var folderPath = ""
@@ -79,6 +80,7 @@ struct NodeView: View {
                     .help(automationHelp(threadAutomation))
                     .accessibilityLabel("Thread automation")
                     .accessibilityValue(automationHelp(threadAutomation))
+                    .minimumAccessibleHitTarget()
                 }
 
                 if shouldShowMachineFolderButton {
@@ -104,6 +106,7 @@ struct NodeView: View {
                     .popover(isPresented: $isShowingFolderPath, arrowEdge: .trailing) {
                         machineFolderPathPopover
                     }
+                    .minimumAccessibleHitTarget()
                 }
 
                 Button {
@@ -116,6 +119,7 @@ struct NodeView: View {
                 .foregroundStyle(isManualEdgeSource || hasPendingManualEdge ? .green : .secondary)
                 .help(linkHelp)
                 .accessibilityLabel(linkHelp)
+                .minimumAccessibleHitTarget()
             }
 
             Spacer(minLength: 0)
@@ -165,10 +169,38 @@ struct NodeView: View {
             }
         }
         .shadow(color: .black.opacity(isSelected || isHighlighted ? 0.18 : 0.08), radius: isSelected || isHighlighted ? 12 : 6, x: 0, y: 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(nodeKindLabel): \(node.title)")
+        .accessibilityValue(accessibilityStatus)
+        .accessibilityAction(.default, onActivate)
+        .accessibilityAction(named: Text(linkHelp), onLinkAction)
     }
 
     private var shouldShowMachineFolderButton: Bool {
         node.kind == .machine
+    }
+
+    private var nodeKindLabel: String {
+        switch node.kind {
+        case .machine:
+            return "Machine"
+        case .folder:
+            return "Project folder"
+        case .codexThread:
+            return threadKind == .subagent ? "Subagent thread" : "Codex thread"
+        }
+    }
+
+    private var accessibilityStatus: String {
+        switch node.kind {
+        case .machine:
+            return statusLabel(node.metadata.hostStatus ?? .disconnected)
+        case .folder:
+            return node.subtitle
+        case .codexThread:
+            let unread = isUnreadThread ? "unread, " : ""
+            return "\(unread)\((node.metadata.runStatus ?? .unknown).rawValue)"
+        }
     }
 
     private var isUnreadThread: Bool {

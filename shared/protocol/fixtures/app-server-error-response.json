@@ -1,0 +1,7 @@
+{
+  "id": "request-example",
+  "error": {
+    "code": -32601,
+    "message": "Method not found"
+  }
+}

@@ -143,6 +143,196 @@ func postToolUseHookIgnoresFailedMkdir() throws {
     try? FileManager.default.removeItem(at: directory)
 }
 
+@Test
+func workflowEventHookWritesMinimalPrivateNormalizedEventByDefault() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-event-hook-minimal-tests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let eventFile = directory.appendingPathComponent("hook-events.jsonl")
+    let hookScript = try repositoryRoot().appendingPathComponent("script/mapofagents-hook-event.sh")
+    let payload = #"{"threadID":"thread-1","turnID":"turn-1","hostID":"local","password":"must-not-persist"}"#
+    let result = try runEventHookScript(
+        hookScript,
+        eventName: "turn-ended",
+        eventFile: eventFile,
+        payload: payload
+    )
+    let event = try parsedSingleJSONObject(from: eventFile)
+    let attributes = try FileManager.default.attributesOfItem(atPath: eventFile.path)
+    let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
+
+    #expect(result.terminationStatus == 0)
+    #expect(event["source"] as? String == "codex-hook")
+    #expect(event["type"] as? String == "turn.completed")
+    #expect(event["method"] as? String == "turn/completed")
+    #expect(event["hostID"] as? String == "local")
+    #expect(event["threadID"] as? String == "thread-1")
+    #expect(event["turnID"] as? String == "turn-1")
+    #expect(event["raw"] == nil)
+    #expect(event["event"] == nil)
+    #expect(event["cwd"] == nil)
+    #expect(permissions.intValue & 0o777 == 0o600)
+}
+
+@Test
+func workflowEventHookRedactsDefaultEnvelopeFreeTextAndPaths() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-event-hook-envelope-redaction-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let eventFile = directory.appendingPathComponent("hook-events.jsonl")
+    let hookScript = try repositoryRoot().appendingPathComponent("script/mapofagents-hook-event.sh")
+    let payload = """
+    {
+      "sourceThreadID": "source-thread",
+      "childThreadID": "child-thread",
+      "childCWD": "https://example-user:path-password@example.test/project?token=path-token",
+      "childTitle": "password=title-password"
+    }
+    """
+    let result = try runEventHookScript(
+        hookScript,
+        eventName: "thread.created",
+        eventFile: eventFile,
+        payload: payload,
+        environmentOverrides: [
+            "MAPOFAGENTS_HOOK_SUMMARY": "Authorization: Bearer summary-bearer",
+        ]
+    )
+    let contents = try String(contentsOf: eventFile, encoding: .utf8)
+    let event = try parsedSingleJSONObject(from: eventFile)
+
+    #expect(result.terminationStatus == 0)
+    #expect(event["raw"] == nil)
+    #expect(contents.contains("summary-bearer") == false)
+    #expect(contents.contains("path-password") == false)
+    #expect(contents.contains("path-token") == false)
+    #expect(contents.contains("title-password") == false)
+    #expect(contents.contains("[REDACTED]"))
+}
+
+@Test
+func workflowEventHookRawCaptureIsExplicitRedactedAndBounded() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-event-hook-raw-tests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let eventFile = directory.appendingPathComponent("hook-events.jsonl")
+    let hookScript = try repositoryRoot().appendingPathComponent("script/mapofagents-hook-event.sh")
+    let payload = """
+    {
+      "threadID": "thread-1",
+      "password": "hook-password-value",
+      "command": "curl -H 'Authorization: Bearer hook-bearer-value'",
+      "output": "\(String(repeating: "x", count: 4_000))"
+    }
+    """
+    let result = try runEventHookScript(
+        hookScript,
+        eventName: "turn-ended",
+        eventFile: eventFile,
+        payload: payload,
+        environmentOverrides: [
+            "MAPOFAGENTS_HOOK_CAPTURE_RAW": "1",
+            "MAPOFAGENTS_HOOK_RAW_MAX_BYTES": "256",
+        ]
+    )
+    let contents = try String(contentsOf: eventFile, encoding: .utf8)
+    let event = try parsedSingleJSONObject(from: eventFile)
+
+    #expect(result.terminationStatus == 0)
+    #expect(event["raw"] != nil)
+    #expect(event["rawTruncated"] as? Bool == true)
+    #expect(contents.contains("hook-password-value") == false)
+    #expect(contents.contains("hook-bearer-value") == false)
+    #expect(contents.utf8.count < 4_096)
+}
+
+@Test
+func workflowEventHookRedactsPEMBlocksBeforeAnyOutputTruncation() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-event-hook-long-pem-redaction-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let eventFile = directory.appendingPathComponent("hook-events.jsonl")
+    let hookScript = try repositoryRoot().appendingPathComponent("script/mapofagents-hook-event.sh")
+    let beginMarker = "-----BEGIN " + "EXAMPLE PRIVATE KEY-----"
+    let endMarker = "-----END " + "EXAMPLE PRIVATE KEY-----"
+    let identifiableMaterial = "test-only-key-material-"
+    let oversizedPEM = beginMarker
+        + String(repeating: identifiableMaterial, count: 1_000)
+        + endMarker
+    let payloadData = try JSONSerialization.data(
+        withJSONObject: ["threadID": "thread-1", "output": oversizedPEM],
+        options: [.sortedKeys]
+    )
+    let payload = try #require(String(data: payloadData, encoding: .utf8))
+    let result = try runEventHookScript(
+        hookScript,
+        eventName: "turn-ended",
+        eventFile: eventFile,
+        payload: payload,
+        environmentOverrides: [
+            "MAPOFAGENTS_HOOK_CAPTURE_RAW": "1",
+            "MAPOFAGENTS_HOOK_RAW_MAX_BYTES": "32768",
+            "MAPOFAGENTS_HOOK_SUMMARY": oversizedPEM,
+        ]
+    )
+    let contents = try String(contentsOf: eventFile, encoding: .utf8)
+
+    #expect(result.terminationStatus == 0)
+    #expect(contents.contains(beginMarker) == false)
+    #expect(contents.contains(endMarker) == false)
+    #expect(contents.contains(identifiableMaterial) == false)
+    #expect(contents.contains("[REDACTED PRIVATE KEY]"))
+}
+
+@Test
+func workflowEventHookCapsAndRotatesPrivateJSONLFiles() throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-event-hook-rotation-tests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let eventFile = directory.appendingPathComponent("hook-events.jsonl")
+    let hookScript = try repositoryRoot().appendingPathComponent("script/mapofagents-hook-event.sh")
+    for index in 0..<8 {
+        let result = try runEventHookScript(
+            hookScript,
+            eventName: "turn-ended",
+            eventFile: eventFile,
+            payload: #"{"threadID":"thread-1"}"#,
+            environmentOverrides: [
+                "MAPOFAGENTS_HOOK_EVENT_ID": "event-\(index)",
+                "MAPOFAGENTS_HOOK_SUMMARY": String(repeating: "s", count: 1_200),
+                "MAPOFAGENTS_HOOK_EVENT_MAX_BYTES": "4096",
+                "MAPOFAGENTS_HOOK_EVENT_ROTATIONS": "2",
+            ]
+        )
+        #expect(result.terminationStatus == 0)
+    }
+
+    let firstRotation = URL(fileURLWithPath: eventFile.path + ".1")
+    let secondRotation = URL(fileURLWithPath: eventFile.path + ".2")
+    let thirdRotation = URL(fileURLWithPath: eventFile.path + ".3")
+    #expect(FileManager.default.fileExists(atPath: firstRotation.path))
+    #expect(FileManager.default.fileExists(atPath: secondRotation.path))
+    #expect(FileManager.default.fileExists(atPath: thirdRotation.path) == false)
+
+    for url in [eventFile, firstRotation, secondRotation] {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let size = try #require(attributes[.size] as? NSNumber)
+        let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
+        #expect(size.intValue <= 4_096)
+        #expect(permissions.intValue & 0o777 == 0o600)
+    }
+}
+
 private struct HookScriptResult {
     var terminationStatus: Int32
     var output: String
@@ -176,6 +366,53 @@ private func runHookScript(
         terminationStatus: process.terminationStatus,
         output: String(data: data, encoding: .utf8) ?? ""
     )
+}
+
+private func runEventHookScript(
+    _ hookScript: URL,
+    eventName: String,
+    eventFile: URL,
+    payload: String,
+    environmentOverrides: [String: String] = [:]
+) throws -> HookScriptResult {
+    let process = Process()
+    process.executableURL = hookScript
+    process.arguments = [eventName]
+    var environment = ProcessInfo.processInfo.environment
+    environment["MAPOFAGENTS_HOOK_EVENT_FILE"] = eventFile.path
+    environment["MAPOFAGENTS_HOST_ID"] = "local"
+    environment["CODEX_THREAD_ID"] = "thread-1"
+    environment["CODEX_TURN_ID"] = "turn-1"
+    environment["MAPOFAGENTS_HOOK_CAPTURE_RAW"] = nil
+    for (key, value) in environmentOverrides {
+        environment[key] = value
+    }
+    process.environment = environment
+
+    let input = Pipe()
+    let output = Pipe()
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = output
+
+    try process.run()
+    input.fileHandleForWriting.write(Data(payload.utf8))
+    try input.fileHandleForWriting.close()
+    process.waitUntilExit()
+
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    return HookScriptResult(
+        terminationStatus: process.terminationStatus,
+        output: String(data: data, encoding: .utf8) ?? ""
+    )
+}
+
+private func parsedSingleJSONObject(from eventFile: URL) throws -> [String: Any] {
+    let contents = try String(contentsOf: eventFile, encoding: .utf8)
+    let lines = contents.split(separator: "\n")
+    #expect(lines.count == 1)
+    let data = try #require(lines.first?.data(using: .utf8))
+    return try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
 }
 
 private func parsedSingleHookEvent(from eventFile: URL) throws -> WorkflowEvent {

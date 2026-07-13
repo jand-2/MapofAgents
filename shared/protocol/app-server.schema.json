@@ -1,58 +1,139 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mapofagents.dev/schema/app-server.schema.json",
-  "title": "MapofAgents App Server protocol scaffold",
+  "title": "MapofAgents App Server protocol envelope",
+  "description": "Disjoint endpoint and JSON-RPC-style message shapes used by MapofAgents. The Codex App Server transport omits the optional jsonrpc member.",
   "type": "object",
   "oneOf": [
-    { "$ref": "#/$defs/relayEndpoint" },
-    { "$ref": "#/$defs/jsonRpcRequest" },
-    { "$ref": "#/$defs/jsonRpcResponse" }
+    {
+      "$ref": "#/$defs/relayEndpoint"
+    },
+    {
+      "$ref": "#/$defs/jsonRpcRequest"
+    },
+    {
+      "$ref": "#/$defs/jsonRpcNotification"
+    },
+    {
+      "$ref": "#/$defs/jsonRpcSuccessResponse"
+    },
+    {
+      "$ref": "#/$defs/jsonRpcErrorResponse"
+    }
   ],
   "$defs": {
+    "requestID": {
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
+      ]
+    },
     "relayEndpoint": {
       "type": "object",
-      "required": ["id", "name", "url"],
+      "required": [
+        "id",
+        "name",
+        "url"
+      ],
       "properties": {
-        "id": { "type": "string" },
-        "name": { "type": "string" },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
         "url": {
           "type": "string",
-          "pattern": "^wss?://"
+          "pattern": "^wss?://\\S+$"
         },
         "bearerToken": {
           "type": "string",
+          "minLength": 1,
           "description": "Runtime-only secret; persisted endpoint descriptors should redact or omit this value."
+        },
+        "credentialReference": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable local Keychain reference used by persisted endpoint descriptors; never a credential value."
         }
-      }
+      },
+      "additionalProperties": false
     },
     "jsonValue": true,
     "jsonRpcRequest": {
       "type": "object",
-      "required": ["method"],
+      "required": [
+        "id",
+        "method"
+      ],
       "properties": {
         "id": {
-          "oneOf": [
-            { "type": "integer" },
-            { "type": "string" }
-          ]
+          "$ref": "#/$defs/requestID"
         },
-        "method": { "type": "string" },
-        "params": { "$ref": "#/$defs/jsonValue" }
-      }
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "params": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      },
+      "additionalProperties": false
     },
-    "jsonRpcResponse": {
+    "jsonRpcNotification": {
       "type": "object",
-      "required": ["id"],
+      "required": [
+        "method"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "params": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "jsonRpcSuccessResponse": {
+      "type": "object",
+      "required": [
+        "id",
+        "result"
+      ],
       "properties": {
         "id": {
-          "oneOf": [
-            { "type": "integer" },
-            { "type": "string" }
-          ]
+          "$ref": "#/$defs/requestID"
         },
-        "result": { "$ref": "#/$defs/jsonValue" },
-        "error": { "$ref": "#/$defs/jsonValue" }
-      }
+        "result": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "jsonRpcErrorResponse": {
+      "type": "object",
+      "required": [
+        "id",
+        "error"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/requestID"
+        },
+        "error": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

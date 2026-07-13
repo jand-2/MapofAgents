@@ -8,15 +8,9 @@ import AppKit
 import CoreImage.CIFilterBuiltins
 
 struct RootView: View {
-    private let repository: LocalControlRoomStore
+    private let session: MapofAgentsAppSession
 
-    @State private var graphStore: GraphStore
-    @State private var runtimeStore: CodexRuntimeStore
-    @State private var supervisorStore: WorkflowSupervisorStore
-    @State private var threadCatalogStore = ThreadCatalogStore()
-    @State private var workflowLibrary: WorkflowLibraryCoordinator
     @State private var workflowMemberships: [String: [ThreadWorkflowMembership]] = [:]
-    @State private var threadCreation = ThreadCreationCoordinator()
     @State private var isImportingFolder = false
     @State private var folderImportMachine: CanvasNode?
     @State private var isShowingNewThread = false
@@ -35,31 +29,39 @@ struct RootView: View {
     @State private var topNotifications: [TopNotification] = []
     @State private var topNotificationHistory: [TopNotification] = []
     @State private var isShowingNotificationHistory = false
-    @State private var hookEventBridgeTask: Task<Void, Never>?
     @State private var seenTopActivityEventIDs: Set<String> = []
     @State private var hasPrimedTopActivityEvents = false
+    @State private var overlayKeyboardFocusRestorer = RootOverlayKeyboardFocusRestorer()
+    @AccessibilityFocusState private var accessibilityFocus: RootOverlayFocusTarget?
     @AppStorage("canvas.showSubagents") private var showsSubagents = true
     @AppStorage("workflow.notify.completed") private var notifyOnCompleted = false
     @AppStorage("workflow.notify.needsInput") private var notifyOnNeedsInput = true
     @AppStorage("workflow.notify.failed") private var notifyOnFailed = true
 
-    init() {
-        let paths: ApplicationPaths
-        let bootstrapErrorMessage: String?
-        do {
-            paths = try ApplicationPaths.defaultPaths()
-            bootstrapErrorMessage = nil
-        } catch {
-            paths = ApplicationPaths(applicationSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(ApplicationPaths.supportDirectoryName, isDirectory: true))
-            bootstrapErrorMessage = "Using temporary app storage because the normal Application Support folder could not be prepared: \(error.localizedDescription)"
+    init(session: MapofAgentsAppSession) {
+        self.session = session
+        _bootstrapErrorMessage = State(initialValue: session.bootstrapErrorMessage)
+    }
+
+    private var repository: LocalControlRoomStore { session.repository }
+    private var graphStore: GraphStore { session.graphStore }
+    private var runtimeStore: CodexRuntimeStore { session.runtimeStore }
+    private var supervisorStore: WorkflowSupervisorStore { session.supervisorStore }
+    private var threadCatalogStore: ThreadCatalogStore { session.threadCatalogStore }
+    private var workflowLibrary: WorkflowLibraryCoordinator { session.workflowLibrary }
+    private var threadCreation: ThreadCreationCoordinator { session.threadCreation }
+
+    private var activeRootOverlay: RootOverlayFocusTarget? {
+        if isShowingNewThread {
+            return .newThread
         }
-        let repository = LocalControlRoomStore(paths: paths)
-        self.repository = repository
-        _graphStore = State(initialValue: GraphStore(repository: repository))
-        _runtimeStore = State(initialValue: CodexRuntimeStore())
-        _supervisorStore = State(initialValue: WorkflowSupervisorStore())
-        _workflowLibrary = State(initialValue: WorkflowLibraryCoordinator(repository: repository))
-        _bootstrapErrorMessage = State(initialValue: bootstrapErrorMessage)
+        if workflowLibrary.editorMode != nil {
+            return .workflowName
+        }
+        if isShowingPairing {
+            return .pairing
+        }
+        return nil
     }
 
     var body: some View {
@@ -82,6 +84,7 @@ struct RootView: View {
             isMachineRecoveryPresented: $isMachineRecoveryPresented,
             onCanvasSizeChange: { canvasSize = $0 }
         )
+            .accessibilityHidden(activeRootOverlay != nil)
             .overlay(alignment: .topLeading) {
                 if !isReadingModePresented {
                     CanvasCommandBar(
@@ -121,6 +124,8 @@ struct RootView: View {
                         readingThreadCount: readingThreadCount,
                         showsSubagents: showsSubagents
                     )
+                    .accessibilityFocused($accessibilityFocus, equals: .commandBar)
+                    .accessibilityHidden(activeRootOverlay != nil)
                     .padding(14)
                 }
             }
@@ -137,6 +142,10 @@ struct RootView: View {
                         onCancel: { isShowingNewThread = false },
                         catalogRevision: threadCreation.catalogRevision
                     )
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("New Codex thread")
+                    .accessibilityAddTraits(.isModal)
+                    .accessibilityFocused($accessibilityFocus, equals: .newThread)
                     .padding(.leading, 14)
                     .padding(.top, 72)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
@@ -153,6 +162,10 @@ struct RootView: View {
                         onSubmit: submitWorkflowName,
                         onCancel: { workflowLibrary.editorMode = nil }
                     )
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel(workflowEditorMode.title)
+                    .accessibilityAddTraits(.isModal)
+                    .accessibilityFocused($accessibilityFocus, equals: .workflowName)
                     .padding(.leading, 14)
                     .padding(.top, 72)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
@@ -167,6 +180,10 @@ struct RootView: View {
                         onRefresh: showPairing,
                         onCancel: dismissPairingPopover
                     )
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Pair iPhone")
+                    .accessibilityAddTraits(.isModal)
+                    .accessibilityFocused($accessibilityFocus, equals: .pairing)
                     .padding(.leading, 14)
                     .padding(.top, 72)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
@@ -199,12 +216,8 @@ struct RootView: View {
                         action: "App storage"
                     )
                 }
-                supervisorStore.start()
-                startWorkflowHookEventBridge()
-                await workflowLibrary.refreshState()
-                await graphStore.load()
-                await workflowLibrary.refreshState()
-                await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
+                await session.start()
+                await bootstrapWorkflowState()
                 do {
                     let events = try await repository.loadWorkflowEvents()
                     let localEvents = events.filter { $0.hostID == nil || $0.hostID == runtimeStore.localHost.id }
@@ -240,6 +253,9 @@ struct RootView: View {
                 Task {
                     await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
                 }
+            }
+            .onChange(of: activeRootOverlay) { previous, current in
+                handleRootOverlayFocusTransition(from: previous, to: current)
             }
             .onChange(of: runtimeStore.workflowEvents) { _, events in
                 Task {
@@ -293,9 +309,6 @@ struct RootView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .mapofagentsConnectRequested)) { _ in
                 Task { await runtimeStore.connect() }
-            }
-            .onDisappear {
-                stopWorkflowHookEventBridge()
             }
             .fileImporter(
                 isPresented: $isImportingFolder,
@@ -597,55 +610,6 @@ struct RootView: View {
         )
     }
 
-    private func startWorkflowHookEventBridge() {
-        guard hookEventBridgeTask == nil else { return }
-        let bridge = WorkflowHookEventFileBridge(defaultHostID: runtimeStore.localHost.id)
-        hookEventBridgeTask = bridge.start { events in
-            for event in events {
-                guard shouldRecordHookWorkflowEvent(event) else {
-                    continue
-                }
-                runtimeStore.recordWorkflowEvent(event)
-            }
-        }
-    }
-
-    private func stopWorkflowHookEventBridge() {
-        hookEventBridgeTask?.cancel()
-        hookEventBridgeTask = nil
-    }
-
-    private func shouldRecordHookWorkflowEvent(_ event: WorkflowEvent) -> Bool {
-        if event.kind == .threadCreated {
-            let sourceMatches = event.threadID.map { threadID in
-                graphStore.workflowThreadRefs.contains { threadRef in
-                    threadRef.matches(hostID: event.hostID, threadID: threadID)
-                }
-            } ?? false
-            let childMatches = event.childThreadID.map { threadID in
-                graphStore.workflowThreadRefs.contains { threadRef in
-                    threadRef.matches(hostID: event.childHostID, threadID: threadID)
-                }
-            } ?? false
-            return sourceMatches || childMatches
-        }
-        if event.kind == .folderCreated {
-            guard event.childFolderPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
-                return false
-            }
-
-            return graphStore.containsWorkflowThread(hostID: event.hostID, threadID: event.threadID)
-        }
-
-        guard let threadID = event.threadID else {
-            return false
-        }
-
-        return graphStore.workflowThreadRefs.contains { threadRef in
-            threadRef.matches(hostID: event.hostID, threadID: threadID)
-        }
-    }
-
     private func activityNotificationTitle(for event: WorkflowEvent) -> String {
         let name = threadTitle(for: event)
         switch event.kind {
@@ -707,14 +671,29 @@ struct RootView: View {
     }
 
     private func loadActiveWorkflow() async {
-        await workflowLibrary.refreshState()
-        await graphStore.load()
-        await refreshWorkflowMemberships()
-        await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
+        await bootstrapWorkflowState()
         await graphStore.applySupervisorMachines(supervisorStore.machines)
         await graphStore.applyHost(runtimeStore.localHost)
         await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
         refreshWorkflowConnections()
+    }
+
+    private func bootstrapWorkflowState() async {
+        do {
+            try await RootWorkflowBootstrap.run(
+                refreshWorkflowLibrary: { await workflowLibrary.refreshState() },
+                loadGraph: { await graphStore.load() },
+                loadSnapshot: { try await repository.loadWorkflowSnapshot() },
+                activeWorkflowID: { workflowLibrary.activeWorkflowID },
+                workflowThreadRefs: { graphStore.workflowThreadRefs },
+                publishMemberships: { workflowMemberships = $0 },
+                publishWorkflowThreads: { await supervisorStore.updateWorkflowThreads($0) }
+            )
+        } catch {
+            workflowMemberships = [:]
+            recordPersistenceError(error, action: "Refresh workflow memberships")
+            await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
+        }
     }
 
     private func refreshWorkflowMemberships() async {
@@ -728,6 +707,18 @@ struct RootView: View {
         } catch {
             workflowMemberships = [:]
             recordPersistenceError(error, action: "Refresh workflow memberships")
+        }
+    }
+
+    private func handleRootOverlayFocusTransition(
+        from previous: RootOverlayFocusTarget?,
+        to current: RootOverlayFocusTarget?
+    ) {
+        overlayKeyboardFocusRestorer.transition(from: previous, to: current)
+        Task { @MainActor in
+            await Task.yield()
+            guard activeRootOverlay == current else { return }
+            accessibilityFocus = current ?? .commandBar
         }
     }
 
@@ -772,6 +763,7 @@ struct RootView: View {
             do {
                 let payload = try await MapofAgentsMacPairingService.beginPairingSession()
                 guard isShowingPairing, pairingSessionGeneration == generation else { return }
+                session.ensurePairingHostSupervision()
                 pairingPayload = payload
                 pairingError = nil
                 pairingStatus = .ready
@@ -785,15 +777,9 @@ struct RootView: View {
     }
 
     private func dismissPairingPopover() {
-        let wasShowingPairing = isShowingPairing
         pairingSessionGeneration += 1
         isShowingPairing = false
         pairingStatus = .idle
-
-        guard wasShowingPairing else { return }
-        Task {
-            try? await MapofAgentsMacPairingService.stopPairingSession()
-        }
     }
 
     private func refreshWorkflowConnections(showProblemsAutomatically: Bool = false) {
@@ -1182,6 +1168,7 @@ private struct WorkflowNamePopoverView: View {
     @Binding var name: String
     var onSubmit: () -> Void
     var onCancel: () -> Void
+    @FocusState private var isNameFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1201,10 +1188,12 @@ private struct WorkflowNamePopoverView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Close")
+                .accessibilityLabel("Close workflow name editor")
             }
 
             TextField("Workflow name", text: $name)
                 .textFieldStyle(.roundedBorder)
+                .focused($isNameFocused)
                 .onSubmit(onSubmit)
 
             HStack {
@@ -1229,6 +1218,12 @@ private struct WorkflowNamePopoverView: View {
                 .stroke(.quaternary, lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.18), radius: 18, x: 0, y: 10)
+        .onAppear {
+            Task { @MainActor in
+                await Task.yield()
+                isNameFocused = true
+            }
+        }
     }
 }
 
@@ -1238,6 +1233,12 @@ private struct PairIPhonePopoverView: View {
     var status: PairingHostStatus
     var onRefresh: () -> Void
     var onCancel: () -> Void
+
+    @State private var pairedDevices: [MapofAgentsPairedDeviceSummary] = []
+    @State private var pairedDevicesError: String?
+    @State private var isLoadingPairedDevices = false
+    @State private var revokingDeviceID: String?
+    @State private var pendingRevocation: MapofAgentsPairedDeviceSummary?
 
     private var pairingURLString: String? {
         try? payload?.pairingURL().absoluteString
@@ -1268,12 +1269,14 @@ private struct PairIPhonePopoverView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Refresh")
+                .accessibilityLabel("Refresh pairing code")
 
                 Button(action: onCancel) {
                     Image(systemName: "xmark")
                 }
                 .buttonStyle(.plain)
                 .help("Close")
+                .accessibilityLabel("Close pairing")
             }
 
             if let errorMessage {
@@ -1314,6 +1317,9 @@ private struct PairIPhonePopoverView: View {
                 ProgressView()
                     .frame(width: 430, height: 188)
             }
+
+            Divider()
+            pairedDevicesSection
         }
         .padding(14)
         .frame(width: 470)
@@ -1323,6 +1329,104 @@ private struct PairIPhonePopoverView: View {
                 .stroke(.quaternary, lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.18), radius: 18, x: 0, y: 10)
+        .task {
+            await loadPairedDevices()
+        }
+        .confirmationDialog(
+            "Revoke this iPhone?",
+            isPresented: Binding(
+                get: { pendingRevocation != nil },
+                set: { if !$0 { pendingRevocation = nil } }
+            ),
+            presenting: pendingRevocation
+        ) { device in
+            Button("Revoke \(device.name)", role: .destructive) {
+                Task { await revoke(device) }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingRevocation = nil
+            }
+        } message: { device in
+            Text("\(device.name) will be unable to refresh its credential and will lose access within five minutes. It must scan a new pairing code to reconnect.")
+        }
+    }
+
+    @ViewBuilder
+    private var pairedDevicesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Paired devices")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                if isLoadingPairedDevices {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if let pairedDevicesError {
+                Text(pairedDevicesError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                Button("Retry") {
+                    Task { await loadPairedDevices() }
+                }
+                .controlSize(.small)
+            } else if pairedDevices.isEmpty, !isLoadingPairedDevices {
+                Text("No active iPhones are enrolled yet.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(pairedDevices) { device in
+                    HStack(spacing: 8) {
+                        Image(systemName: "iphone")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(device.name)
+                                .font(.caption.weight(.semibold))
+                            Text("Last used \(device.lastRefreshedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        FeedbackButton(
+                            unavailableReason: revokingDeviceID == device.id
+                                ? "This device is already being revoked."
+                                : nil,
+                            action: { pendingRevocation = device }
+                        ) {
+                            Text(revokingDeviceID == device.id ? "Revoking…" : "Revoke")
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
+    private func loadPairedDevices() async {
+        guard !isLoadingPairedDevices else { return }
+        isLoadingPairedDevices = true
+        defer { isLoadingPairedDevices = false }
+        do {
+            pairedDevices = try await MapofAgentsMacPairingService.pairedDevices()
+            pairedDevicesError = nil
+        } catch {
+            pairedDevicesError = error.localizedDescription
+        }
+    }
+
+    private func revoke(_ device: MapofAgentsPairedDeviceSummary) async {
+        guard revokingDeviceID == nil else { return }
+        revokingDeviceID = device.id
+        pendingRevocation = nil
+        defer { revokingDeviceID = nil }
+        do {
+            try await MapofAgentsMacPairingService.revokePairedDevice(id: device.id)
+            await loadPairedDevices()
+        } catch {
+            pairedDevicesError = error.localizedDescription
+        }
     }
 
     private func endpointSummary(_ payload: MapofAgentsPairingPayload) -> some View {

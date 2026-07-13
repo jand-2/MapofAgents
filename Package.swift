@@ -30,5 +30,13 @@ let package = Package(
             name: "MapofAgentsCoreTests",
             dependencies: ["MapofAgentsCore"]
         ),
+        .testTarget(
+            name: "MapofAgentsUITests",
+            dependencies: ["MapofAgentsCore", "MapofAgentsUI"]
+        ),
+        .testTarget(
+            name: "MapofAgentsAppTests",
+            dependencies: ["MapofAgentsApp"]
+        ),
     ]
 )

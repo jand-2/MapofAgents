@@ -1,5 +1,9 @@
 {
+  "id": "event-folder-created-1",
+  "source": "codex-hook",
   "type": "folder.created",
+  "method": "folder/created",
+  "summary": "Created folder Desktop",
   "sourceHostID": "local",
   "sourceThreadID": "source-thread",
   "sourceTurnID": "turn-1",

@@ -22,6 +22,7 @@ struct IPhoneRootView: View {
     @State private var workflowMemberships: [String: [ThreadWorkflowMembership]] = [:]
     @State private var threadCreation = ThreadCreationCoordinator()
     @State private var pairingCoordinator = IPhonePairingCoordinator()
+    @State private var workflowImportConfirmation = WorkflowImportConfirmationGate()
     @State private var activeSheet: IPhoneSheet?
     @State private var isShowingNewThread = false
     @State private var isRefreshingWorkflowConnections = false
@@ -235,14 +236,36 @@ struct IPhoneRootView: View {
                 pairingCoordinator.approvePendingPairingURL(
                     graphStore: graphStore,
                     supervisorStore: supervisorStore,
-                    syncWorkflowFromMac: syncWorkflowFromMac
+                    syncWorkflowFromMac: makeWorkflowSyncHandler()
                 )
             }
             Button("Cancel", role: .cancel) {
                 pairingCoordinator.cancelPendingPairingApproval()
             }
         } message: { pending in
-            Text("This pairing link will connect this iPhone to \(pending.title) and save it only after a successful connection.\n\nEndpoints:\n\(pending.endpointSummary)")
+            Text("This pairing link securely enrolls this iPhone with \(pending.title), saves the revocable device credential in Keychain, and then attempts the connection. If the Mac is temporarily unavailable afterward, you can retry without scanning another code.\n\nEndpoints:\n\(pending.endpointSummary)")
+        }
+        .confirmationDialog(
+            "Replace iPhone Layouts?",
+            isPresented: Binding(
+                get: { workflowImportConfirmation.pendingRequest != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        workflowImportConfirmation.cancel()
+                    }
+                }
+            ),
+            titleVisibility: .visible,
+            presenting: workflowImportConfirmation.pendingRequest
+        ) { request in
+            Button("Replace with \(request.sourceName) Layouts", role: .destructive) {
+                workflowImportConfirmation.approve()
+            }
+            Button("Keep iPhone Layouts", role: .cancel) {
+                workflowImportConfirmation.cancel()
+            }
+        } message: { request in
+            Text("This replaces the entire workflow library and every saved layout on this iPhone with the current snapshot from \(request.sourceName). The current iPhone library is retained as a rollback snapshot.")
         }
         .task {
             await bootstrapRemoteControl()
@@ -298,9 +321,10 @@ struct IPhoneRootView: View {
                 }
             ) {
                 Image(systemName: "plus.bubble")
-                    .frame(width: 34, height: 34)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.borderedProminent)
+            .accessibilityLabel("Create Codex thread")
             .help(newThreadUnavailableReason ?? "Create Codex thread")
         }
         .padding(8)
@@ -341,7 +365,7 @@ struct IPhoneRootView: View {
                 action: refreshWorkflowConnections
             ) {
                 Image(systemName: isRefreshingWorkflowConnections ? "arrow.triangle.2.circlepath" : "antenna.radiowaves.left.and.right")
-                    .frame(width: 34, height: 34)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Refresh connections")
@@ -475,7 +499,7 @@ struct IPhoneRootView: View {
         Button(action: action) {
             Label(title, systemImage: systemImage)
                 .labelStyle(.iconOnly)
-                .frame(width: 36, height: 36)
+                .frame(width: 44, height: 44)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
@@ -484,7 +508,7 @@ struct IPhoneRootView: View {
     private func iconButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                .frame(width: 34, height: 34)
+                .frame(width: 44, height: 44)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
@@ -496,7 +520,6 @@ struct IPhoneRootView: View {
         await workflowLibrary.refreshState()
         await graphStore.load()
         await refreshWorkflowMemberships()
-        await workflowLibrary.refreshState()
         await supervisorStore.updateWorkflowThreads(graphStore.workflowThreadRefs)
 
         do {
@@ -525,7 +548,7 @@ struct IPhoneRootView: View {
         await pairingCoordinator.connectLaunchConfiguredRemoteIfNeeded(
             graphStore: graphStore,
             supervisorStore: supervisorStore,
-            syncWorkflowFromMac: syncWorkflowFromMac
+            syncWorkflowFromMac: makeWorkflowSyncHandler()
         )
     }
 
@@ -592,22 +615,25 @@ struct IPhoneRootView: View {
         }
     }
 
-    private func connectRemote(name: String, endpoint: String, bearerToken: String?) {
-        pairingCoordinator.connectRemote(
+    private func connectRemote(name: String, endpoint: String, bearerToken: String?) async -> Bool {
+        await pairingCoordinator.connectRemote(
             name: name,
             endpoint: endpoint,
             bearerToken: bearerToken,
             graphStore: graphStore,
             supervisorStore: supervisorStore,
-            syncWorkflowFromMac: syncWorkflowFromMac
+            syncWorkflowFromMac: makeWorkflowSyncHandler()
         )
     }
 
     private func loadWorkflowFromMachine(_ machine: SupervisorMachine) {
+        activeSheet = nil
+        let syncWorkflow = makeWorkflowSyncHandler()
         Task {
-            await syncWorkflowFromMac(
-                hostID: machine.id,
-                pairedHost: machine.id == pairingCoordinator.pairedHost?.id ? pairingCoordinator.pairedHost : nil
+            await Task.yield()
+            await syncWorkflow(
+                machine.id,
+                machine.id == pairingCoordinator.pairedHost?.id ? pairingCoordinator.pairedHost : nil
             )
         }
     }
@@ -617,14 +643,40 @@ struct IPhoneRootView: View {
             code,
             graphStore: graphStore,
             supervisorStore: supervisorStore,
-            syncWorkflowFromMac: syncWorkflowFromMac
+            syncWorkflowFromMac: makeWorkflowSyncHandler()
         )
     }
 
+    private func makeWorkflowSyncHandler() -> (HostID, MapofAgentsPairedHost?) async -> Bool {
+        let authorizationID = UUID()
+        return { hostID, pairedHost in
+            await syncWorkflowFromMac(
+                hostID: hostID,
+                pairedHost: pairedHost,
+                authorizationID: authorizationID
+            )
+        }
+    }
+
     @discardableResult
-    private func syncWorkflowFromMac(hostID: HostID, pairedHost: MapofAgentsPairedHost? = nil) async -> Bool {
+    private func syncWorkflowFromMac(
+        hostID: HostID,
+        pairedHost: MapofAgentsPairedHost? = nil,
+        authorizationID: UUID
+    ) async -> Bool {
         let machine = supervisorStore.machines.first { $0.id == hostID }
-        pairingCoordinator.syncMessage = "Loading layout from \(machine?.name ?? "Mac")..."
+        let machineName = machine?.name ?? "Mac"
+        guard await workflowImportConfirmation.requestApproval(
+            authorizationID: authorizationID,
+            sourceHostID: hostID,
+            sourceName: machineName
+        ) else {
+            pairingCoordinator.syncMessage = nil
+            pairingCoordinator.errorMessage = "Workflow import from \(machineName) was canceled. Your iPhone layouts were not changed."
+            return false
+        }
+
+        pairingCoordinator.syncMessage = "Loading layout from \(machineName)..."
 
         do {
             let snapshot = try await supervisorStore
@@ -639,7 +691,7 @@ struct IPhoneRootView: View {
             await supervisorStore.restoreWorkflowEvents(snapshot.workflowEvents)
             await loadActiveWorkflow()
 
-            pairingCoordinator.syncMessage = "Loaded \(snapshot.library.workflows.count) workflows from \(machine?.name ?? "Mac")."
+            pairingCoordinator.syncMessage = "Loaded \(snapshot.library.workflows.count) workflows from \(machineName)."
             pairingCoordinator.errorMessage = nil
             errorMessage = nil
             return true
@@ -654,7 +706,7 @@ struct IPhoneRootView: View {
         pairingCoordinator.reconnectPairedHost(
             graphStore: graphStore,
             supervisorStore: supervisorStore,
-            syncWorkflowFromMac: syncWorkflowFromMac
+            syncWorkflowFromMac: makeWorkflowSyncHandler()
         )
     }
 
@@ -819,15 +871,12 @@ struct IPhoneRootView: View {
 private struct IPhoneMachinesSheet: View {
     private enum PendingDestructiveAction: Identifiable {
         case forgetPairing(MapofAgentsPairedHost)
-        case loadWorkflow(SupervisorMachine)
         case removeMachine(SupervisorMachine)
 
         var id: String {
             switch self {
             case .forgetPairing(let host):
                 return "forget-\(host.id.rawValue)"
-            case .loadWorkflow(let machine):
-                return "load-workflow-\(machine.id.rawValue)"
             case .removeMachine(let machine):
                 return "remove-\(machine.id.rawValue)"
             }
@@ -837,8 +886,6 @@ private struct IPhoneMachinesSheet: View {
             switch self {
             case .forgetPairing:
                 return "Forget Paired Mac?"
-            case .loadWorkflow:
-                return "Load Mac Layout?"
             case .removeMachine:
                 return "Remove Machine?"
             }
@@ -848,8 +895,6 @@ private struct IPhoneMachinesSheet: View {
             switch self {
             case .forgetPairing(let host):
                 return "Forget \(host.name)"
-            case .loadWorkflow:
-                return "Replace iPhone Layouts"
             case .removeMachine(let machine):
                 return "Remove \(machine.name)"
             }
@@ -859,8 +904,6 @@ private struct IPhoneMachinesSheet: View {
             switch self {
             case .forgetPairing(let host):
                 return "This removes the saved pairing for \(host.name) from this iPhone. You will need a new pairing code from the Mac to sync workflows again."
-            case .loadWorkflow(let machine):
-                return "This replaces the workflow library and saved layouts on this iPhone with the current snapshot from \(machine.name). Local iPhone-only layouts are not backed up by this import."
             case .removeMachine(let machine):
                 return "This removes the saved route for \(machine.name). Existing workflow nodes stay on the map and can be reconnected later."
             }
@@ -872,7 +915,7 @@ private struct IPhoneMachinesSheet: View {
     var pairedHost: MapofAgentsPairedHost?
     var activeEndpoint: AppServerRelayEndpoint?
     var isConnectingPairedHost: Bool
-    var onConnect: (String, String, String?) -> Void
+    var onConnect: (String, String, String?) async -> Bool
     var onPair: (String) -> Void
     var onReconnectPairedHost: () -> Void
     var onForgetPairing: () -> Void
@@ -880,9 +923,10 @@ private struct IPhoneMachinesSheet: View {
     var onAddFolder: (SupervisorMachine, String) -> Void
     var onDisconnect: (HostID) -> Void
 
-    @State private var remoteName = "mac-host.lan"
-    @State private var remoteEndpoint = "ws://mac-host.lan:18945"
+    @State private var remoteName = "Example Mac"
+    @State private var remoteEndpoint = "wss://example-host.local"
     @State private var remoteToken = ""
+    @State private var isConnectingManualRemote = false
     @State private var pairingCode = ""
     @State private var folderPaths: [HostID: String] = [:]
     @State private var isCodexRemotesExpanded = true
@@ -993,7 +1037,7 @@ private struct IPhoneMachinesSheet: View {
                 Section("Connect") {
                     TextField("Machine name", text: $remoteName)
                         .textInputAutocapitalization(.words)
-                    TextField("ws://mac-mini.tailnet:18945", text: $remoteEndpoint)
+                    TextField("wss://example-host.local", text: $remoteEndpoint)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -1001,16 +1045,27 @@ private struct IPhoneMachinesSheet: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     FeedbackButton(
-                        unavailableReason: remoteEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Enter a remote App Server endpoint before connecting." : nil,
+                        unavailableReason: manualConnectionUnavailableReason,
                         action: {
-                        let token = remoteToken.trimmingCharacters(in: .whitespacesAndNewlines)
-                        onConnect(remoteName, remoteEndpoint, token.isEmpty ? nil : token)
-                        remoteName = "mac-host.lan"
-                        remoteEndpoint = "ws://mac-host.lan:18945"
-                        remoteToken = ""
+                            let name = remoteName.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let endpoint = remoteEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let token = remoteToken.trimmingCharacters(in: .whitespacesAndNewlines)
+                            Task {
+                                isConnectingManualRemote = true
+                                defer { isConnectingManualRemote = false }
+                                guard await onConnect(name, endpoint, token.isEmpty ? nil : token) else {
+                                    return
+                                }
+                                remoteName = "Example Mac"
+                                remoteEndpoint = "wss://example-host.local"
+                                remoteToken = ""
+                            }
                         }
                     ) {
-                        Label("Connect Remote App Server", systemImage: "antenna.radiowaves.left.and.right")
+                        Label(
+                            isConnectingManualRemote ? "Connecting..." : "Connect Remote App Server",
+                            systemImage: "antenna.radiowaves.left.and.right"
+                        )
                     }
                 }
 
@@ -1128,7 +1183,7 @@ private struct IPhoneMachinesSheet: View {
                                 if machine.status == .connected {
                                     if machine.platform == .macOS || machine.name.localizedCaseInsensitiveContains("mac") {
                                         Button {
-                                            pendingDestructiveAction = .loadWorkflow(machine)
+                                            onLoadWorkflow(machine)
                                         } label: {
                                             Label("Load Mac Layout", systemImage: "rectangle.3.group")
                                         }
@@ -1146,8 +1201,10 @@ private struct IPhoneMachinesSheet: View {
                                             folderPaths[machine.id] = ""
                                         } label: {
                                             Image(systemName: "folder.badge.plus")
+                                                .frame(width: 44, height: 44)
                                         }
                                         .buttonStyle(.bordered)
+                                        .accessibilityLabel("Add project folder")
                                     }
                                 }
 
@@ -1198,8 +1255,6 @@ private struct IPhoneMachinesSheet: View {
                 switch action {
                 case .forgetPairing:
                     onForgetPairing()
-                case .loadWorkflow(let machine):
-                    onLoadWorkflow(machine)
                 case .removeMachine(let machine):
                     onDisconnect(machine.id)
                 }
@@ -1228,6 +1283,16 @@ private struct IPhoneMachinesSheet: View {
             }
         }
         .buttonStyle(.plain)
+    }
+
+    private var manualConnectionUnavailableReason: String? {
+        if isConnectingManualRemote {
+            return "A remote App Server connection is already in progress."
+        }
+        if remoteEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Enter a remote App Server endpoint before connecting."
+        }
+        return nil
     }
 
     private func codexRemoteRow(_ remote: CodexDesktopRemote) -> some View {
@@ -1318,9 +1383,10 @@ private struct IPhoneMachinesSheet: View {
                     remoteEndpoint = endpoint
                 } label: {
                     Image(systemName: "square.and.pencil")
-                        .frame(width: 28, height: 28)
+                        .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.bordered)
+                .accessibilityLabel("Use suggested endpoint for \(machine.name)")
             }
         }
         .padding(.vertical, 4)
@@ -1405,7 +1471,7 @@ private struct IPhoneMachinesSheet: View {
         case .windows:
             return #"C:\Users\User\Desktop"#
         case .macOS, .linux:
-            return "/Users/name/project"
+            return "/Users/example/project"
         case .iOS, .iPadOS, .unknown:
             return "Project path"
         }

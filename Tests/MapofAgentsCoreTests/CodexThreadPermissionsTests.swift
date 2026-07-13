@@ -79,13 +79,15 @@ func attentionApprovalResponsesPreserveRequestedPermissions() {
 
 @Test
 func attentionRequestsPreserveStringRequestIDs() {
+    let connectionID = AppServerConnectionID()
     let notification = CodexServerNotification(
         method: "item/commandExecution/requestApproval",
         params: .object([
             "threadId": .string("thread"),
             "command": .string("date"),
         ]),
-        requestID: .string("approval-1")
+        requestID: .string("approval-1"),
+        connectionID: connectionID
     )
 
     let request = RuntimeAttentionRequest.appServerRequest(
@@ -95,6 +97,7 @@ func attentionRequestsPreserveStringRequestIDs() {
 
     #expect(request?.id == "remote::approval-1")
     #expect(request?.requestID == .string("approval-1"))
+    #expect(request?.connectionID == connectionID)
     #expect(request?.appServerApprovalResult(allow: true) == .object([
         "decision": .string("accept"),
     ]))

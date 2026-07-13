@@ -2,119 +2,636 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mapofagents.dev/schema/graph.schema.json",
   "title": "MapofAgents graph",
+  "description": "The cross-platform graph document persisted by the Apple and Windows clients.",
   "type": "object",
-  "required": ["workspaceID", "title", "nodes", "manualEdges", "viewport", "updatedAt"],
+  "required": [
+    "workspaceID",
+    "title",
+    "nodes",
+    "manualEdges",
+    "viewport",
+    "updatedAt"
+  ],
   "properties": {
-    "workspaceID": { "type": "string" },
-    "title": { "type": "string" },
+    "workspaceID": {
+      "$ref": "#/$defs/identifier"
+    },
+    "title": {
+      "type": "string"
+    },
+    "layoutCoordinateSpace": {
+      "const": "center"
+    },
     "nodes": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/canvasNode" }
+      "additionalProperties": {
+        "$ref": "#/$defs/canvasNode"
+      }
     },
     "manualEdges": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/canvasEdge" }
+      "additionalProperties": {
+        "$ref": "#/$defs/canvasEdge"
+      }
     },
     "messageRoutes": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": {
+        "$ref": "#/$defs/messageRoute"
+      }
+    },
+    "pendingAttentionRequests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/runtimeAttentionRequest"
+      }
+    },
+    "runtimeDiagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/runtimeDiagnosticStep"
+      }
     },
     "suppressedAutoMaterializedThreadIDs": {
       "type": "array",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
     },
-    "viewport": { "$ref": "#/$defs/canvasViewport" },
+    "viewport": {
+      "$ref": "#/$defs/canvasViewport"
+    },
     "updatedAt": {
-      "type": "string",
-      "format": "date-time"
+      "$ref": "#/$defs/dateTime"
     }
   },
+  "additionalProperties": false,
   "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dateTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "requestID": {
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "$ref": "#/$defs/identifier"
+        }
+      ]
+    },
     "canvasPoint": {
       "type": "object",
-      "required": ["x", "y"],
+      "required": [
+        "x",
+        "y"
+      ],
       "properties": {
-        "x": { "type": "number" },
-        "y": { "type": "number" }
-      }
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
     },
     "canvasSize": {
       "type": "object",
-      "required": ["width", "height"],
+      "required": [
+        "width",
+        "height"
+      ],
       "properties": {
-        "width": { "type": "number" },
-        "height": { "type": "number" }
-      }
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "height": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "canvasViewport": {
       "type": "object",
-      "required": ["scale", "offset"],
+      "required": [
+        "scale",
+        "offset"
+      ],
       "properties": {
-        "scale": { "type": "number" },
-        "offset": { "$ref": "#/$defs/canvasPoint" }
-      }
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "offset": {
+          "$ref": "#/$defs/canvasPoint"
+        }
+      },
+      "additionalProperties": false
     },
     "threadRef": {
       "type": "object",
-      "required": ["hostID", "threadID", "cwd"],
+      "required": [
+        "hostID",
+        "threadID",
+        "cwd"
+      ],
       "properties": {
-        "hostID": { "type": "string" },
-        "threadID": { "type": "string" },
-        "cwd": { "type": "string" },
-        "name": { "type": "string" }
-      }
+        "hostID": {
+          "$ref": "#/$defs/identifier"
+        },
+        "threadID": {
+          "$ref": "#/$defs/identifier"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "threadPermissions": {
+      "type": "object",
+      "required": [
+        "approvalPolicy",
+        "sandboxMode"
+      ],
+      "properties": {
+        "approvalPolicy": {
+          "enum": [
+            "on-request",
+            "on-failure",
+            "untrusted",
+            "never"
+          ]
+        },
+        "sandboxMode": {
+          "enum": [
+            "danger-full-access",
+            "workspace-write",
+            "read-only"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "localThreadMessage": {
+      "type": "object",
+      "required": [
+        "id",
+        "role",
+        "text",
+        "createdAt"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "role": {
+          "enum": [
+            "user",
+            "assistant",
+            "reasoning",
+            "tool",
+            "system",
+            "file",
+            "image",
+            "diff"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/dateTime"
+        }
+      },
+      "additionalProperties": false
+    },
+    "localThreadTurn": {
+      "type": "object",
+      "required": [
+        "id",
+        "status",
+        "startedAt",
+        "itemsView",
+        "itemMessageIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "status": {
+          "enum": [
+            "idle",
+            "running",
+            "needsInput",
+            "failed",
+            "complete",
+            "unknown"
+          ]
+        },
+        "startedAt": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "completedAt": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "error": {
+          "type": "string"
+        },
+        "itemsView": {
+          "enum": [
+            "notLoaded",
+            "summary",
+            "full"
+          ]
+        },
+        "durationMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "itemMessageIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "nodeMetadata": {
       "type": "object",
       "properties": {
-        "hostID": { "type": "string" },
+        "hostID": {
+          "$ref": "#/$defs/identifier"
+        },
         "platform": {
-          "enum": ["macOS", "iOS", "iPadOS", "windows", "linux", "unknown"]
+          "enum": [
+            "macOS",
+            "iOS",
+            "iPadOS",
+            "windows",
+            "linux",
+            "unknown"
+          ]
         },
         "hostStatus": {
-          "enum": ["connected", "connecting", "disconnected", "unavailable"]
+          "enum": [
+            "connected",
+            "connecting",
+            "disconnected",
+            "unavailable"
+          ]
         },
-        "codexHome": { "type": "string" },
-        "folderPath": { "type": "string" },
-        "threadRef": { "$ref": "#/$defs/threadRef" },
-        "model": { "type": "string" },
-        "reasoningEffort": { "type": "string" },
+        "hostLastError": {
+          "type": "string"
+        },
+        "codexHome": {
+          "type": "string"
+        },
+        "appServerEndpointUrl": {
+          "type": "string",
+          "pattern": "^wss?://\\S+$"
+        },
+        "folderPath": {
+          "type": "string"
+        },
+        "threadRef": {
+          "$ref": "#/$defs/threadRef"
+        },
+        "model": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "type": "string"
+        },
+        "threadPermissions": {
+          "$ref": "#/$defs/threadPermissions"
+        },
+        "threadKind": {
+          "enum": [
+            "thread",
+            "subagent"
+          ]
+        },
+        "approvalPolicy": {
+          "enum": [
+            "on-request",
+            "on-failure",
+            "untrusted",
+            "never"
+          ]
+        },
+        "sandboxMode": {
+          "enum": [
+            "danger-full-access",
+            "workspace-write",
+            "read-only"
+          ]
+        },
+        "initialPrompt": {
+          "type": "string"
+        },
+        "localTranscript": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/localThreadMessage"
+          }
+        },
+        "localTranscriptTurns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/localThreadTurn"
+          }
+        },
         "runStatus": {
-          "enum": ["idle", "running", "needsInput", "failed", "complete", "unknown"]
+          "enum": [
+            "idle",
+            "running",
+            "needsInput",
+            "failed",
+            "complete",
+            "unknown"
+          ]
         },
-        "isUnread": { "type": "boolean" },
-        "hasManualPosition": { "type": "boolean" }
-      }
+        "popoverOffset": {
+          "$ref": "#/$defs/canvasPoint"
+        },
+        "isUnread": {
+          "type": "boolean"
+        },
+        "isArchived": {
+          "type": "boolean"
+        },
+        "hasManualPosition": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
     },
     "canvasNode": {
       "type": "object",
-      "required": ["id", "kind", "title", "subtitle", "position", "size", "metadata", "zIndex"],
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "subtitle",
+        "position",
+        "size",
+        "metadata",
+        "zIndex"
+      ],
       "properties": {
-        "id": { "type": "string" },
-        "kind": {
-          "enum": ["machine", "folder", "codexThread"]
+        "id": {
+          "$ref": "#/$defs/identifier"
         },
-        "title": { "type": "string" },
-        "subtitle": { "type": "string" },
-        "position": { "$ref": "#/$defs/canvasPoint" },
-        "size": { "$ref": "#/$defs/canvasSize" },
-        "metadata": { "$ref": "#/$defs/nodeMetadata" },
-        "zIndex": { "type": "integer" }
-      }
+        "kind": {
+          "enum": [
+            "machine",
+            "folder",
+            "codexThread"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "subtitle": {
+          "type": "string"
+        },
+        "position": {
+          "$ref": "#/$defs/canvasPoint"
+        },
+        "size": {
+          "$ref": "#/$defs/canvasSize"
+        },
+        "metadata": {
+          "$ref": "#/$defs/nodeMetadata"
+        },
+        "zIndex": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
     },
     "canvasEdge": {
       "type": "object",
-      "required": ["id", "source", "target", "kind", "isManual"],
+      "required": [
+        "id",
+        "source",
+        "target",
+        "kind",
+        "isManual"
+      ],
       "properties": {
-        "id": { "type": "string" },
-        "source": { "type": "string" },
-        "target": { "type": "string" },
-        "kind": {
-          "enum": ["machineFolder", "folderThread", "machineThread", "manualNote", "threadMessage", "createdBy"]
+        "id": {
+          "$ref": "#/$defs/identifier"
         },
-        "isManual": { "type": "boolean" },
-        "label": { "type": "string" }
-      }
+        "source": {
+          "$ref": "#/$defs/identifier"
+        },
+        "target": {
+          "$ref": "#/$defs/identifier"
+        },
+        "kind": {
+          "enum": [
+            "machineFolder",
+            "folderThread",
+            "machineThread",
+            "manualNote",
+            "threadMessage",
+            "createdBy"
+          ]
+        },
+        "isManual": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "messageRoute": {
+      "type": "object",
+      "required": [
+        "id",
+        "sourceHostID",
+        "sourceThreadID",
+        "targetHostID",
+        "targetThreadID",
+        "timestamp",
+        "snippet",
+        "deliveryState",
+        "eventIDs"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "sourceHostID": {
+          "$ref": "#/$defs/identifier"
+        },
+        "sourceThreadID": {
+          "$ref": "#/$defs/identifier"
+        },
+        "sourceTurnID": {
+          "type": "string"
+        },
+        "sourceItemID": {
+          "type": "string"
+        },
+        "targetHostID": {
+          "$ref": "#/$defs/identifier"
+        },
+        "targetThreadID": {
+          "$ref": "#/$defs/identifier"
+        },
+        "targetTurnID": {
+          "type": "string"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "snippet": {
+          "type": "string"
+        },
+        "deliveryState": {
+          "enum": [
+            "pending",
+            "delivered",
+            "failed",
+            "unknown"
+          ]
+        },
+        "eventIDs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "canvasEdgeID": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtimeAttentionResponseChoice": {
+      "type": "object",
+      "required": [
+        "label",
+        "value"
+      ],
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtimeAttentionRequest": {
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "summary",
+        "createdAt"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "hostID": {
+          "type": "string"
+        },
+        "requestID": {
+          "$ref": "#/$defs/requestID"
+        },
+        "connectionID": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "threadID": {
+          "type": "string"
+        },
+        "turnID": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "requestParams": true,
+        "responseChoices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/runtimeAttentionResponseChoice"
+          }
+        },
+        "createdAt": {
+          "$ref": "#/$defs/dateTime"
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtimeDiagnosticStep": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "status",
+        "detail",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "passed",
+            "warning",
+            "failed"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "action": {
+          "enum": [
+            "installCodexCLI",
+            "updateCodexCLI",
+            "startAppServer",
+            "restartAppServer"
+          ]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

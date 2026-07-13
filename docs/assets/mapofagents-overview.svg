@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title description">
+  <title id="title">MapofAgents canvas overview</title>
+  <desc id="description">A public-safe schematic showing Codex threads collaborating across an example Mac, Windows host, and two folders.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10141b"/>
+      <stop offset="1" stop-color="#171c25"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#2a303b" stroke-width="1" opacity="0.58"/>
+    </pattern>
+    <marker id="blue-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#5ba7ff"/>
+    </marker>
+    <marker id="amber-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#f6a93b"/>
+    </marker>
+    <style>
+      .label { font: 600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f4f7fb; }
+      .meta { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #aab3c2; }
+      .badge { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .card { fill: #1b212b; stroke-width: 2; rx: 12; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="680" fill="url(#background)"/>
+  <rect width="1200" height="680" fill="url(#grid)"/>
+
+  <rect x="28" y="24" width="1144" height="64" rx="14" fill="#1d232d" stroke="#323a47"/>
+  <text x="55" y="64" class="label">MapofAgents</text>
+  <text x="214" y="63" class="meta">Machines · folders · threads · live workflow relationships</text>
+  <rect x="992" y="41" width="152" height="32" rx="16" fill="#163923" stroke="#2c9a55"/>
+  <circle cx="1012" cy="57" r="5" fill="#46d77b"/>
+  <text x="1025" y="62" class="badge" fill="#8ef0ad">Runtime connected</text>
+
+  <path d="M208 185 C208 235 260 238 260 286" fill="none" stroke="#687384" stroke-width="3"/>
+  <path d="M953 185 C953 235 905 238 905 286" fill="none" stroke="#687384" stroke-width="3"/>
+  <path d="M260 374 C260 412 234 420 234 456" fill="none" stroke="#687384" stroke-width="3"/>
+  <path d="M260 374 C260 414 505 414 505 456" fill="none" stroke="#687384" stroke-width="3"/>
+  <path d="M905 374 C905 414 861 420 861 456" fill="none" stroke="#687384" stroke-width="3"/>
+  <path d="M346 510 C390 510 410 510 454 510" fill="none" stroke="#5ba7ff" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#blue-arrow)"/>
+  <path d="M596 536 C654 550 686 556 740 536" fill="none" stroke="#f6a93b" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#amber-arrow)"/>
+
+  <rect class="card" x="100" y="118" width="216" height="68" stroke="#45c878"/>
+  <circle cx="126" cy="146" r="9" fill="#45c878"/>
+  <text x="146" y="145" class="label">Example Mac</text>
+  <text x="146" y="169" class="meta">example-host.local</text>
+
+  <rect class="card" x="844" y="118" width="216" height="68" stroke="#45c878"/>
+  <circle cx="870" cy="146" r="9" fill="#45c878"/>
+  <text x="890" y="145" class="label">Example PC</text>
+  <text x="890" y="169" class="meta">example-pc.local</text>
+
+  <rect class="card" x="142" y="286" width="236" height="88" stroke="#efc94c"/>
+  <text x="170" y="321" class="label">Project folder</text>
+  <text x="170" y="349" class="meta">/Users/example/project</text>
+
+  <rect class="card" x="782" y="286" width="246" height="88" stroke="#efc94c"/>
+  <text x="810" y="321" class="label">Project folder</text>
+  <text x="810" y="349" class="meta">C:\Users\Example\Project</text>
+
+  <rect class="card" x="112" y="456" width="234" height="112" stroke="#5ba7ff"/>
+  <text x="138" y="490" class="label">Planner</text>
+  <text x="138" y="516" class="meta">Defines the implementation</text>
+  <rect x="138" y="535" width="76" height="22" rx="11" fill="#173c28"/>
+  <text x="151" y="550" class="badge" fill="#62dc8c">complete</text>
+
+  <rect class="card" x="454" y="456" width="242" height="112" stroke="#5ba7ff"/>
+  <text x="480" y="490" class="label">Builder</text>
+  <text x="480" y="516" class="meta">Implements the change</text>
+  <rect x="480" y="535" width="72" height="22" rx="11" fill="#173c28"/>
+  <text x="493" y="550" class="badge" fill="#62dc8c">working</text>
+
+  <rect class="card" x="740" y="456" width="242" height="112" stroke="#5ba7ff"/>
+  <text x="766" y="490" class="label">Verifier</text>
+  <text x="766" y="516" class="meta">Runs remote checks</text>
+  <rect x="766" y="535" width="76" height="22" rx="11" fill="#173c28"/>
+  <text x="779" y="550" class="badge" fill="#62dc8c">complete</text>
+
+  <rect x="360" y="488" width="80" height="28" rx="14" fill="#172a42" stroke="#5ba7ff"/>
+  <text x="376" y="507" class="badge" fill="#91c8ff">message</text>
+  <rect x="638" y="532" width="76" height="28" rx="14" fill="#342719" stroke="#f6a93b"/>
+  <text x="654" y="551" class="badge" fill="#ffc66f">created</text>
+
+  <text x="40" y="638" class="meta">All names, hosts, and paths in this schematic are intentionally fictional placeholders.</text>
+</svg>

@@ -86,6 +86,16 @@ public struct ThreadRef: Codable, Hashable, Sendable {
     }
 }
 
+public struct ThreadCreationOutcome: Equatable, Sendable {
+    public var threadRef: ThreadRef
+    public var warning: String?
+
+    public init(threadRef: ThreadRef, warning: String? = nil) {
+        self.threadRef = threadRef
+        self.warning = warning
+    }
+}
+
 public struct WorkflowThreadContentSignature: Hashable, Sendable {
     public var threadRefs: [ThreadRef]
 

@@ -11,8 +11,8 @@ func codexAppServerClientConnectsWhenIntegrationEnabled() async throws {
     }
 
     let client = CodexAppServerClient()
-    let initialize = try await client.request(
-        method: "initialize",
+    let initialize = try await client.request(AppServerCall(
+        .initialize,
         params: .object([
             "clientInfo": .object([
                 "name": .string("mapofagents-tests"),
@@ -23,16 +23,16 @@ func codexAppServerClientConnectsWhenIntegrationEnabled() async throws {
                 "experimentalApi": .bool(true),
             ]),
         ])
-    )
+    ))
     try await client.notify(method: "initialized")
 
-    let models = try await client.request(
-        method: "model/list",
+    let models = try await client.request(AppServerCall(
+        .listModels,
         params: .object([
             "limit": .number(5),
             "includeHidden": .bool(false),
         ])
-    )
+    ))
 
     await client.stop()
 

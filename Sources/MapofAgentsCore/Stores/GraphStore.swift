@@ -7,6 +7,18 @@ public enum CanvasSelection: Hashable, Sendable {
     case edge(EdgeID)
 }
 
+public struct GraphPersistenceFailure: Equatable, Sendable {
+    public var operation: String
+    public var message: String
+    public var occurredAt: Date
+
+    public init(operation: String, message: String, occurredAt: Date = Date()) {
+        self.operation = operation
+        self.message = message
+        self.occurredAt = occurredAt
+    }
+}
+
 @MainActor
 @Observable
 public final class GraphStore {
@@ -15,6 +27,8 @@ public final class GraphStore {
     public var selection: CanvasSelection = .none
     public var pendingManualEdgeSource: NodeID?
     public var errorMessage: String?
+    public private(set) var lastPersistenceFailure: GraphPersistenceFailure?
+    public private(set) var persistenceFailureRevision = 0
 
     private let repository: any ControlRoomStore
     private let semanticResolver: any SemanticEdgeResolving
@@ -120,8 +134,25 @@ public final class GraphStore {
             pendingManualEdgeSource = nil
             recalculateSemanticEdges()
         } catch {
-            errorMessage = error.localizedDescription
+            recordPersistenceFailure(error, operation: "load canvas")
         }
+    }
+
+    @discardableResult
+    public func applyCanvasPatch(_ patch: CanvasPatch) async throws -> AgentGraph {
+        do {
+            let persistedGraph = try await repository.applyCanvasPatch(patch)
+            graph = persistedGraph
+            recalculateSemanticEdges()
+            return persistedGraph
+        } catch {
+            recordPersistenceFailure(error, operation: patch.persistenceOperation)
+            throw error
+        }
+    }
+
+    public func clearPersistenceFailure() {
+        lastPersistenceFailure = nil
     }
 
     public func addFolder(
@@ -925,11 +956,21 @@ public final class GraphStore {
 
     private func apply(_ patch: CanvasPatch) async {
         do {
-            graph = try await repository.applyCanvasPatch(patch)
-            recalculateSemanticEdges()
+            _ = try await applyCanvasPatch(patch)
         } catch {
-            errorMessage = error.localizedDescription
+            // UI-oriented mutation methods keep their non-throwing API. The failure is
+            // retained above and is also available through the throwing entry point.
         }
+    }
+
+    private func recordPersistenceFailure(_ error: Error, operation: String) {
+        let failure = GraphPersistenceFailure(
+            operation: operation,
+            message: error.localizedDescription
+        )
+        lastPersistenceFailure = failure
+        persistenceFailureRevision &+= 1
+        errorMessage = failure.message
     }
 
     private func recalculateSemanticEdges() {
@@ -1481,6 +1522,29 @@ public final class GraphStore {
     }
 
     private static let localHostID = HostID(rawValue: "local")
+}
+
+private extension CanvasPatch {
+    var persistenceOperation: String {
+        switch self {
+        case .replace:
+            return "replace canvas"
+        case .upsertNode:
+            return "save node"
+        case .removeNode:
+            return "remove node"
+        case .moveNode:
+            return "move node"
+        case .updateViewport:
+            return "save viewport"
+        case .upsertManualEdge:
+            return "save edge"
+        case .removeManualEdge:
+            return "remove edge"
+        case .upsertMessageRoute:
+            return "save message route"
+        }
+    }
 }
 
 private extension String {

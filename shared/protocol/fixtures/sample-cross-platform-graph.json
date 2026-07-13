@@ -1,0 +1,92 @@
+{
+  "workspaceID": "workflow-example",
+  "title": "Cross-platform example",
+  "layoutCoordinateSpace": "center",
+  "nodes": {
+    "thread-example": {
+      "id": "thread-example",
+      "kind": "codexThread",
+      "title": "Example thread",
+      "subtitle": "Ready",
+      "position": {
+        "x": 240,
+        "y": 180
+      },
+      "size": {
+        "width": 200,
+        "height": 132
+      },
+      "metadata": {
+        "hostID": "example-host",
+        "platform": "windows",
+        "hostStatus": "connected",
+        "threadRef": {
+          "hostID": "example-host",
+          "threadID": "thread-17",
+          "cwd": "C:\\Users\\example\\project",
+          "name": "Example thread"
+        },
+        "model": "example-model",
+        "reasoningEffort": "medium",
+        "threadKind": "thread",
+        "approvalPolicy": "on-request",
+        "sandboxMode": "workspace-write",
+        "localTranscript": [
+          {
+            "id": "message-1",
+            "role": "user",
+            "text": "Hello",
+            "createdAt": "2026-06-02T00:00:00Z"
+          },
+          {
+            "id": "attachment-1",
+            "role": "file",
+            "text": "File artifact: example.txt",
+            "createdAt": "2026-06-02T00:00:30Z"
+          }
+        ],
+        "localTranscriptTurns": [],
+        "runStatus": "idle",
+        "isUnread": false,
+        "isArchived": false,
+        "hasManualPosition": true
+      },
+      "zIndex": 1
+    }
+  },
+  "manualEdges": {},
+  "messageRoutes": {
+    "route-1": {
+      "id": "route-1",
+      "sourceHostID": "example-host",
+      "sourceThreadID": "thread-17",
+      "targetHostID": "example-host",
+      "targetThreadID": "thread-18",
+      "timestamp": "2026-06-02T00:01:00Z",
+      "snippet": "Example handoff",
+      "deliveryState": "delivered",
+      "eventIDs": [
+        "event-1"
+      ]
+    }
+  },
+  "pendingAttentionRequests": [],
+  "runtimeDiagnostics": [
+    {
+      "id": "runtime",
+      "title": "Runtime",
+      "status": "passed",
+      "detail": "Ready",
+      "evidence": "Fixture"
+    }
+  ],
+  "suppressedAutoMaterializedThreadIDs": [],
+  "viewport": {
+    "scale": 1,
+    "offset": {
+      "x": 0,
+      "y": 0
+    }
+  },
+  "updatedAt": "2026-06-02T00:02:00Z"
+}

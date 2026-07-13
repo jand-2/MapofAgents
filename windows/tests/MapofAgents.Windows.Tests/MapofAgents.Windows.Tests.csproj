@@ -15,4 +15,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\MapofAgents.Core\MapofAgents.Core.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\MapofAgents.Windows\GraphWebRenderer.cs" Link="GraphWebRenderer.cs" />
+  </ItemGroup>
 </Project>
