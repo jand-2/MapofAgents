@@ -104,11 +104,14 @@ interactive and default to one-time allow or deny decisions. MapofAgents never
 enables Grok's always-approve mode. The current Grok ACP handshake does not
 advertise a fork operation, so the first turn on a fork uses the documented
 `--fork-session` headless path with `dontAsk` permissions, then returns to ACP.
-Antigravity print mode does not currently return a machine-readable ID for a
-newly created conversation, so MapofAgents persists that thread's transcript
-under Application Support and supplies its recent context to later `agy
---print` turns. This avoids guessing which workspace conversation `--continue`
-would select.
+Antigravity print mode does not return a conversation ID on standard output.
+MapofAgents gives each first turn an isolated temporary `--log-file`, captures
+the conversation ID emitted there, deletes the log, and resumes later turns
+with the explicit `--conversation` flag. Existing Gemini threads without a
+captured provider session seed one new conversation from their saved
+MapofAgents transcript, then switch to native session continuity. This avoids
+the process-global ambiguity of `--continue` while keeping authentication in
+Antigravity's keychain-owned state.
 
 ## iOS Companion
 

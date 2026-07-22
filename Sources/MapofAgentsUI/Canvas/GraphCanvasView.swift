@@ -300,6 +300,14 @@ public struct GraphCanvasView: View {
             .onChange(of: workflowEvents) { _, events in
                 Task { await handleWorkflowEvents(events) }
             }
+            .onChange(of: providerActivitySignature) { previous, current in
+                Task {
+                    await refreshOpenProviderTranscripts(
+                        changedFrom: previous,
+                        to: current
+                    )
+                }
+            }
             .onChange(of: threadCatalogRefreshSignature) { _, _ in
                 Task { await refreshThreadInbox() }
             }
@@ -419,6 +427,10 @@ public struct GraphCanvasView: View {
 
     private var selectedThreadKey: String? {
         selectedThreadNode?.metadata.threadRef?.qualifiedID ?? selectedThreadNode?.id.rawValue
+    }
+
+    private var providerActivitySignature: [String: Date] {
+        providerRuntimeStore?.lastActivityByThreadKey ?? [:]
     }
 
     private var transcript: ThreadTranscript? {
@@ -3101,6 +3113,28 @@ public struct GraphCanvasView: View {
                 transcriptSessions.setError(message, for: .reader(nodeID))
             }
             reconcileAwaitingResponse(for: threadRef)
+        }
+    }
+
+    private func refreshOpenProviderTranscripts(
+        changedFrom previous: [String: Date],
+        to current: [String: Date]
+    ) async {
+        let changedKeys = Set(current.compactMap { key, date in
+            previous[key] == date ? nil : key
+        })
+        guard !changedKeys.isEmpty else { return }
+
+        var openRefs = readingThreadIDs.compactMap {
+            graphStore.graph.nodes[$0]?.metadata.threadRef
+        }
+        if let activePopoverThreadRef {
+            openRefs.append(activePopoverThreadRef)
+        }
+
+        for threadRef in Set(openRefs)
+        where threadRef.provider != .codex && changedKeys.contains(threadRef.qualifiedID) {
+            await refreshOpenTranscripts(for: threadRef)
         }
     }
 

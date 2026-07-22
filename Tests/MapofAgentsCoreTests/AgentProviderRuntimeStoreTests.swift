@@ -46,6 +46,21 @@ func providerModelParserUsesCLIOutputWithoutEmbeddedModelNames() {
 }
 
 @Test
+func geminiConversationIDParsesIsolatedAntigravityLogs() {
+    #expect(
+        AgentProviderRuntimeStore.geminiConversationID(
+            from: "I0101 server.go:917] Created conversation session-from-create\n"
+        ) == "session-from-create"
+    )
+    #expect(
+        AgentProviderRuntimeStore.geminiConversationID(
+            from: "I0101 printmode.go:216] Print mode: conversation=session-from-print, sending message\n"
+        ) == "session-from-print"
+    )
+    #expect(AgentProviderRuntimeStore.geminiConversationID(from: "No conversation here") == nil)
+}
+
+@Test
 func grokModelParserIgnoresCatalogHeadingsAndStatusText() {
     let models = AgentProviderRuntimeStore.modelOptions(
         from: """
@@ -440,6 +455,78 @@ func externalProviderStoreCreatesAndResumesProviderLockedThreads() async throws 
     #expect(calls[1].arguments.contains("vendor-live-a"))
 }
 
+@Test
+@MainActor
+func geminiStoreCapturesAndResumesTheProviderConversation() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-gemini-session-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let repository = LocalControlRoomStore(
+        paths: ApplicationPaths(applicationSupportDirectory: directory)
+    )
+    let probe = AgentProviderCLIProbe()
+    let client = AgentProviderCLIClient(
+        resolveExecutable: { provider in
+            provider == .gemini ? URL(fileURLWithPath: "/tmp/agy") : nil
+        },
+        run: { executableURL, arguments, currentDirectoryURL, timeout in
+            await probe.run(
+                executableURL: executableURL,
+                arguments: arguments,
+                currentDirectoryURL: currentDirectoryURL,
+                timeout: timeout
+            )
+        },
+        launchAuthentication: { _, _ in }
+    )
+    let store = AgentProviderRuntimeStore(repository: repository, client: client)
+
+    await store.refresh(.gemini)
+    let outcome = try await store.createThread(
+        provider: .gemini,
+        hostID: HostID(rawValue: "local"),
+        cwd: "/tmp/project",
+        name: "Gemini example",
+        model: "vendor-live-a"
+    )
+
+    try await store.sendMessage(
+        "Remember MAPLE",
+        to: outcome.threadRef,
+        model: "vendor-live-a",
+        reasoningEffort: nil
+    )
+    try await store.sendMessage(
+        "What was the word?",
+        to: outcome.threadRef,
+        model: "vendor-live-a",
+        reasoningEffort: nil
+    )
+
+    let transcript = try await store.loadTranscript(for: outcome.threadRef)
+    #expect(transcript.providerMetadata?.sessionID == "gemini-session-1")
+    #expect(transcript.providerMetadata?.isSessionMaterialized == true)
+    #expect(transcript.turnTimeline?.turns.map(\.status) == [.complete, .complete])
+    #expect(store.runStatus(for: outcome.threadRef) == .complete)
+    #expect(store.lastActivity(for: outcome.threadRef) != nil)
+
+    let calls = await probe.calls
+    #expect(calls[1].arguments.contains("--log-file"))
+    #expect(!calls[1].arguments.contains("--conversation"))
+    #expect(calls[2].arguments.contains("--conversation"))
+    #expect(calls[2].arguments.contains("gemini-session-1"))
+    let secondPromptIndex = try #require(calls[2].arguments.firstIndex(of: "--print")) + 1
+    #expect(calls[2].arguments[secondPromptIndex] == "What was the word?")
+
+    let forkedRef = try await store.forkThread(outcome.threadRef, name: "Gemini fork")
+    let forkedTranscript = try await store.loadTranscript(for: forkedRef)
+    #expect(forkedTranscript.providerMetadata?.sessionID == nil)
+    #expect(forkedTranscript.providerMetadata?.forkedFromSessionID == "gemini-session-1")
+    #expect(forkedTranscript.providerMetadata?.isSessionMaterialized == false)
+    #expect(forkedTranscript.turnTimeline?.threadRef == forkedRef)
+}
+
 private actor AgentProviderCLIProbe {
     struct Call: Sendable {
         var arguments: [String]
@@ -462,6 +549,13 @@ private actor AgentProviderCLIProbe {
                 timeout: timeout
             )
         )
+        if let logFlagIndex = arguments.firstIndex(of: "--log-file"),
+           arguments.indices.contains(logFlagIndex + 1) {
+            let logURL = URL(fileURLWithPath: arguments[logFlagIndex + 1])
+            try? Data(
+                "I0101 server.go:917] Created conversation gemini-session-1\n".utf8
+            ).write(to: logURL, options: [.atomic])
+        }
         let output = arguments == ["models"]
             ? "Default model: vendor-live-a\n\nAvailable models:\n  * vendor-live-a (default)\n"
             : "Provider response\n"

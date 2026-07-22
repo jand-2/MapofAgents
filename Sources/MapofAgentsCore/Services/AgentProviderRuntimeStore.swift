@@ -441,7 +441,17 @@ public final class AgentProviderRuntimeStore {
             cwd: cwd,
             name: name
         )
-        try await repository.saveTranscript(ThreadTranscript(threadRef: threadRef))
+        let transcript = ThreadTranscript(
+            threadRef: threadRef,
+            providerMetadata: ProviderThreadMetadata(
+                sessionID: provider == .grok ? threadRef.threadID : nil,
+                isSessionMaterialized: provider == .grok,
+                modelID: model,
+                reasoningEffort: reasoningEffort,
+                prefersGeneratedTitle: adoptProviderGeneratedTitle
+            )
+        )
+        try await repository.saveTranscript(transcript)
         return ThreadCreationOutcome(threadRef: threadRef)
     }
 
@@ -525,48 +535,142 @@ public final class AgentProviderRuntimeStore {
         #endif
 
         var transcript = try await loadTranscript(for: threadRef)
+        let existingProviderSessionID = transcript.providerMetadata?.sessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let providerSessionID = existingProviderSessionID?.isEmpty == false
+            ? existingProviderSessionID
+            : nil
+        let existingMessages = transcript.messages
         let prompt = Self.prompt(
             text: trimmedText,
             attachmentLines: attachmentLines,
             provider: provider,
-            previousMessages: transcript.messages
+            previousMessages: provider == .gemini && providerSessionID == nil
+                ? existingMessages
+                : []
         )
+        let geminiLogURL = provider == .gemini
+            ? FileManager.default.temporaryDirectory
+                .appendingPathComponent("mapofagents-antigravity-\(UUID().uuidString).log")
+            : nil
+        defer {
+            if let geminiLogURL {
+                try? FileManager.default.removeItem(at: geminiLogURL)
+            }
+        }
         let arguments = Self.promptArguments(
             provider: provider,
             prompt: prompt,
             threadRef: threadRef,
             model: model,
             reasoningEffort: reasoningEffort,
-            isNewSession: transcript.messages.isEmpty
+            isNewSession: existingMessages.isEmpty,
+            providerSessionID: providerSessionID,
+            geminiLogFilePath: geminiLogURL?.path
         )
-        let result = try await client.run(
-            executableURL,
-            arguments,
-            URL(fileURLWithPath: threadRef.cwd, isDirectory: true),
-            30 * 60
-        )
-        guard result.terminationStatus == 0 else {
-            throw AgentProviderRuntimeError.commandFailed(provider, Self.commandFailureDetail(result))
-        }
-
-        let assistantText = Self.assistantText(
-            from: result.stdout.stringValue,
-            provider: provider
-        )
-        guard !assistantText.isEmpty else {
-            throw AgentProviderRuntimeError.emptyResponse(provider)
-        }
-
         let userText = attachmentLines.isEmpty
             ? trimmedText
             : ([trimmedText, "Attached files:", attachmentLines.joined(separator: "\n")]
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n\n"))
-        let now = Date()
-        transcript.messages.append(ThreadMessage(role: .user, text: userText, createdAt: now))
-        transcript.messages.append(ThreadMessage(role: .assistant, text: assistantText, createdAt: now.addingTimeInterval(0.001)))
-        transcript.lastUpdatedAt = Date()
+        let startedAt = Date()
+        let turnID = "\(threadRef.qualifiedID)-turn-\(UUID().uuidString.lowercased())"
+        let userMessage = ThreadMessage(role: .user, text: userText, createdAt: startedAt)
+        transcript.messages.append(userMessage)
+        var timeline = transcript.turnTimeline ?? ThreadTurnTimeline.fromTranscript(
+            ThreadTranscript(threadRef: threadRef, messages: existingMessages)
+        )
+        timeline.turns.append(
+            ThreadTurn(
+                id: turnID,
+                status: .running,
+                startedAt: startedAt,
+                items: [
+                    ThreadTurnItem(
+                        id: userMessage.id,
+                        kind: .userMessage,
+                        message: userMessage
+                    ),
+                ]
+            )
+        )
+        transcript.turnTimeline = timeline
+        var providerMetadata = transcript.providerMetadata ?? ProviderThreadMetadata(
+            isSessionMaterialized: providerSessionID != nil
+        )
+        providerMetadata.modelID = model ?? providerMetadata.modelID
+        providerMetadata.reasoningEffort = reasoningEffort ?? providerMetadata.reasoningEffort
+        transcript.providerMetadata = providerMetadata
+        transcript.lastUpdatedAt = startedAt
         try await repository.saveTranscript(transcript)
+        activeTranscripts[key] = transcript
+        runStatusByThreadKey[key] = .running
+        lastActivityByThreadKey[key] = startedAt
+
+        do {
+            let result = try await client.run(
+                executableURL,
+                arguments,
+                URL(fileURLWithPath: threadRef.cwd, isDirectory: true),
+                30 * 60
+            )
+            guard result.terminationStatus == 0 else {
+                throw AgentProviderRuntimeError.commandFailed(provider, Self.commandFailureDetail(result))
+            }
+
+            let assistantText = Self.assistantText(
+                from: result.stdout.stringValue,
+                provider: provider
+            )
+            guard !assistantText.isEmpty else {
+                throw AgentProviderRuntimeError.emptyResponse(provider)
+            }
+
+            let completedAt = Date()
+            let assistantMessage = ThreadMessage(
+                role: .assistant,
+                text: assistantText,
+                createdAt: completedAt
+            )
+            transcript.messages.append(assistantMessage)
+            if let turnIndex = transcript.turnTimeline?.turns.lastIndex(where: { $0.id == turnID }) {
+                transcript.turnTimeline?.turns[turnIndex].status = .complete
+                transcript.turnTimeline?.turns[turnIndex].completedAt = completedAt
+                transcript.turnTimeline?.turns[turnIndex].items.append(
+                    ThreadTurnItem(
+                        id: assistantMessage.id,
+                        kind: .assistantMessage,
+                        message: assistantMessage
+                    )
+                )
+            }
+            if provider == .gemini,
+               providerSessionID == nil,
+               let geminiLogURL,
+               let sessionID = Self.geminiConversationID(fromLogAt: geminiLogURL) {
+                providerMetadata.sessionID = sessionID
+                providerMetadata.isSessionMaterialized = true
+            }
+            transcript.providerMetadata = providerMetadata
+            transcript.lastUpdatedAt = completedAt
+            activeTranscripts[key] = transcript
+            runStatusByThreadKey[key] = .complete
+            lastActivityByThreadKey[key] = completedAt
+            try await repository.saveTranscript(transcript)
+        } catch {
+            let failedAt = Date()
+            if let turnIndex = transcript.turnTimeline?.turns.lastIndex(where: { $0.id == turnID }) {
+                transcript.turnTimeline?.turns[turnIndex].status = .failed
+                transcript.turnTimeline?.turns[turnIndex].completedAt = failedAt
+                transcript.turnTimeline?.turns[turnIndex].error = error.localizedDescription
+            }
+            transcript.lastUpdatedAt = failedAt
+            activeTranscripts[key] = transcript
+            runStatusByThreadKey[key] = .failed
+            lastActivityByThreadKey[key] = failedAt
+            try? await repository.saveTranscript(transcript)
+            throw error
+        }
     }
 
     public func forkThread(_ threadRef: ThreadRef, name: String? = nil) async throws -> ThreadRef {
@@ -579,12 +683,23 @@ public final class AgentProviderRuntimeStore {
             name: name ?? threadRef.name
         )
         transcript.threadRef = forkedRef
+        transcript.turnTimeline?.threadRef = forkedRef
         if threadRef.provider == .grok {
             let sourceSessionID = transcript.providerMetadata?.sessionID ?? threadRef.threadID
             transcript.providerMetadata = ProviderThreadMetadata(
                 sessionID: forkedRef.threadID,
                 generatedTitle: transcript.providerMetadata?.generatedTitle,
                 forkedFromSessionID: sourceSessionID,
+                isSessionMaterialized: false,
+                modelID: transcript.providerMetadata?.modelID,
+                reasoningEffort: transcript.providerMetadata?.reasoningEffort,
+                prefersGeneratedTitle: false
+            )
+        } else if threadRef.provider == .gemini {
+            transcript.providerMetadata = ProviderThreadMetadata(
+                sessionID: nil,
+                generatedTitle: transcript.providerMetadata?.generatedTitle,
+                forkedFromSessionID: transcript.providerMetadata?.sessionID,
                 isSessionMaterialized: false,
                 modelID: transcript.providerMetadata?.modelID,
                 reasoningEffort: transcript.providerMetadata?.reasoningEffort,
@@ -1608,7 +1723,9 @@ public final class AgentProviderRuntimeStore {
         threadRef: ThreadRef,
         model: String?,
         reasoningEffort: String?,
-        isNewSession: Bool
+        isNewSession: Bool,
+        providerSessionID: String? = nil,
+        geminiLogFilePath: String? = nil
     ) -> [String] {
         var arguments: [String]
         switch provider {
@@ -1616,6 +1733,12 @@ public final class AgentProviderRuntimeStore {
             return []
         case .gemini:
             arguments = ["--print", prompt, "--print-timeout", "30m"]
+            if let providerSessionID, !providerSessionID.isEmpty {
+                arguments += ["--conversation", providerSessionID]
+            }
+            if let geminiLogFilePath, !geminiLogFilePath.isEmpty {
+                arguments += ["--log-file", geminiLogFilePath]
+            }
         case .grok:
             arguments = [
                 "-p", prompt,
@@ -1632,10 +1755,36 @@ public final class AgentProviderRuntimeStore {
         if let model, !model.isEmpty {
             arguments += ["--model", model]
         }
-        if let reasoningEffort, !reasoningEffort.isEmpty {
+        if provider == .grok, let reasoningEffort, !reasoningEffort.isEmpty {
             arguments += ["--effort", reasoningEffort]
         }
         return arguments
+    }
+
+    nonisolated static func geminiConversationID(from log: String) -> String? {
+        let patterns = [
+            #"Created conversation\s+([A-Za-z0-9._:-]+)"#,
+            #"Print mode:\s+conversation=([A-Za-z0-9._:-]+)"#,
+        ]
+        let range = NSRange(log.startIndex..<log.endIndex, in: log)
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(pattern: pattern),
+                  let match = expression.firstMatch(in: log, range: range),
+                  match.numberOfRanges > 1,
+                  let matchRange = Range(match.range(at: 1), in: log) else {
+                continue
+            }
+            return String(log[matchRange])
+        }
+        return nil
+    }
+
+    private nonisolated static func geminiConversationID(fromLogAt url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let log = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return geminiConversationID(from: log)
     }
 
     private nonisolated static func commandFailureDetail(_ result: BoundedProcessResult) -> String {

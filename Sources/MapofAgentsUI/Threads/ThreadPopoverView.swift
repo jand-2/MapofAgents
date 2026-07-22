@@ -249,8 +249,6 @@ private extension ThreadTurnItem {
 }
 
 struct ThreadPopoverView: View {
-    private static let messageBottomAnchorID = "thread-message-list-bottom"
-
     var node: CanvasNode
     @Bindable var runtimeStore: CodexRuntimeStore
     var transcript: ThreadTranscript?
@@ -286,13 +284,9 @@ struct ThreadPopoverView: View {
 
     @State private var isRenaming = false
     @State private var titleDraft = ""
-    @State private var pendingOlderAnchorID: String?
     @State private var isArtifactsPresented = false
     @State private var activeRowCategories = Set(TranscriptRowCategory.allCases)
-    @State private var currentUserMessageNavigationID: String?
-    @State private var manualTranscriptNavigationStartedAt: Date?
-    @State private var isNearMessageBottom = true
-    @State private var hasUnseenLatestContent = false
+    @State private var transcriptScrollSession = ThreadTranscriptScrollSession()
     @State private var liveAssistantMessageStartedAt: Date?
 
     var body: some View {
@@ -623,11 +617,19 @@ struct ThreadPopoverView: View {
     }
 
     private var messageList: some View {
-        GeometryReader { viewportProxy in
-            ScrollViewReader { proxy in
-                let navigationEntries = userMessageNavigationEntries
+        ScrollViewReader { proxy in
+            let navigationEntries = userMessageNavigationEntries
+            let visibleTarget = Binding<ThreadTranscriptScrollTarget?>(
+                get: { transcriptScrollSession.visibleTarget },
+                set: {
+                    transcriptScrollSession.updateVisibleTarget(
+                        $0,
+                        updatesBottomProximity: !supportsScrollGeometryTracking
+                    )
+                }
+            )
 
-                ZStack(alignment: .leading) {
+            ZStack(alignment: .leading) {
                 ScrollView {
                     let messages = displayMessages
                     let timeline = displayTimeline
@@ -656,7 +658,11 @@ struct ThreadPopoverView: View {
                                     ? "Wait for the current transcript refresh to finish."
                                     : (isLoadingOlder ? "Older messages are already loading." : nil),
                                 action: {
-                                    pendingOlderAnchorID = filteredMessages.first?.id ?? messages.first?.id
+                                    transcriptScrollSession.beginLoadingOlder(
+                                        anchor: navigationEntries.first?.scrollAnchorID
+                                            ?? filteredMessages.first.map { .userMessage($0.id) }
+                                            ?? messages.first.map { .userMessage($0.id) }
+                                    )
                                     onLoadOlder()
                                 }
                             ) {
@@ -730,39 +736,24 @@ struct ThreadPopoverView: View {
 
                         Color.clear
                             .frame(height: 1)
-                            .id(Self.messageBottomAnchorID)
-                            .background {
-                                GeometryReader { bottomProxy in
-                                    Color.clear.preference(
-                                        key: ThreadMessageBottomPreferenceKey.self,
-                                        value: bottomProxy.frame(
-                                            in: .named(ThreadUserMessageNavigationLayout.coordinateSpaceName)
-                                        ).maxY
-                                    )
-                                }
-                            }
+                            .id(ThreadTranscriptScrollTarget.bottom)
                     }
+                    .scrollTargetLayout()
                     .padding(.top, 14)
                     .padding(.trailing, 14)
                     .padding(.bottom, 14)
                     .padding(.leading, navigationEntries.isEmpty ? 14 : 42)
                 }
-                .coordinateSpace(name: ThreadUserMessageNavigationLayout.coordinateSpaceName)
-                .onPreferenceChange(ThreadUserMessageNavigationAnchorPreferenceKey.self) { positions in
-                    updateCurrentUserMessageNavigationID(from: positions, entries: navigationEntries)
-                }
+                .scrollPosition(id: visibleTarget, anchor: .top)
+                .trackThreadTranscriptBottomProximity(with: transcriptScrollSession)
                 .onChange(of: navigationEntries.map(\.id)) { _, entryIDs in
-                    if entryIDs.isEmpty {
-                        currentUserMessageNavigationID = nil
-                    } else if currentUserMessageNavigationID.map(entryIDs.contains) != true {
-                        currentUserMessageNavigationID = entryIDs.first
-                    }
+                    transcriptScrollSession.reconcileNavigationEntryIDs(entryIDs)
                 }
 
                 if !navigationEntries.isEmpty {
-                    ThreadUserMessageNavigationRail(
+                    ThreadUserMessageNavigationRailHost(
                         entries: navigationEntries,
-                        currentEntryID: currentUserMessageNavigationID
+                        scrollSession: transcriptScrollSession
                     ) { entry in
                         scrollToUserMessage(entry, with: proxy)
                     }
@@ -770,56 +761,33 @@ struct ThreadPopoverView: View {
                     .padding(.leading, 2)
                     .padding(.vertical, 10)
                 }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                ThreadJumpToLatestButton(scrollSession: transcriptScrollSession) {
+                    scrollToBottom(with: proxy)
                 }
-                .overlay(alignment: .bottomTrailing) {
-                    if hasUnseenLatestContent {
-                        Button {
-                            manualTranscriptNavigationStartedAt = nil
-                            hasUnseenLatestContent = false
-                            scrollToBottom(with: proxy)
-                        } label: {
-                            Label("Jump to latest", systemImage: "arrow.down.to.line")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .padding(12)
-                        .accessibilityLabel("Jump to latest message")
-                        .minimumAccessibleHitTarget()
-                    }
+            }
+            .onChange(of: messageListRevision) { _, _ in
+                if transcriptScrollSession.shouldAutoScrollForContentChange() {
+                    scrollToBottom(with: proxy, animated: liveAssistantText.isEmpty)
                 }
-                .onPreferenceChange(ThreadMessageBottomPreferenceKey.self) { bottomY in
-                    let isNearBottom = bottomY <= viewportProxy.size.height + 96
-                    isNearMessageBottom = isNearBottom
-                    if isNearBottom {
-                        hasUnseenLatestContent = false
-                    }
+            }
+            .onChange(of: liveAssistantText.isEmpty) { wasEmpty, isEmpty in
+                if isEmpty {
+                    liveAssistantMessageStartedAt = nil
+                } else if wasEmpty {
+                    liveAssistantMessageStartedAt = Date()
                 }
-                .onChange(of: messageListRevision) { _, _ in
-                    if isNearMessageBottom {
-                        scrollToBottom(with: proxy, animated: liveAssistantText.isEmpty)
-                    } else {
-                        hasUnseenLatestContent = true
-                    }
-                }
-                .onChange(of: liveAssistantText.isEmpty) { wasEmpty, isEmpty in
-                    if isEmpty {
-                        liveAssistantMessageStartedAt = nil
-                    } else if wasEmpty {
-                        liveAssistantMessageStartedAt = Date()
-                    }
-                }
+            }
             .onChange(of: transcript?.messages.first?.id) { _, _ in
-                guard let anchorID = pendingOlderAnchorID else { return }
-                pendingOlderAnchorID = nil
+                guard let anchorID = transcriptScrollSession.takePendingOlderAnchor() else { return }
                 withAnimation(.snappy) {
                     proxy.scrollTo(anchorID, anchor: .top)
                 }
             }
-                .task(id: threadIdentity) {
-                    isNearMessageBottom = true
-                    hasUnseenLatestContent = false
-                    scrollToBottom(with: proxy, animated: false)
-                }
+            .task(id: threadIdentity) {
+                transcriptScrollSession.prepareToJumpToLatest()
+                scrollToBottom(with: proxy, animated: false)
             }
         }
     }
@@ -943,6 +911,14 @@ struct ThreadPopoverView: View {
         )
     }
 
+    private var supportsScrollGeometryTracking: Bool {
+        if #available(macOS 15.0, iOS 18.0, *) {
+            true
+        } else {
+            false
+        }
+    }
+
     private var transcriptCategoryCounts: [TranscriptRowCategory: Int] {
         var counts = Dictionary(uniqueKeysWithValues: TranscriptRowCategory.allCases.map { ($0, 0) })
 
@@ -1024,10 +1000,10 @@ struct ThreadPopoverView: View {
     }
 
     private func scrollToBottom(with proxy: ScrollViewProxy, animated: Bool = true) {
-        guard pendingOlderAnchorID == nil else { return }
-        guard !isManualTranscriptNavigationActive else { return }
+        guard transcriptScrollSession.pendingOlderAnchor == nil else { return }
+        guard !transcriptScrollSession.isManualNavigationActive() else { return }
         let action = {
-            proxy.scrollTo(Self.messageBottomAnchorID, anchor: .bottom)
+            proxy.scrollTo(ThreadTranscriptScrollTarget.bottom, anchor: .bottom)
         }
         if animated {
             withAnimation(.snappy) {
@@ -1039,57 +1015,8 @@ struct ThreadPopoverView: View {
     }
 
     private func scrollToUserMessage(_ entry: ThreadUserMessageNavigationEntry, with proxy: ScrollViewProxy) {
-        pendingOlderAnchorID = nil
-        currentUserMessageNavigationID = entry.id
-        manualTranscriptNavigationStartedAt = Date()
+        transcriptScrollSession.selectUserMessage(entry.id)
         proxy.scrollTo(entry.scrollAnchorID, anchor: .top)
-    }
-
-    private var isManualTranscriptNavigationActive: Bool {
-        guard let manualTranscriptNavigationStartedAt else {
-            return false
-        }
-        return Date().timeIntervalSince(manualTranscriptNavigationStartedAt) < 2.0
-    }
-
-    private func updateCurrentUserMessageNavigationID(
-        from positions: [ThreadUserMessageNavigationAnchorPosition],
-        entries: [ThreadUserMessageNavigationEntry]
-    ) {
-        let entryIDs = entries.map(\.id)
-        guard !entryIDs.isEmpty else {
-            currentUserMessageNavigationID = nil
-            return
-        }
-
-        let positionsByID = positions.reduce(into: [String: CGFloat]()) { partial, position in
-            partial[position.id] = position.minY
-        }
-        let orderedPositions = entries.compactMap { entry -> (id: String, minY: CGFloat)? in
-            guard let minY = positionsByID[entry.id] else {
-                return nil
-            }
-            return (entry.id, minY)
-        }
-
-        guard !orderedPositions.isEmpty else {
-            if currentUserMessageNavigationID.map(entryIDs.contains) != true {
-                currentUserMessageNavigationID = entryIDs.first
-            }
-            return
-        }
-
-        let topThreshold: CGFloat = 32
-        if let activePosition = orderedPositions
-            .filter({ $0.minY <= topThreshold })
-            .max(by: { lhs, rhs in lhs.minY < rhs.minY }) {
-            if currentUserMessageNavigationID != activePosition.id {
-                currentUserMessageNavigationID = activePosition.id
-            }
-        } else if currentUserMessageNavigationID.map(entryIDs.contains) != true {
-            currentUserMessageNavigationID = orderedPositions.min { lhs, rhs in lhs.minY < rhs.minY }?.id
-                ?? entryIDs.first
-        }
     }
 
     private var threadArtifacts: [ThreadMessageAttachment] {
@@ -1127,12 +1054,9 @@ struct ThreadPopoverView: View {
     private func resetPopoverStateForCurrentThread() {
         isRenaming = false
         titleDraft = node.title
-        pendingOlderAnchorID = nil
         isArtifactsPresented = false
         activeRowCategories = Set(TranscriptRowCategory.allCases)
-        isNearMessageBottom = true
-        hasUnseenLatestContent = false
-        manualTranscriptNavigationStartedAt = nil
+        transcriptScrollSession.reset()
         liveAssistantMessageStartedAt = liveAssistantText.isEmpty ? nil : Date()
     }
 
@@ -1507,16 +1431,12 @@ private struct ThreadUserMessageNavigationEntry: Identifiable, Hashable {
         "Message \(index)"
     }
 
-    var scrollAnchorID: String {
-        Self.scrollAnchorID(for: id)
+    var scrollAnchorID: ThreadTranscriptScrollTarget {
+        .userMessage(id)
     }
 
     var accessibilityLabel: String {
         "\(title), \(userPreview)"
-    }
-
-    static func scrollAnchorID(for messageID: String) -> String {
-        "thread-user-message-navigation-\(messageID)"
     }
 
     private static func responsePreview(in items: [ThreadTurnItem]) -> String? {
@@ -1608,48 +1528,59 @@ private struct ThreadUserMessageNavigationTarget<Content: View>: View {
 
     var body: some View {
         content
-            .id(ThreadUserMessageNavigationEntry.scrollAnchorID(for: messageID))
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(
-                        key: ThreadUserMessageNavigationAnchorPreferenceKey.self,
-                        value: [
-                            ThreadUserMessageNavigationAnchorPosition(
-                                id: messageID,
-                                minY: proxy.frame(in: .named(ThreadUserMessageNavigationLayout.coordinateSpaceName)).minY
-                            )
-                        ]
-                    )
-                }
+            .id(ThreadTranscriptScrollTarget.userMessage(messageID))
+    }
+}
+
+private struct ThreadUserMessageNavigationRailHost: View {
+    var entries: [ThreadUserMessageNavigationEntry]
+    var scrollSession: ThreadTranscriptScrollSession
+    var onSelect: (ThreadUserMessageNavigationEntry) -> Void
+
+    var body: some View {
+        ThreadUserMessageNavigationRail(
+            entries: entries,
+            currentEntryID: scrollSession.currentUserMessageID,
+            onSelect: onSelect
+        )
+    }
+}
+
+private struct ThreadJumpToLatestButton: View {
+    var scrollSession: ThreadTranscriptScrollSession
+    var onJump: () -> Void
+
+    var body: some View {
+        if scrollSession.hasUnseenLatestContent {
+            Button {
+                scrollSession.prepareToJumpToLatest()
+                onJump()
+            } label: {
+                Label("Jump to latest", systemImage: "arrow.down.to.line")
+                    .font(.caption.weight(.semibold))
             }
+            .buttonStyle(.borderedProminent)
+            .padding(12)
+            .accessibilityLabel("Jump to latest message")
+            .minimumAccessibleHitTarget()
+        }
     }
 }
 
-private enum ThreadUserMessageNavigationLayout {
-    static let coordinateSpaceName = "thread-user-message-navigation-scroll"
-}
-
-private struct ThreadUserMessageNavigationAnchorPosition: Equatable {
-    var id: String
-    var minY: CGFloat
-}
-
-private struct ThreadUserMessageNavigationAnchorPreferenceKey: PreferenceKey {
-    static let defaultValue: [ThreadUserMessageNavigationAnchorPosition] = []
-
-    static func reduce(
-        value: inout [ThreadUserMessageNavigationAnchorPosition],
-        nextValue: () -> [ThreadUserMessageNavigationAnchorPosition]
-    ) {
-        value.append(contentsOf: nextValue())
-    }
-}
-
-private struct ThreadMessageBottomPreferenceKey: PreferenceKey {
-    static let defaultValue = CGFloat.greatestFiniteMagnitude
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+private extension View {
+    @ViewBuilder
+    func trackThreadTranscriptBottomProximity(
+        with scrollSession: ThreadTranscriptScrollSession
+    ) -> some View {
+        if #available(macOS 15.0, iOS 18.0, *) {
+            onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.visibleRect.maxY >= geometry.contentSize.height - 96
+            } action: { _, isNearBottom in
+                scrollSession.updateIsNearBottom(isNearBottom)
+            }
+        } else {
+            self
+        }
     }
 }
 
