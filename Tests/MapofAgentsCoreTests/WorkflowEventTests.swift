@@ -281,7 +281,7 @@ func workflowSupervisorReconnectRespectsRelayBackoff() async throws {
         name: "Paired Mac",
         url: try #require(URL(string: "ws://127.0.0.1:9"))
     )
-    let startedAt = Date()
+    let startedAt = Date().addingTimeInterval(60)
 
     await store.stageRelayEndpointAttempt(endpoint, at: startedAt)
     await store.recordRelayEndpointAttemptFailure(

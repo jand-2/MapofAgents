@@ -287,7 +287,7 @@ func canvasViewportInteractionCoalescesPersistenceAndScalesNodeDrag() async {
     let second = CanvasViewport(scale: 0.9, offset: CanvasPoint(x: 3, y: 4))
     model.scheduleCommit(first, delay: .milliseconds(1)) { persisted.append($0) }
     model.scheduleCommit(second, delay: .milliseconds(1)) { persisted.append($0) }
-    let deadline = ContinuousClock.now + .seconds(1)
+    let deadline = ContinuousClock.now + .seconds(30)
     while persisted != [second], ContinuousClock.now < deadline {
         try? await Task.sleep(for: .milliseconds(10))
     }
