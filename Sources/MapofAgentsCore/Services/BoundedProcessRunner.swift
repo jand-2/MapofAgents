@@ -34,6 +34,7 @@ public enum BoundedProcessRunner {
     public static func runBlocking(
         executableURL: URL,
         arguments: [String],
+        currentDirectoryURL: URL? = nil,
         timeout: TimeInterval,
         maxOutputBytes: Int = 1_048_576
     ) throws -> BoundedProcessResult {
@@ -41,6 +42,7 @@ public enum BoundedProcessRunner {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = arguments
+        process.currentDirectoryURL = currentDirectoryURL
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -106,6 +108,7 @@ public enum BoundedProcessRunner {
     public static func run(
         executableURL: URL,
         arguments: [String],
+        currentDirectoryURL: URL? = nil,
         timeout: TimeInterval,
         maxOutputBytes: Int = 1_048_576
     ) async throws -> BoundedProcessResult {
@@ -114,6 +117,7 @@ public enum BoundedProcessRunner {
             try runBlocking(
                 executableURL: executableURL,
                 arguments: arguments,
+                currentDirectoryURL: currentDirectoryURL,
                 timeout: timeout,
                 maxOutputBytes: maxOutputBytes
             )

@@ -367,6 +367,33 @@ func daemonProxyErrorsAreExplicitlyFallbackEligible() {
     #expect(CodexAppServerError.daemonProxyRequestTimedOut(method: "initialize").isStdioFallbackEligible)
     #expect(!CodexAppServerError.transport("Timed out waiting for initialize response from Codex App Server.").isStdioFallbackEligible)
     #expect(CodexRuntimeStore.shouldRetryConnectionWithFallback(after: CodexAppServerError.daemonProxyHandshakeFailed("bad upgrade")))
+    #expect(CodexRuntimeStore.shouldRetryConnectionWithFallback(after: CodexAppServerError.ambiguousWrite(method: "initialize")))
+    #expect(!CodexRuntimeStore.shouldRetryConnectionWithFallback(after: CodexAppServerError.ambiguousWrite(method: "turn/start")))
+}
+
+@Test
+@MainActor
+func loadedThreadCatalogStopsResolvingAfterConnectionFailure() async {
+    let hostID = HostID(rawValue: "local")
+    let ids = ["one", "two", "three"]
+    var isConnected = true
+    var attemptedIDs: [String] = []
+
+    let entries = await CodexRuntimeStore.resolveLoadedThreadCatalogEntries(
+        ids: ids,
+        hostID: hostID,
+        hostName: "This Mac",
+        connectionIsAvailable: { isConnected },
+        load: { threadID in
+            attemptedIDs.append(threadID)
+            isConnected = false
+            throw CodexAppServerError.disconnected
+        }
+    )
+
+    #expect(attemptedIDs == ["one"])
+    #expect(entries.map(\.threadRef.threadID) == ids)
+    #expect(entries.allSatisfy { $0.loadedStatus == .running })
 }
 
 @Test

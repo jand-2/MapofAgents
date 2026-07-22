@@ -80,15 +80,21 @@ public final class GraphStore {
             let encodedThreadID = Self.percentEncoded(threadRef.threadID)
             let safeTitle = Self.escapedMentionLabel(node.title)
             let shortID = threadRef.threadID.prefix(8)
+            let mentionURL: String
+            if threadRef.provider == .codex {
+                mentionURL = "codex-thread://\(encodedHost)/\(encodedThreadID)"
+            } else {
+                mentionURL = "agent-thread://\(threadRef.provider.rawValue)/\(encodedHost)/\(encodedThreadID)"
+            }
 
             return MentionCandidate(
-                id: "thread-\(threadRef.hostID.rawValue)-\(threadRef.threadID)",
+                id: "thread-\(threadRef.qualifiedID)",
                 kind: .thread,
                 trigger: "@",
                 label: node.title,
                 title: node.title,
-                subtitle: "\(threadRef.cwd) - \(shortID)",
-                insertionText: "[@\"\(safeTitle)\" chat](codex-thread://\(encodedHost)/\(encodedThreadID))"
+                subtitle: "\(threadRef.provider.displayName) · \(threadRef.cwd) - \(shortID)",
+                insertionText: "[@\"\(safeTitle)\" chat](\(mentionURL))"
             )
         }
     }
@@ -186,12 +192,12 @@ public final class GraphStore {
         title: String? = nil,
         anchorFolderID: NodeID? = nil,
         platform: HostPlatform = .macOS,
-        permissions: CodexThreadPermissions? = nil,
+        permissions: AgentThreadPermissions? = nil,
         threadKind: CodexThreadNodeKind = .thread
     ) async {
         let node = CanvasNode(
             kind: .codexThread,
-            title: Self.preferredDisplayName(title, threadRef.name) ?? "Codex thread",
+            title: Self.preferredDisplayName(title, threadRef.name) ?? "\(threadRef.provider.displayName) thread",
             subtitle: threadRef.cwd,
             position: nextThreadPosition(anchorFolderID: anchorFolderID),
             size: .thread,
@@ -219,11 +225,13 @@ public final class GraphStore {
     public func applySupervisorMachine(_ machine: SupervisorMachine) async {
         if let existingID = graph.nodes.values.first(where: { $0.kind == .machine && $0.metadata.hostID == machine.id })?.id,
            var node = graph.nodes[existingID] {
+            let existingNode = node
             node.title = machine.name
             node.subtitle = machine.subtitle
             node.metadata.platform = machine.platform
             node.metadata.hostStatus = HostStatus(machine.status)
             node.metadata.codexHome = machine.codexHome
+            guard node != existingNode else { return }
             await apply(.upsertNode(node))
             return
         }
@@ -254,12 +262,15 @@ public final class GraphStore {
         for machine in machines where machine.id != Self.localHostID {
             if let existingID = nextGraph.nodes.values.first(where: { $0.kind == .machine && $0.metadata.hostID == machine.id })?.id,
                var node = nextGraph.nodes[existingID] {
+                let existingNode = node
                 node.title = machine.name
                 node.subtitle = machine.subtitle
                 node.metadata.platform = machine.platform
                 node.metadata.hostStatus = HostStatus(machine.status)
                 node.metadata.codexHome = machine.codexHome
-                nextGraph.upsertNode(node)
+                if node != existingNode {
+                    nextGraph.upsertNode(node)
+                }
             } else {
                 nextGraph.upsertNode(
                     CanvasNode(
@@ -291,9 +302,12 @@ public final class GraphStore {
             }
             var disconnectedNode = node
             disconnectedNode.metadata.hostStatus = .disconnected
-            nextGraph.upsertNode(disconnectedNode)
+            if disconnectedNode != node {
+                nextGraph.upsertNode(disconnectedNode)
+            }
         }
 
+        guard nextGraph != graph else { return }
         await apply(.replace(nextGraph))
     }
 
@@ -423,12 +437,22 @@ public final class GraphStore {
     }
 
     public func updateNodeTitle(id: NodeID, title: String) async {
+        await updateNodeTitle(id: id, title: title, selectNode: true)
+    }
+
+    public func synchronizeNodeTitle(id: NodeID, title: String) async {
+        await updateNodeTitle(id: id, title: title, selectNode: false)
+    }
+
+    private func updateNodeTitle(id: NodeID, title: String, selectNode: Bool) async {
         guard var node = graph.nodes[id] else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         node.title = trimmed
         await apply(.upsertNode(node))
-        selection = .node(id)
+        if selectNode {
+            selection = .node(id)
+        }
     }
 
     public func updateFolderPath(id: NodeID, path: String) async {
@@ -466,7 +490,7 @@ public final class GraphStore {
     }
 
     public func updateThreadRunStatus(for threadRef: ThreadRef, status: ThreadRunStatus) async {
-        guard let nodeID = matchingThreadNodeID(hostID: threadRef.hostID, threadID: threadRef.threadID),
+        guard let nodeID = matchingThreadNodeID(threadRef: threadRef),
               var node = graph.nodes[nodeID],
               node.kind == .codexThread,
               node.metadata.runStatus != status
@@ -530,7 +554,10 @@ public final class GraphStore {
     }
 
     public func selectThread(_ threadRef: ThreadRef) {
-        selectThread(hostID: threadRef.hostID, threadID: threadRef.threadID)
+        guard let nodeID = matchingThreadNodeID(threadRef: threadRef) else {
+            return
+        }
+        selectNode(nodeID)
     }
 
     public func clearSelection() {
@@ -596,6 +623,27 @@ public final class GraphStore {
         }
 
         guard let sourceThreadRef, let targetThreadRef else {
+            return
+        }
+
+        if deliveryState != .pending,
+           let pendingRoute = graph.messageRoutes.values
+            .filter({ route in
+                route.sourceHostID == sourceThreadRef.hostID
+                    && route.sourceThreadID == sourceThreadRef.threadID
+                    && route.targetHostID == targetThreadRef.hostID
+                    && route.targetThreadID == targetThreadRef.threadID
+                    && route.deliveryState == .pending
+                    && route.canvasEdgeID == edgeID
+            })
+            .max(by: { $0.timestamp < $1.timestamp }) {
+            var resolvedRoute = pendingRoute
+            resolvedRoute.timestamp = Date()
+            resolvedRoute.snippet = snippet
+            resolvedRoute.deliveryState = deliveryState
+            resolvedRoute.eventIDs = eventIDs
+            resolvedRoute.canvasEdgeID = edgeID
+            await apply(.upsertMessageRoute(resolvedRoute))
             return
         }
 
@@ -1128,7 +1176,7 @@ public final class GraphStore {
         else {
             return nil
         }
-        return "\(threadRef.hostID.rawValue)::\(threadRef.threadID.lowercased())"
+        return threadRef.qualifiedID.lowercased()
     }
 
     private static func manualEdgeCounts(in graph: AgentGraph) -> [NodeID: Int] {
@@ -1404,6 +1452,12 @@ public final class GraphStore {
         let hostIDs = matches.compactMap(\.metadata.threadRef?.hostID.rawValue).sorted().joined(separator: ", ")
         errorMessage = "Ambiguous hostless workflow event for thread '\(threadID)' matched hosts: \(hostIDs)"
         return nil
+    }
+
+    private func matchingThreadNodeID(threadRef: ThreadRef) -> NodeID? {
+        graph.nodes.values.first(where: {
+            $0.metadata.threadRef?.matches(threadRef) == true
+        })?.id
     }
 
     private func matchingFolderNodeID(hostID: HostID, path: String) -> NodeID? {

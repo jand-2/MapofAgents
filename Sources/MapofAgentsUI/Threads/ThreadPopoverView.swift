@@ -103,19 +103,17 @@ private enum TranscriptRowCategory: String, CaseIterable, Identifiable, Hashable
     }
 
     static func primaryCategory(for item: ThreadTurnItem) -> Self {
-        if item.kind.isArtifact {
-            return .artifacts
-        }
-
-        switch item.message.role {
-        case .user:
+        switch item.kind {
+        case .userMessage, .assistantMessage:
             return .messages
-        case .assistant:
-            return isProgressLikeAssistantText(item.message.text) ? .progress : .messages
+        case .progress:
+            return .progress
         case .reasoning:
             return .thoughts
         case .tool:
             return .tools
+        case .artifact, .imageArtifact, .fileArtifact, .diffArtifact:
+            return .artifacts
         case .system:
             return .system
         }
@@ -138,7 +136,9 @@ private enum TranscriptRowCategory: String, CaseIterable, Identifiable, Hashable
 
         switch itemKind {
         case .userMessage, .assistantMessage:
-            break
+            categories.insert(.messages)
+        case .progress:
+            categories.insert(.progress)
         case .reasoning:
             categories.insert(.thoughts)
         case .tool:
@@ -155,7 +155,13 @@ private enum TranscriptRowCategory: String, CaseIterable, Identifiable, Hashable
         case .user:
             categories.insert(.messages)
         case .assistant:
-            categories.insert(isProgressLikeAssistantText(message.text) ? .progress : .messages)
+            if itemKind == .progress {
+                categories.insert(.progress)
+            } else if itemKind == .assistantMessage {
+                categories.insert(.messages)
+            } else {
+                categories.insert(isProgressLikeAssistantText(message.text) ? .progress : .messages)
+            }
         case .reasoning:
             categories.insert(.thoughts)
         case .tool:
@@ -216,7 +222,7 @@ private extension ThreadTurnItemKind {
         switch self {
         case .artifact, .imageArtifact, .fileArtifact, .diffArtifact:
             return true
-        case .userMessage, .assistantMessage, .reasoning, .tool, .system:
+        case .userMessage, .assistantMessage, .progress, .reasoning, .tool, .system:
             return false
         }
     }
@@ -287,6 +293,7 @@ struct ThreadPopoverView: View {
     @State private var manualTranscriptNavigationStartedAt: Date?
     @State private var isNearMessageBottom = true
     @State private var hasUnseenLatestContent = false
+    @State private var liveAssistantMessageStartedAt: Date?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -386,6 +393,28 @@ struct ThreadPopoverView: View {
             .background((threadKind == .subagent ? Color.purple : Color.secondary).opacity(0.10), in: Capsule())
     }
 
+    private var provider: AgentProvider {
+        node.metadata.threadRef?.provider ?? .codex
+    }
+
+    private var providerColor: Color {
+        switch provider {
+        case .codex: return .blue
+        case .gemini: return .purple
+        case .grok: return .orange
+        }
+    }
+
+    private var providerBadge: some View {
+        Text(provider.displayName)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(providerColor)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(providerColor.opacity(0.12), in: Capsule())
+            .accessibilityLabel("Provider \(provider.displayName)")
+    }
+
     private var header: some View {
         HStack(alignment: .top, spacing: 12) {
             headerDragArea
@@ -475,9 +504,9 @@ struct ThreadPopoverView: View {
     private var headerDragArea: some View {
         let content = HStack(spacing: 10) {
             Image(systemName: threadKind == .subagent ? "person.2" : "bubble.left.and.bubble.right")
-                .foregroundStyle(threadKind == .subagent ? .purple : .blue)
+                .foregroundStyle(threadKind == .subagent ? .purple : providerColor)
                 .frame(width: 26, height: 26)
-                .background((threadKind == .subagent ? Color.purple : Color.blue).opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                .background((threadKind == .subagent ? Color.purple : providerColor).opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
@@ -514,8 +543,19 @@ struct ThreadPopoverView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
+                if let generatedTitle = transcript?.providerMetadata?.generatedTitle?.nilIfBlank,
+                   generatedTitle.caseInsensitiveCompare(node.title) != .orderedSame {
+                    Text("\(provider.displayName) title: \(generatedTitle)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .help("The provider generated this session title. Your MapofAgents title remains editable.")
+                }
+
                 if let threadID = node.metadata.threadRef?.threadID {
                     HStack(spacing: 6) {
+                        providerBadge
+
                         threadKindBadge
 
                         Text(threadID)
@@ -644,9 +684,15 @@ struct ThreadPopoverView: View {
                         if activeRowCategories.contains(.messages), !liveAssistantText.isEmpty {
                             ThreadMessageRow(
                                 message: ThreadMessage(
+                                    id: "live-assistant-\(threadIdentity)",
                                     role: .assistant,
-                                    text: liveAssistantText
-                                )
+                                    text: liveAssistantText,
+                                    createdAt: liveAssistantMessageStartedAt
+                                        ?? displayTimeline?.turns.last?.startedAt
+                                        ?? displayMessages.last?.createdAt
+                                        ?? Date(timeIntervalSinceReferenceDate: 0)
+                                ),
+                                provider: transcript?.threadRef.provider ?? node.metadata.threadRef?.provider ?? .codex
                             )
                             .id("live-assistant")
                         }
@@ -750,9 +796,16 @@ struct ThreadPopoverView: View {
                 }
                 .onChange(of: messageListRevision) { _, _ in
                     if isNearMessageBottom {
-                        scrollToBottom(with: proxy)
+                        scrollToBottom(with: proxy, animated: liveAssistantText.isEmpty)
                     } else {
                         hasUnseenLatestContent = true
+                    }
+                }
+                .onChange(of: liveAssistantText.isEmpty) { wasEmpty, isEmpty in
+                    if isEmpty {
+                        liveAssistantMessageStartedAt = nil
+                    } else if wasEmpty {
+                        liveAssistantMessageStartedAt = Date()
                     }
                 }
             .onChange(of: transcript?.messages.first?.id) { _, _ in
@@ -776,10 +829,18 @@ struct ThreadPopoverView: View {
         ForEach(timeline.turns) { turn in
             if let navigationMessageID = turn.items.first(where: { $0.message.role == .user })?.message.id {
                 ThreadUserMessageNavigationTarget(messageID: navigationMessageID) {
-                    ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
+                    ThreadTurnSectionView(
+                        turn: turn,
+                        activeCategories: activeRowCategories,
+                        provider: timeline.threadRef.provider
+                    )
                 }
             } else {
-                ThreadTurnSectionView(turn: turn, activeCategories: activeRowCategories)
+                ThreadTurnSectionView(
+                    turn: turn,
+                    activeCategories: activeRowCategories,
+                    provider: timeline.threadRef.provider
+                )
             }
         }
     }
@@ -789,11 +850,17 @@ struct ThreadPopoverView: View {
         ForEach(messages) { message in
             if message.role == .user {
                 ThreadUserMessageNavigationTarget(messageID: message.id) {
-                    ThreadMessageRow(message: message)
+                    ThreadMessageRow(
+                        message: message,
+                        provider: transcript?.threadRef.provider ?? node.metadata.threadRef?.provider ?? .codex
+                    )
                         .id(message.id)
                 }
             } else {
-                ThreadMessageRow(message: message)
+                ThreadMessageRow(
+                    message: message,
+                    provider: transcript?.threadRef.provider ?? node.metadata.threadRef?.provider ?? .codex
+                )
                     .id(message.id)
             }
         }
@@ -1066,6 +1133,7 @@ struct ThreadPopoverView: View {
         isNearMessageBottom = true
         hasUnseenLatestContent = false
         manualTranscriptNavigationStartedAt = nil
+        liveAssistantMessageStartedAt = liveAssistantText.isEmpty ? nil : Date()
     }
 
 }
@@ -1848,6 +1916,7 @@ private struct ThreadUserMessageNavigationArtifactSummaryView: View {
 private struct ThreadTurnSectionView: View {
     var turn: ThreadTurn
     var activeCategories: Set<TranscriptRowCategory>
+    var provider: AgentProvider = .codex
 
     var body: some View {
         let visibleItems = turn.visibleTranscriptItems(for: activeCategories)
@@ -1863,7 +1932,7 @@ private struct ThreadTurnSectionView: View {
                     EmptyTurnDetailsView(turn: turn)
                 } else {
                     ForEach(visibleItems) { item in
-                        ThreadMessageRow(item: item)
+                        ThreadMessageRow(item: item, provider: provider)
                             .id(item.message.id)
                     }
                 }
@@ -2067,20 +2136,23 @@ private extension String {
 
 private struct ThreadMessageRow: View {
     var item: ThreadTurnItem
+    var provider: AgentProvider
 
     @State private var isExpanded = false
 
-    init(item: ThreadTurnItem) {
+    init(item: ThreadTurnItem, provider: AgentProvider = .codex) {
         self.item = item
+        self.provider = provider
     }
 
-    init(message: ThreadMessage) {
+    init(message: ThreadMessage, provider: AgentProvider = .codex) {
         self.item = ThreadTurnItem(
             id: message.id,
             kind: Self.kind(for: message),
             message: message,
             attachments: message.attachments
         )
+        self.provider = provider
     }
 
     var body: some View {
@@ -2178,7 +2250,7 @@ private struct ThreadMessageRow: View {
                         HStack(spacing: 8) {
                             TranscriptCategoryPill(category: .progress, title: "Progress")
 
-                            Text("Assistant update")
+                            Text("\(provider.displayName) update")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
 
@@ -2193,7 +2265,7 @@ private struct ThreadMessageRow: View {
                                 }
                                 .buttonStyle(.plain)
                                 .minimumAccessibleHitTarget()
-                                .accessibilityLabel("Copy assistant update")
+                                .accessibilityLabel("Copy \(provider.displayName) update")
                                 .help("Copy message")
                                 .disabled(message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
@@ -2395,7 +2467,7 @@ private struct ThreadMessageRow: View {
         case .user:
             return "You"
         case .assistant:
-            return "Codex"
+            return provider.displayName
         case .reasoning:
             return "Thinking"
         case .tool:

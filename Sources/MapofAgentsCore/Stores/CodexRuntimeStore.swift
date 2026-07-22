@@ -1,14 +1,22 @@
 import Foundation
 import Observation
+import OSLog
 
 @MainActor
 @Observable
 public final class CodexRuntimeStore {
+    private static let logger = Logger(
+        subsystem: "dev.mapofagents",
+        category: "CodexRuntime"
+    )
+
     public private(set) var connectionState: HostStatus = .disconnected
     public private(set) var statusMessage: String = "Not connected"
     public private(set) var localHost: AgentHost
     public private(set) var accountLabel: String = "Unknown account"
-    public private(set) var models: [CodexModelOption] = []
+    public private(set) var runtimeVersion: String?
+    public private(set) var models: [AgentModelOption] = []
+    public private(set) var isRuntimeMaintenanceInProgress = false
     public private(set) var threadSummaries: [ThreadRef] = []
     public private(set) var mentionCandidates: [MentionCandidate] = []
     public private(set) var workflowEvents: [WorkflowEvent] = []
@@ -21,6 +29,7 @@ public final class CodexRuntimeStore {
     private let client: CodexAppServerClient
     private let mentionCatalogSession: MentionCatalogSession
     private var isConnectingRuntime = false
+    private var inFlightRuntimeWriteCount = 0
     private var mentionCatalogPublicationGeneration = MentionCatalogPublicationGeneration()
 
     public init(
@@ -60,24 +69,62 @@ public final class CodexRuntimeStore {
         }
     }
 
-    public var defaultModel: CodexModelOption {
+    public var defaultModel: AgentModelOption? {
         models.first(where: \.isDefault)
             ?? models.first
-            ?? CodexModelOption(id: "gpt-5.5", displayName: "gpt-5.5", defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"], isDefault: true)
+    }
+
+    public var activeRuntimeWorkCount: Int {
+        threadRuntimeStates.values.count { state in
+            state.status == .running
+                || state.activeFlags.contains(.running)
+                || state.activeFlags.contains(.waitingOnApproval)
+                || state.activeFlags.contains(.waitingOnUserInput)
+                || !state.pendingRequestIDs.isEmpty
+        }
+    }
+
+    public var hasInFlightRuntimeWrites: Bool {
+        inFlightRuntimeWriteCount > 0
+    }
+
+    /// Prevents new local runtime writes while the managed Codex executable is
+    /// being updated. Reads remain available until the caller deliberately
+    /// disconnects for the daemon restart.
+    @discardableResult
+    public func beginRuntimeMaintenance() -> Bool {
+        guard !isRuntimeMaintenanceInProgress,
+              !isConnectingRuntime,
+              inFlightRuntimeWriteCount == 0,
+              activeRuntimeWorkCount == 0
+        else {
+            return false
+        }
+        isRuntimeMaintenanceInProgress = true
+        return true
+    }
+
+    public func endRuntimeMaintenance() {
+        isRuntimeMaintenanceInProgress = false
     }
 
     public func connect() async {
+        await connectRuntime(allowDuringMaintenance: false)
+    }
+
+    public func connectAfterRuntimeUpdate() async {
+        await connectRuntime(allowDuringMaintenance: true)
+    }
+
+    private func connectRuntime(allowDuringMaintenance: Bool) async {
         #if !os(macOS)
         connectionState = .disconnected
         localHost.status = .disconnected
         statusMessage = "Connect to a remote machine"
         return
         #else
-        if await client.isInitializedAndRunning() {
-            connectionState = .connected
-            localHost.status = .connected
-            localHost.lastSeenAt = Date()
-            statusMessage = "Connected via \(await client.currentLaunchDescription())"
+        guard allowDuringMaintenance || !isRuntimeMaintenanceInProgress else {
+            statusMessage = "Updating Codex runtime"
             return
         }
 
@@ -91,25 +138,47 @@ public final class CodexRuntimeStore {
             isConnectingRuntime = false
         }
 
+        // Reserve the connection attempt before the first suspension point so
+        // runtime maintenance cannot begin while a normal connection is being
+        // admitted.
+        if await client.isInitializedAndRunning() {
+            publishConnectedRuntime(
+                launchDescription: await client.currentLaunchDescription(),
+                recordHealthCheck: false
+            )
+            return
+        }
+
         connectionState = .connecting
         statusMessage = "Starting codex app-server"
+        Self.logger.info("Local Codex runtime connection attempt started")
 
         do {
             try await connectOnce()
         } catch {
             guard Self.shouldRetryConnectionWithFallback(after: error) else {
                 applyConnectionFailure(error)
+                Self.logger.error("Local Codex runtime connection attempt failed")
                 return
             }
 
             statusMessage = "Retrying with stdio app-server"
+            Self.logger.notice("Local Codex daemon proxy failed; retrying with stdio")
             do {
                 try await connectOnce()
             } catch {
                 applyConnectionFailure(error)
+                Self.logger.error("Local Codex stdio fallback connection attempt failed")
             }
         }
         #endif
+    }
+
+    public func disconnectForRuntimeUpdate() async {
+        await client.stop()
+        connectionState = .disconnected
+        localHost.status = .disconnected
+        statusMessage = "Updating Codex runtime"
     }
 
     private func waitForActiveConnectionAttempt() async {
@@ -151,10 +220,8 @@ public final class CodexRuntimeStore {
         _ = try await (accountTask, modelsTask)
 
         let launchDescription = await client.currentLaunchDescription()
-        connectionState = .connected
-        statusMessage = "Connected via \(launchDescription)"
-        localHost.status = .connected
-        localHost.lastSeenAt = Date()
+        publishConnectedRuntime(launchDescription: launchDescription, recordHealthCheck: true)
+        Self.logger.info("Local Codex runtime connected")
 
         Task {
             try? await refreshThreads()
@@ -174,6 +241,18 @@ public final class CodexRuntimeStore {
         connectionState = hadSuccessfulConnection ? .disconnected : .unavailable
         localHost.status = hadSuccessfulConnection ? .disconnected : .unavailable
         statusMessage = error.localizedDescription
+    }
+
+    private func publishConnectedRuntime(
+        launchDescription: String,
+        recordHealthCheck: Bool
+    ) {
+        connectionState = .connected
+        statusMessage = "Connected via \(launchDescription)"
+        localHost.status = .connected
+        if recordHealthCheck || localHost.lastSeenAt == nil {
+            localHost.lastSeenAt = Date()
+        }
     }
 
     public func refreshModels() async throws {
@@ -251,25 +330,82 @@ public final class CodexRuntimeStore {
         }
 
         let ids = Array(ThreadCatalogEntry.loadedThreadIDs(from: result).prefix(limit))
+        return await Self.resolveLoadedThreadCatalogEntries(
+            ids: ids,
+            hostID: localHost.id,
+            hostName: localHost.name,
+            connectionIsAvailable: { self.connectionState == .connected },
+            load: { threadID in
+                try await self.readThreadCatalogEntry(threadID: threadID, cwdHint: nil)
+            }
+        )
+    }
+
+    /// Resolve loaded threads while the runtime is healthy. If the transport
+    /// drops, retain lightweight catalog rows for the remaining IDs instead of
+    /// turning one catalog pass into a reconnect attempt per thread.
+    static func resolveLoadedThreadCatalogEntries(
+        ids: [String],
+        hostID: HostID,
+        hostName: String,
+        connectionIsAvailable: () -> Bool,
+        load: (String) async throws -> ThreadCatalogEntry?
+    ) async -> [ThreadCatalogEntry] {
         var entries: [ThreadCatalogEntry] = []
-        for threadID in ids {
-            if let entry = try? await readThreadCatalogEntry(threadID: threadID, cwdHint: nil) {
-                entries.append(entry)
-            } else {
-                let threadRef = ThreadRef(hostID: localHost.id, threadID: threadID, cwd: "", name: nil)
-                entries.append(
-                    ThreadCatalogEntry(
-                        threadRef: threadRef,
-                        hostName: localHost.name,
-                        title: "Codex thread",
-                        source: "loaded",
-                        loadedStatus: .running,
-                        lastActivityAt: Date()
-                    )
-                )
+        entries.reserveCapacity(ids.count)
+
+        for (index, threadID) in ids.enumerated() {
+            guard connectionIsAvailable() else {
+                entries.append(contentsOf: ids[index...].map {
+                    loadedThreadFallbackEntry(threadID: $0, hostID: hostID, hostName: hostName)
+                })
+                break
+            }
+
+            do {
+                if let entry = try await load(threadID) {
+                    entries.append(entry)
+                } else {
+                    entries.append(loadedThreadFallbackEntry(
+                        threadID: threadID,
+                        hostID: hostID,
+                        hostName: hostName
+                    ))
+                }
+            } catch {
+                entries.append(loadedThreadFallbackEntry(
+                    threadID: threadID,
+                    hostID: hostID,
+                    hostName: hostName
+                ))
+                guard connectionIsAvailable() else {
+                    if index + 1 < ids.count {
+                        entries.append(contentsOf: ids[(index + 1)...].map {
+                            loadedThreadFallbackEntry(threadID: $0, hostID: hostID, hostName: hostName)
+                        })
+                    }
+                    break
+                }
             }
         }
+
         return entries
+    }
+
+    private static func loadedThreadFallbackEntry(
+        threadID: String,
+        hostID: HostID,
+        hostName: String
+    ) -> ThreadCatalogEntry {
+        let threadRef = ThreadRef(hostID: hostID, threadID: threadID, cwd: "", name: nil)
+        return ThreadCatalogEntry(
+            threadRef: threadRef,
+            hostName: hostName,
+            title: "Codex thread",
+            source: "loaded",
+            loadedStatus: .running,
+            lastActivityAt: Date()
+        )
     }
 
     public func resolveThread(threadID: String, cwdHint: String? = nil) async -> ThreadRef? {
@@ -433,7 +569,8 @@ public final class CodexRuntimeStore {
 
             updateDiagnostic("models", status: .running)
             try await refreshModels()
-            updateDiagnostic("models", status: .passed, detail: "\(models.count) models")
+            let runtimeDetail = runtimeVersion.map { " from Codex \($0)" } ?? ""
+            updateDiagnostic("models", status: .passed, detail: "\(models.count) models\(runtimeDetail)")
 
             updateDiagnostic("threads", status: .running)
             try await refreshThreads()
@@ -455,7 +592,7 @@ public final class CodexRuntimeStore {
         name: String,
         model: String,
         reasoningEffort: String,
-        permissions: CodexThreadPermissions = .default,
+        permissions: AgentThreadPermissions = .default,
         initialPrompt: String = ""
     ) async throws -> ThreadCreationOutcome {
         try await createThreadUsingRequest(
@@ -476,7 +613,7 @@ public final class CodexRuntimeStore {
         name: String,
         model: String,
         reasoningEffort: String,
-        permissions: CodexThreadPermissions = .default,
+        permissions: AgentThreadPermissions = .default,
         initialPrompt: String = "",
         request: @escaping (AppServerMethod, JSONValue) async throws -> JSONValue
     ) async throws -> ThreadCreationOutcome {
@@ -630,7 +767,7 @@ public final class CodexRuntimeStore {
         to threadRef: ThreadRef,
         model: String?,
         reasoningEffort: String?,
-        permissions: CodexThreadPermissions? = nil,
+        permissions: AgentThreadPermissions? = nil,
         attachments: [ChatInputAttachment] = []
     ) async throws {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else {
@@ -724,7 +861,7 @@ public final class CodexRuntimeStore {
     }
 
     @discardableResult
-    private func resumeThread(_ threadRef: ThreadRef, permissions: CodexThreadPermissions? = nil) async throws -> JSONValue {
+    private func resumeThread(_ threadRef: ThreadRef, permissions: AgentThreadPermissions? = nil) async throws -> JSONValue {
         guard threadRef.hostID == localHost.id else {
             throw CodexAppServerError.server("This thread belongs to \(threadRef.hostID.rawValue), not the connected local Codex runtime.")
         }
@@ -996,6 +1133,8 @@ public final class CodexRuntimeStore {
     }
 
     public func respondToAttentionRequest(_ request: RuntimeAttentionRequest, allow: Bool) async throws {
+        try acquireRuntimeWritePermit()
+        defer { releaseRuntimeWritePermit() }
         guard request.supportsApprovalDecision else {
             throw CodexAppServerError.server("This request needs a typed response and cannot be answered with Allow/Deny.")
         }
@@ -1013,6 +1152,8 @@ public final class CodexRuntimeStore {
     }
 
     public func respondToAttentionRequest(_ request: RuntimeAttentionRequest, text: String) async throws {
+        try acquireRuntimeWritePermit()
+        defer { releaseRuntimeWritePermit() }
         guard request.supportsTypedResponse else {
             throw CodexAppServerError.server("This request cannot be answered with typed input.")
         }
@@ -1030,6 +1171,8 @@ public final class CodexRuntimeStore {
     }
 
     public func declineTypedAttentionRequest(_ request: RuntimeAttentionRequest) async throws {
+        try acquireRuntimeWritePermit()
+        defer { releaseRuntimeWritePermit() }
         guard request.supportsTypedResponse else {
             throw CodexAppServerError.server("This request does not support typed responses.")
         }
@@ -1228,9 +1371,16 @@ public final class CodexRuntimeStore {
 
     private func updateHost(fromInitializeResult result: JSONValue, launchDescription: String) {
         localHost.codexHome = result["codexHome"]?.stringValue
+        runtimeVersion = Self.runtimeVersion(fromInitializeResult: result)
         let platform = result["platformFamily"]?.stringValue ?? result["platformOs"]?.stringValue ?? "macOS"
         localHost.platform = Self.hostPlatform(from: platform)
         localHost.endpointDescription = launchDescription
+    }
+
+    public nonisolated static func runtimeVersion(fromInitializeResult result: JSONValue) -> String? {
+        result["serverInfo"]?["version"]?.stringValue
+            ?? result["serverVersion"]?.stringValue
+            ?? result["userAgent"]?.stringValue.flatMap(CodexRuntimeUpdateService.parseVersion(from:))
     }
 
     private static func hostPlatform(from value: String) -> HostPlatform {
@@ -1243,7 +1393,7 @@ public final class CodexRuntimeStore {
         return .unknown
     }
 
-    private nonisolated static func modelOption(from value: JSONValue) -> CodexModelOption? {
+    private nonisolated static func modelOption(from value: JSONValue) -> AgentModelOption? {
         guard let id = value["id"]?.stringValue ?? value["model"]?.stringValue else {
             return nil
         }
@@ -1256,8 +1406,9 @@ public final class CodexRuntimeStore {
                     ?? effort.stringValue
             }
 
-        return CodexModelOption(
+        return AgentModelOption(
             id: id,
+            provider: .codex,
             displayName: value["displayName"]?.stringValue ?? id,
             description: value["description"]?.stringValue ?? "",
             defaultReasoningEffort: value["defaultReasoningEffort"]?.stringValue ?? "medium",
@@ -1266,7 +1417,7 @@ public final class CodexRuntimeStore {
         )
     }
 
-    public nonisolated static func modelOptions(from result: JSONValue) -> [CodexModelOption] {
+    public nonisolated static func modelOptions(from result: JSONValue) -> [AgentModelOption] {
         (result["data"]?.arrayValue ?? []).compactMap(Self.modelOption)
     }
 
@@ -1280,7 +1431,7 @@ public final class CodexRuntimeStore {
     nonisolated static func threadStartParams(
         cwd: String,
         model: String,
-        permissions: CodexThreadPermissions
+        permissions: AgentThreadPermissions
     ) -> [String: JSONValue] {
         var params: [String: JSONValue] = [
             "cwd": .string(cwd),
@@ -1490,6 +1641,15 @@ public final class CodexRuntimeStore {
         method: AppServerMethod,
         params: JSONValue = .object([:])
     ) async throws -> JSONValue {
+        let holdsWritePermit = method.replaySafety == .nonReplayableWrite
+        if holdsWritePermit {
+            try acquireRuntimeWritePermit()
+        }
+        defer {
+            if holdsWritePermit {
+                releaseRuntimeWritePermit()
+            }
+        }
         let call = AppServerCall(method, params: params)
         try await ensureConnectedRuntime()
 
@@ -1513,6 +1673,20 @@ public final class CodexRuntimeStore {
             }
             return try await client.request(call)
         }
+    }
+
+    private func acquireRuntimeWritePermit() throws {
+        guard !isRuntimeMaintenanceInProgress else {
+            throw CodexAppServerError.server(
+                "The local Codex runtime is being updated. Wait for MapofAgents to reconnect before making changes."
+            )
+        }
+        inFlightRuntimeWriteCount += 1
+    }
+
+    private func releaseRuntimeWritePermit() {
+        precondition(inFlightRuntimeWriteCount > 0, "Unbalanced local runtime write permit")
+        inFlightRuntimeWriteCount -= 1
     }
 
     private static func isAmbiguousWriteFailure(_ error: Error) -> Bool {
@@ -1568,9 +1742,12 @@ public final class CodexRuntimeStore {
 
     private func ensureConnectedRuntime() async throws {
         if await client.isInitializedAndRunning() {
-            connectionState = .connected
-            localHost.status = .connected
-            localHost.lastSeenAt = Date()
+            if connectionState != .connected || localHost.status != .connected {
+                publishConnectedRuntime(
+                    launchDescription: await client.currentLaunchDescription(),
+                    recordHealthCheck: false
+                )
+            }
             return
         }
 
@@ -1710,6 +1887,13 @@ public final class CodexRuntimeStore {
 
     static func shouldRetryConnectionWithFallback(after error: Error) -> Bool {
         if let appServerError = error as? CodexAppServerError {
+            if case .ambiguousWrite(let method) = appServerError {
+                // `initialize` only establishes a session. The client has
+                // already invalidated the failed daemon-proxy connection, so
+                // initializing a fresh stdio process cannot duplicate a user
+                // operation. Other ambiguous writes remain non-replayable.
+                return method == AppServerMethod.initialize.rawValue
+            }
             return appServerError.isStdioFallbackEligible
         }
 

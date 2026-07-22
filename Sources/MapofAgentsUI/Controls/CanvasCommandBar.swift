@@ -6,6 +6,14 @@ public struct CanvasCommandBar: View {
     @Bindable var runtimeStore: CodexRuntimeStore
     @Bindable var supervisorStore: WorkflowSupervisorStore
     @Binding private var isMachinesMenuPresented: Bool
+    @Binding private var isUpdatesPresented: Bool
+    var updatePhase: CodexRuntimeUpdatePhase
+    var installedCodexVersion: String?
+    var runningCodexVersion: String?
+    var updateMessage: String?
+    var updateUnavailableReason: String?
+    var onRefreshUpdateStatus: () -> Void
+    var onUpdateCodexRuntime: () -> Void
     var workflows: [WorkflowRecord]
     var activeWorkflowID: String?
     var onSelectWorkflow: (String) -> Void
@@ -42,6 +50,14 @@ public struct CanvasCommandBar: View {
         runtimeStore: CodexRuntimeStore,
         supervisorStore: WorkflowSupervisorStore,
         isMachinesMenuPresented: Binding<Bool> = .constant(false),
+        isUpdatesPresented: Binding<Bool> = .constant(false),
+        updatePhase: CodexRuntimeUpdatePhase = .idle,
+        installedCodexVersion: String? = nil,
+        runningCodexVersion: String? = nil,
+        updateMessage: String? = nil,
+        updateUnavailableReason: String? = nil,
+        onRefreshUpdateStatus: @escaping () -> Void = {},
+        onUpdateCodexRuntime: @escaping () -> Void = {},
         workflows: [WorkflowRecord] = [],
         activeWorkflowID: String? = nil,
         onSelectWorkflow: @escaping (String) -> Void = { _ in },
@@ -74,6 +90,14 @@ public struct CanvasCommandBar: View {
         self.runtimeStore = runtimeStore
         self.supervisorStore = supervisorStore
         self._isMachinesMenuPresented = isMachinesMenuPresented
+        self._isUpdatesPresented = isUpdatesPresented
+        self.updatePhase = updatePhase
+        self.installedCodexVersion = installedCodexVersion
+        self.runningCodexVersion = runningCodexVersion
+        self.updateMessage = updateMessage
+        self.updateUnavailableReason = updateUnavailableReason
+        self.onRefreshUpdateStatus = onRefreshUpdateStatus
+        self.onUpdateCodexRuntime = onUpdateCodexRuntime
         self.workflows = workflows
         self.activeWorkflowID = activeWorkflowID
         self.onSelectWorkflow = onSelectWorkflow
@@ -105,6 +129,11 @@ public struct CanvasCommandBar: View {
 
     public var body: some View {
         HStack(spacing: 10) {
+            updatesControl
+
+            Divider()
+                .frame(height: 20)
+
             workflowMenu
 
             Divider()
@@ -182,6 +211,65 @@ public struct CanvasCommandBar: View {
                     .zIndex(20)
             }
         }
+    }
+
+    private var updatesControl: some View {
+        Button {
+            let isOpening = !isUpdatesPresented
+            isUpdatesPresented.toggle()
+            if isOpening {
+                onRefreshUpdateStatus()
+            }
+        } label: {
+            Label("Update", systemImage: updateButtonIcon)
+        }
+        .buttonStyle(.bordered)
+        .tint(updateButtonTint)
+        .help("Check for standalone Codex runtime and MapofAgents updates")
+        .accessibilityLabel("Updates")
+        .accessibilityValue(updateAccessibilityValue)
+        .popover(isPresented: $isUpdatesPresented, arrowEdge: .top) {
+            UpdateCenterPopoverView(
+                updatePhase: updatePhase,
+                installedCodexVersion: installedCodexVersion,
+                runningCodexVersion: runningCodexVersion,
+                updateMessage: updateMessage,
+                updateUnavailableReason: updateUnavailableReason,
+                onRefreshUpdateStatus: onRefreshUpdateStatus,
+                onUpdateCodexRuntime: onUpdateCodexRuntime,
+                onClose: { isUpdatesPresented = false }
+            )
+        }
+    }
+
+    private var updateButtonIcon: String {
+        switch updatePhase {
+        case .checking, .updating, .restarting, .reconnecting:
+            return "arrow.triangle.2.circlepath"
+        case .succeeded:
+            return "checkmark.circle.fill"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        case .idle:
+            return "arrow.down.circle"
+        }
+    }
+
+    private var updateButtonTint: Color {
+        switch updatePhase {
+        case .succeeded:
+            return .green
+        case .failed:
+            return .orange
+        case .checking, .updating, .restarting, .reconnecting:
+            return .accentColor
+        case .idle:
+            return .secondary
+        }
+    }
+
+    private var updateAccessibilityValue: String {
+        updateMessage ?? updatePhase.updateAccessibilityDescription
     }
 
     private var workflowMenu: some View {

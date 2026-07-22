@@ -16,6 +16,7 @@ struct RootView: View {
     @State private var isShowingNewThread = false
     @State private var isReadingModePresented = false
     @State private var readingThreadCount = 0
+    @State private var isUpdatesPresented = false
     @State private var isMachinesMenuPresented = false
     @State private var isMachineRecoveryPresented = false
     @State private var isShowingPairing = false
@@ -46,6 +47,7 @@ struct RootView: View {
     private var repository: LocalControlRoomStore { session.repository }
     private var graphStore: GraphStore { session.graphStore }
     private var runtimeStore: CodexRuntimeStore { session.runtimeStore }
+    private var providerRuntimeStore: AgentProviderRuntimeStore { session.providerRuntimeStore }
     private var supervisorStore: WorkflowSupervisorStore { session.supervisorStore }
     private var threadCatalogStore: ThreadCatalogStore { session.threadCatalogStore }
     private var workflowLibrary: WorkflowLibraryCoordinator { session.workflowLibrary }
@@ -68,6 +70,7 @@ struct RootView: View {
         GraphCanvasView(
             graphStore: graphStore,
             runtimeStore: runtimeStore,
+            providerRuntimeStore: providerRuntimeStore,
             supervisorStore: supervisorStore,
             threadCatalogStore: threadCatalogStore,
             workflowEvents: mergedWorkflowEvents,
@@ -92,6 +95,16 @@ struct RootView: View {
                         runtimeStore: runtimeStore,
                         supervisorStore: supervisorStore,
                         isMachinesMenuPresented: $isMachinesMenuPresented,
+                        isUpdatesPresented: $isUpdatesPresented,
+                        updatePhase: session.runtimeUpdatePhase,
+                        installedCodexVersion: session.runtimeVersionStatus.installedVersion,
+                        runningCodexVersion: session.runtimeVersionStatus.runningVersion,
+                        updateMessage: session.runtimeUpdateMessage,
+                        updateUnavailableReason: session.runtimeUpdateUnavailableReason,
+                        onRefreshUpdateStatus: {
+                            Task { await session.refreshRuntimeUpdateStatus() }
+                        },
+                        onUpdateCodexRuntime: session.updateCodexRuntime,
                         workflows: workflowLibrary.workflows,
                         activeWorkflowID: workflowLibrary.activeWorkflowID,
                         onSelectWorkflow: selectWorkflow,
@@ -135,15 +148,20 @@ struct RootView: View {
                         graphStore: graphStore,
                         runtimeStore: runtimeStore,
                         isFolderAvailable: isFolderAvailable,
-                        modelOptionsForFolder: modelOptions(for:),
+                        availableProviders: availableProviders(for:),
+                        modelOptions: modelOptions(for:target:),
+                        providerStatus: providerRuntimeStatus(for:),
                         mentionCandidatesForFolder: mentionCandidates(for:),
                         onSelectedFolderChanged: refreshThreadFormCatalog(for:),
+                        onRefreshProvider: refreshProvider,
+                        onInstallProvider: installProvider,
+                        onSignInProvider: signInProvider,
                         onCreate: createThread,
                         onCancel: { isShowingNewThread = false },
                         catalogRevision: threadCreation.catalogRevision
                     )
                     .accessibilityElement(children: .contain)
-                    .accessibilityLabel("New Codex thread")
+                    .accessibilityLabel("New agent thread")
                     .accessibilityAddTraits(.isModal)
                     .accessibilityFocused($accessibilityFocus, equals: .newThread)
                     .padding(.leading, 14)
@@ -824,8 +842,56 @@ struct RootView: View {
             .sorted { $0.createdAt > $1.createdAt }
     }
 
-    private func modelOptions(for target: CanvasNode?) -> [CodexModelOption]? {
-        threadCreation.modelOptions(for: target, localHostID: runtimeStore.localHost.id)
+    private func availableProviders(for target: CanvasNode?) -> [AgentProvider] {
+        guard let hostID = target?.metadata.hostID else {
+            return AgentProvider.allCases
+        }
+        return hostID == runtimeStore.localHost.id ? AgentProvider.allCases : [.codex]
+    }
+
+    private func modelOptions(
+        for provider: AgentProvider,
+        target: CanvasNode?
+    ) -> [AgentModelOption] {
+        switch provider {
+        case .codex:
+            return threadCreation.modelOptions(
+                for: target,
+                localHostID: runtimeStore.localHost.id
+            ) ?? runtimeStore.models
+        case .gemini, .grok:
+            return providerRuntimeStore.models(for: provider)
+        }
+    }
+
+    private func providerRuntimeStatus(for provider: AgentProvider) -> AgentProviderRuntimeStatus? {
+        providerRuntimeStore.statusByProvider[provider]
+    }
+
+    private func refreshProvider(_ provider: AgentProvider) async {
+        if provider == .codex {
+            try? await runtimeStore.refreshModels()
+        } else {
+            await providerRuntimeStore.refresh(provider)
+        }
+    }
+
+    private func signInProvider(_ provider: AgentProvider) {
+        do {
+            try providerRuntimeStore.signIn(to: provider)
+            threadCreation.errorMessage = "Finish signing in to \(provider.displayName) in Terminal, then choose Refresh."
+        } catch {
+            threadCreation.errorMessage = error.localizedDescription
+        }
+    }
+
+    private func installProvider(_ provider: AgentProvider) {
+        do {
+            try ProviderCLIInstallationLauncher.launch(provider: provider)
+            threadCreation.errorMessage = "Finish installing \(provider.displayName) in Terminal, then choose Refresh and Sign In."
+        } catch {
+            threadCreation.errorMessage = error.localizedDescription
+        }
     }
 
     private func mentionCandidates(for target: CanvasNode?) -> [MentionCandidate] {
@@ -857,6 +923,7 @@ struct RootView: View {
             request,
             graphStore: graphStore,
             runtimeStore: runtimeStore,
+            providerRuntimeStore: providerRuntimeStore,
             supervisorStore: supervisorStore,
             allowsLocalRuntime: true,
             localDefaultDirectory: FileManager.default.homeDirectoryForCurrentUser.path,

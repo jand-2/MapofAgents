@@ -55,12 +55,20 @@ public enum EdgeKind: String, Codable, CaseIterable, Sendable {
 }
 
 public struct ThreadRef: Codable, Hashable, Sendable {
+    public let provider: AgentProvider
     public var hostID: HostID
     public var threadID: String
     public var cwd: String
     public var name: String?
 
-    public init(hostID: HostID, threadID: String, cwd: String, name: String? = nil) {
+    public init(
+        provider: AgentProvider = .codex,
+        hostID: HostID,
+        threadID: String,
+        cwd: String,
+        name: String? = nil
+    ) {
+        self.provider = provider
         self.hostID = hostID
         self.threadID = threadID
         self.cwd = cwd
@@ -68,7 +76,7 @@ public struct ThreadRef: Codable, Hashable, Sendable {
     }
 
     public var qualifiedID: String {
-        Self.qualifiedID(hostID: hostID, threadID: threadID)
+        Self.qualifiedID(provider: provider, hostID: hostID, threadID: threadID)
     }
 
     public func matches(hostID: HostID?, threadID: String?) -> Bool {
@@ -81,8 +89,42 @@ public struct ThreadRef: Codable, Hashable, Sendable {
         return self.hostID == hostID
     }
 
+    public func matches(_ other: ThreadRef) -> Bool {
+        provider == other.provider
+            && hostID == other.hostID
+            && threadID == other.threadID
+    }
+
     public static func qualifiedID(hostID: HostID, threadID: String) -> String {
-        "\(hostID.rawValue)::\(threadID)"
+        qualifiedID(provider: .codex, hostID: hostID, threadID: threadID)
+    }
+
+    public static func qualifiedID(
+        provider: AgentProvider,
+        hostID: HostID,
+        threadID: String
+    ) -> String {
+        if provider == .codex {
+            return "\(hostID.rawValue)::\(threadID)"
+        }
+        return "\(provider.rawValue)::\(hostID.rawValue)::\(threadID)"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case provider
+        case hostID
+        case threadID
+        case cwd
+        case name
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decodeIfPresent(AgentProvider.self, forKey: .provider) ?? .codex
+        hostID = try container.decode(HostID.self, forKey: .hostID)
+        threadID = try container.decode(String.self, forKey: .threadID)
+        cwd = try container.decode(String.self, forKey: .cwd)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
     }
 }
 
@@ -101,6 +143,9 @@ public struct WorkflowThreadContentSignature: Hashable, Sendable {
 
     public init(threadRefs: [ThreadRef]) {
         self.threadRefs = threadRefs.sorted { lhs, rhs in
+            if lhs.provider.rawValue != rhs.provider.rawValue {
+                return lhs.provider.rawValue < rhs.provider.rawValue
+            }
             if lhs.hostID.rawValue != rhs.hostID.rawValue {
                 return lhs.hostID.rawValue < rhs.hostID.rawValue
             }
@@ -124,7 +169,7 @@ public struct NodeMetadata: Codable, Hashable, Sendable {
     public var threadRef: ThreadRef?
     public var model: String?
     public var reasoningEffort: String?
-    public var threadPermissions: CodexThreadPermissions?
+    public var threadPermissions: AgentThreadPermissions?
     public var threadKind: CodexThreadNodeKind?
     public var runStatus: ThreadRunStatus?
     public var popoverOffset: CanvasPoint?
@@ -140,7 +185,7 @@ public struct NodeMetadata: Codable, Hashable, Sendable {
         threadRef: ThreadRef? = nil,
         model: String? = nil,
         reasoningEffort: String? = nil,
-        threadPermissions: CodexThreadPermissions? = nil,
+        threadPermissions: AgentThreadPermissions? = nil,
         threadKind: CodexThreadNodeKind? = nil,
         runStatus: ThreadRunStatus? = nil,
         popoverOffset: CanvasPoint? = nil,

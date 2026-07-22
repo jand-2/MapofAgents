@@ -472,12 +472,14 @@ public final class WorkflowHookEventFileBridge: @unchecked Sendable {
                     fileIdentity = currentIdentity
                 }
 
-                if Self.fileSize(eventFileURL) < offset {
+                let currentSize = Self.fileSize(eventFileURL)
+                if currentSize < offset {
                     offset = 0
                     pendingData.removeAll(keepingCapacity: true)
                 }
 
-                if let data = try? Self.readAppendedData(from: eventFileURL, offset: &offset),
+                if currentSize > offset,
+                   let data = try? Self.readAppendedData(from: eventFileURL, offset: &offset),
                    !data.isEmpty {
                     events.append(contentsOf: Self.workflowEvents(
                         from: data,

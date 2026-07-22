@@ -28,8 +28,39 @@ public struct AgentHost: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
-public struct CodexModelOption: Codable, Identifiable, Hashable, Sendable {
+public enum AgentProvider: String, Codable, CaseIterable, Identifiable, Sendable {
+    case codex
+    case gemini
+    case grok
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .codex:
+            return "Codex"
+        case .gemini:
+            return "Gemini"
+        case .grok:
+            return "Grok"
+        }
+    }
+
+    public var executableName: String {
+        switch self {
+        case .codex:
+            return "codex"
+        case .gemini:
+            return "agy"
+        case .grok:
+            return "grok"
+        }
+    }
+}
+
+public struct AgentModelOption: Codable, Identifiable, Hashable, Sendable {
     public var id: String
+    public var provider: AgentProvider
     public var displayName: String
     public var description: String
     public var defaultReasoningEffort: String
@@ -38,22 +69,49 @@ public struct CodexModelOption: Codable, Identifiable, Hashable, Sendable {
 
     public init(
         id: String,
+        provider: AgentProvider = .codex,
         displayName: String,
         description: String = "",
-        defaultReasoningEffort: String = "medium",
-        supportedReasoningEfforts: [String] = ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: String = "",
+        supportedReasoningEfforts: [String] = [],
         isDefault: Bool = false
     ) {
         self.id = id
+        self.provider = provider
         self.displayName = displayName
         self.description = description
         self.defaultReasoningEffort = defaultReasoningEffort
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.isDefault = isDefault
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case provider
+        case displayName
+        case description
+        case defaultReasoningEffort
+        case supportedReasoningEfforts
+        case isDefault
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        provider = try container.decodeIfPresent(AgentProvider.self, forKey: .provider) ?? .codex
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName) ?? id
+        description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
+        defaultReasoningEffort = try container.decodeIfPresent(String.self, forKey: .defaultReasoningEffort) ?? ""
+        supportedReasoningEfforts = try container.decodeIfPresent([String].self, forKey: .supportedReasoningEfforts) ?? []
+        isDefault = try container.decodeIfPresent(Bool.self, forKey: .isDefault) ?? false
+    }
+
+    public var qualifiedID: String {
+        "\(provider.rawValue)::\(id)"
+    }
 }
 
-public enum CodexApprovalPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
+public enum AgentApprovalPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
     case onRequest = "on-request"
     case onFailure = "on-failure"
     case untrusted
@@ -75,7 +133,7 @@ public enum CodexApprovalPolicy: String, Codable, CaseIterable, Identifiable, Se
     }
 }
 
-public enum CodexSandboxMode: String, Codable, CaseIterable, Identifiable, Sendable {
+public enum AgentSandboxMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case dangerFullAccess = "danger-full-access"
     case workspaceWrite = "workspace-write"
     case readOnly = "read-only"
@@ -114,13 +172,13 @@ public enum CodexSandboxMode: String, Codable, CaseIterable, Identifiable, Senda
     }
 }
 
-public struct CodexThreadPermissions: Codable, Hashable, Sendable {
-    public var approvalPolicy: CodexApprovalPolicy
-    public var sandboxMode: CodexSandboxMode
+public struct AgentThreadPermissions: Codable, Hashable, Sendable {
+    public var approvalPolicy: AgentApprovalPolicy
+    public var sandboxMode: AgentSandboxMode
 
     public init(
-        approvalPolicy: CodexApprovalPolicy = .onRequest,
-        sandboxMode: CodexSandboxMode = .dangerFullAccess
+        approvalPolicy: AgentApprovalPolicy = .onRequest,
+        sandboxMode: AgentSandboxMode = .dangerFullAccess
     ) {
         self.approvalPolicy = approvalPolicy
         self.sandboxMode = sandboxMode
@@ -128,7 +186,7 @@ public struct CodexThreadPermissions: Codable, Hashable, Sendable {
 
     /// Historical app-server workflows expect the full-access sandbox default.
     /// New-thread UI warns for this mode and confirms it on remote targets.
-    public static let `default` = CodexThreadPermissions()
+    public static let `default` = AgentThreadPermissions()
 
     public func threadParams() -> [String: JSONValue] {
         [
@@ -144,6 +202,15 @@ public struct CodexThreadPermissions: Codable, Hashable, Sendable {
         ]
     }
 }
+
+@available(*, deprecated, renamed: "AgentApprovalPolicy")
+public typealias CodexApprovalPolicy = AgentApprovalPolicy
+
+@available(*, deprecated, renamed: "AgentSandboxMode")
+public typealias CodexSandboxMode = AgentSandboxMode
+
+@available(*, deprecated, renamed: "AgentThreadPermissions")
+public typealias CodexThreadPermissions = AgentThreadPermissions
 
 public enum ChatInputAttachmentKind: String, Codable, CaseIterable, Sendable {
     case file
@@ -424,19 +491,22 @@ public struct ThreadTranscript: Codable, Hashable, Sendable {
     public var nextCursor: String?
     public var lastUpdatedAt: Date
     public var turnTimeline: ThreadTurnTimeline?
+    public var providerMetadata: ProviderThreadMetadata?
 
     public init(
         threadRef: ThreadRef,
         messages: [ThreadMessage] = [],
         nextCursor: String? = nil,
         lastUpdatedAt: Date = Date(),
-        turnTimeline: ThreadTurnTimeline? = nil
+        turnTimeline: ThreadTurnTimeline? = nil,
+        providerMetadata: ProviderThreadMetadata? = nil
     ) {
         self.threadRef = threadRef
         self.messages = messages
         self.nextCursor = nextCursor
         self.lastUpdatedAt = lastUpdatedAt
         self.turnTimeline = turnTimeline
+        self.providerMetadata = providerMetadata
     }
 
     public func sortedChronologically() -> ThreadTranscript {
@@ -517,6 +587,36 @@ public struct ThreadTranscript: Codable, Hashable, Sendable {
             attachment.sourcePath ?? attachment.cachedPath ?? attachment.id,
             attachment.diffText ?? "",
         ].joined(separator: "::")
+    }
+}
+
+/// Provider-owned session details that are not part of MapofAgents' portable
+/// thread identity. Optional fields keep older transcript files compatible.
+public struct ProviderThreadMetadata: Codable, Hashable, Sendable {
+    public var sessionID: String?
+    public var generatedTitle: String?
+    public var forkedFromSessionID: String?
+    public var isSessionMaterialized: Bool
+    public var modelID: String?
+    public var reasoningEffort: String?
+    public var prefersGeneratedTitle: Bool?
+
+    public init(
+        sessionID: String? = nil,
+        generatedTitle: String? = nil,
+        forkedFromSessionID: String? = nil,
+        isSessionMaterialized: Bool = true,
+        modelID: String? = nil,
+        reasoningEffort: String? = nil,
+        prefersGeneratedTitle: Bool? = nil
+    ) {
+        self.sessionID = sessionID
+        self.generatedTitle = generatedTitle
+        self.forkedFromSessionID = forkedFromSessionID
+        self.isSessionMaterialized = isSessionMaterialized
+        self.modelID = modelID
+        self.reasoningEffort = reasoningEffort
+        self.prefersGeneratedTitle = prefersGeneratedTitle
     }
 }
 
@@ -942,6 +1042,7 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
         method == "item/commandExecution/requestApproval"
             || method == "item/fileChange/requestApproval"
             || method == "item/permissions/requestApproval"
+            || method == "session/request_permission"
     }
 
     public var supportsTypedResponse: Bool {
@@ -963,6 +1064,7 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
     public func targetThreadRef(defaultHostID: HostID) -> ThreadRef? {
         guard let threadID else { return nil }
         return ThreadRef(
+            provider: requestParams?["provider"]?.stringValue.flatMap(AgentProvider.init(rawValue:)) ?? .codex,
             hostID: hostID ?? defaultHostID,
             threadID: threadID,
             cwd: requestParams?["cwd"]?.stringValue

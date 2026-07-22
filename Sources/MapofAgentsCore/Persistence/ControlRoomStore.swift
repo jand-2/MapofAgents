@@ -292,7 +292,12 @@ public struct ApplicationPaths: Sendable {
     }
 
     public func transcriptURL(for threadRef: ThreadRef) -> URL {
-        transcriptsDirectory.appendingPathComponent("\(Self.transcriptFileComponent(hostID: threadRef.hostID.rawValue, threadID: threadRef.threadID)).json")
+        let providerQualifiedHost = threadRef.provider == .codex
+            ? threadRef.hostID.rawValue
+            : "\(threadRef.provider.rawValue)::\(threadRef.hostID.rawValue)"
+        return transcriptsDirectory.appendingPathComponent(
+            "\(Self.transcriptFileComponent(hostID: providerQualifiedHost, threadID: threadRef.threadID)).json"
+        )
     }
 
     public func legacyTranscriptURL(for threadRef: ThreadRef) -> URL {
@@ -1298,12 +1303,20 @@ private extension Optional where Wrapped == AgentGraph {
 }
 
 public enum LocalCodexDiscovery {
-    public static func findCodexExecutable() -> String? {
+    public static func findManagedCodexExecutable() -> String? {
         #if os(macOS)
         let standalone = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/packages/standalone/current/codex")
-        if FileManager.default.isExecutableFile(atPath: standalone.path) {
-            return standalone.path
+        return FileManager.default.isExecutableFile(atPath: standalone.path) ? standalone.path : nil
+        #else
+        return nil
+        #endif
+    }
+
+    public static func findCodexExecutable() -> String? {
+        #if os(macOS)
+        if let managedExecutable = findManagedCodexExecutable() {
+            return managedExecutable
         }
 
         let process = Process()

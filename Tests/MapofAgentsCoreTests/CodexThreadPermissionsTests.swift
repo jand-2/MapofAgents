@@ -3,7 +3,7 @@ import Testing
 
 @Test
 func threadPermissionsEncodeLaunchParams() {
-    let permissions = CodexThreadPermissions(
+    let permissions = AgentThreadPermissions(
         approvalPolicy: .onRequest,
         sandboxMode: .dangerFullAccess
     )
@@ -18,7 +18,7 @@ func threadStartParamsExcludeDeprecatedExtendedHistoryFlag() {
     let params = CodexRuntimeStore.threadStartParams(
         cwd: "/tmp/project",
         model: "gpt-5.5",
-        permissions: CodexThreadPermissions(
+        permissions: AgentThreadPermissions(
             approvalPolicy: .onFailure,
             sandboxMode: .workspaceWrite
         )
@@ -34,16 +34,16 @@ func threadStartParamsExcludeDeprecatedExtendedHistoryFlag() {
 
 @Test
 func threadPermissionsEncodeSandboxPolicies() {
-    let fullAccess = CodexSandboxMode.dangerFullAccess.sandboxPolicy(cwd: "/tmp/project")
+    let fullAccess = AgentSandboxMode.dangerFullAccess.sandboxPolicy(cwd: "/tmp/project")
     #expect(fullAccess == .object(["type": .string("dangerFullAccess")]))
 
-    let readOnly = CodexSandboxMode.readOnly.sandboxPolicy(cwd: "/tmp/project")
+    let readOnly = AgentSandboxMode.readOnly.sandboxPolicy(cwd: "/tmp/project")
     #expect(readOnly == .object([
         "type": .string("readOnly"),
         "networkAccess": .bool(true),
     ]))
 
-    let workspaceWrite = CodexSandboxMode.workspaceWrite.sandboxPolicy(cwd: "/tmp/project")
+    let workspaceWrite = AgentSandboxMode.workspaceWrite.sandboxPolicy(cwd: "/tmp/project")
     #expect(workspaceWrite["type"] == .string("workspaceWrite"))
     #expect(workspaceWrite["writableRoots"] == .array([.string("/tmp/project")]))
     #expect(workspaceWrite["networkAccess"] == .bool(true))

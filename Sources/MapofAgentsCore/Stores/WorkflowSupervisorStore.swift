@@ -603,7 +603,7 @@ public final class WorkflowSupervisorStore {
         name: String,
         model: String,
         reasoningEffort: String,
-        permissions: CodexThreadPermissions = .default,
+        permissions: AgentThreadPermissions = .default,
         initialPrompt: String
     ) async throws -> ThreadCreationOutcome {
         guard let relay = relays[hostID] else {
@@ -619,7 +619,7 @@ public final class WorkflowSupervisorStore {
         )
     }
 
-    public func models(on hostID: HostID) async throws -> [CodexModelOption] {
+    public func models(on hostID: HostID) async throws -> [AgentModelOption] {
         guard let relay = relays[hostID] else {
             throw CodexAppServerError.disconnected
         }
@@ -900,7 +900,7 @@ public final class WorkflowSupervisorStore {
         to threadRef: ThreadRef,
         model: String?,
         reasoningEffort: String?,
-        permissions: CodexThreadPermissions? = nil,
+        permissions: AgentThreadPermissions? = nil,
         attachments: [ChatInputAttachment] = []
     ) async throws {
         guard let relay = relays[threadRef.hostID] else {
@@ -1157,9 +1157,16 @@ public final class WorkflowSupervisorStore {
     }
 
     public func refreshSnapshots() async {
-        machines = await supervisor.machineSnapshot()
-        eventEnvelopes = await supervisor.recentEvents(limit: 120)
-        workflowEvents = eventEnvelopes.map(\.event)
+        let nextMachines = await supervisor.machineSnapshot()
+        if machines != nextMachines {
+            machines = nextMachines
+        }
+
+        let nextEventEnvelopes = await supervisor.recentEvents(limit: 120)
+        if eventEnvelopes != nextEventEnvelopes {
+            eventEnvelopes = nextEventEnvelopes
+            workflowEvents = nextEventEnvelopes.map(\.event)
+        }
     }
 
     private func handleRemoteNotification(_ notification: CodexServerNotification, hostID: HostID) {

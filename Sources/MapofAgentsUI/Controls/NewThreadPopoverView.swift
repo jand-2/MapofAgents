@@ -10,10 +10,12 @@ public struct NewThreadRequest: Sendable {
     public var targetNodeID: NodeID
     public var targetKind: NewThreadTargetKind
     public var name: String
-    public var model: String
+    public var provider: AgentProvider
+    public var modelID: String
     public var reasoningEffort: String
-    public var permissions: CodexThreadPermissions
+    public var permissions: AgentThreadPermissions
     public var initialPrompt: String
+    public var adoptProviderGeneratedTitle: Bool
 
     public var folderNodeID: NodeID {
         targetNodeID
@@ -23,36 +25,44 @@ public struct NewThreadRequest: Sendable {
         targetNodeID: NodeID,
         targetKind: NewThreadTargetKind,
         name: String,
-        model: String,
+        provider: AgentProvider = .codex,
+        modelID: String,
         reasoningEffort: String,
-        permissions: CodexThreadPermissions = .default,
-        initialPrompt: String
+        permissions: AgentThreadPermissions = .default,
+        initialPrompt: String,
+        adoptProviderGeneratedTitle: Bool = false
     ) {
         self.targetNodeID = targetNodeID
         self.targetKind = targetKind
         self.name = name
-        self.model = model
+        self.provider = provider
+        self.modelID = modelID
         self.reasoningEffort = reasoningEffort
         self.permissions = permissions
         self.initialPrompt = initialPrompt
+        self.adoptProviderGeneratedTitle = adoptProviderGeneratedTitle
     }
 
     public init(
         folderNodeID: NodeID,
         name: String,
-        model: String,
+        provider: AgentProvider = .codex,
+        modelID: String,
         reasoningEffort: String,
-        permissions: CodexThreadPermissions = .default,
-        initialPrompt: String
+        permissions: AgentThreadPermissions = .default,
+        initialPrompt: String,
+        adoptProviderGeneratedTitle: Bool = false
     ) {
         self.init(
             targetNodeID: folderNodeID,
             targetKind: .folder,
             name: name,
-            model: model,
+            provider: provider,
+            modelID: modelID,
             reasoningEffort: reasoningEffort,
             permissions: permissions,
-            initialPrompt: initialPrompt
+            initialPrompt: initialPrompt,
+            adoptProviderGeneratedTitle: adoptProviderGeneratedTitle
         )
     }
 }
@@ -61,9 +71,14 @@ public struct NewThreadPopoverView: View {
     @Bindable var graphStore: GraphStore
     @Bindable var runtimeStore: CodexRuntimeStore
     var isFolderAvailable: (CanvasNode) -> Bool
-    var modelOptionsForFolder: (CanvasNode?) -> [CodexModelOption]?
+    var availableProviders: (CanvasNode?) -> [AgentProvider]
+    var modelOptions: (AgentProvider, CanvasNode?) -> [AgentModelOption]
+    var providerStatus: (AgentProvider) -> AgentProviderRuntimeStatus?
     var mentionCandidatesForFolder: (CanvasNode?) -> [MentionCandidate]
     var onSelectedFolderChanged: (CanvasNode?) -> Void
+    var onRefreshProvider: (AgentProvider) async -> Void
+    var onInstallProvider: (AgentProvider) -> Void
+    var onSignInProvider: (AgentProvider) -> Void
     var onCreate: (NewThreadRequest) async -> Bool
     var onCancel: () -> Void
     var isFullScreen: Bool
@@ -72,10 +87,11 @@ public struct NewThreadPopoverView: View {
     @State private var selectedFolderID: NodeID?
     @State private var selectedMachineID: NodeID?
     @State private var selectedTargetKind: NewThreadTargetKind = .folder
+    @State private var selectedProvider: AgentProvider = .codex
     @State private var selectedModelID = ""
-    @State private var selectedEffort = "high"
-    @State private var selectedApprovalPolicy = CodexThreadPermissions.default.approvalPolicy
-    @State private var selectedSandboxMode = CodexThreadPermissions.default.sandboxMode
+    @State private var selectedEffort = ""
+    @State private var selectedApprovalPolicy = AgentThreadPermissions.default.approvalPolicy
+    @State private var selectedSandboxMode = AgentThreadPermissions.default.sandboxMode
     @State private var threadName = ""
     @State private var initialPrompt = ""
     @State private var isConfirmingDangerFullAccess = false
@@ -85,9 +101,14 @@ public struct NewThreadPopoverView: View {
         graphStore: GraphStore,
         runtimeStore: CodexRuntimeStore,
         isFolderAvailable: @escaping (CanvasNode) -> Bool = { _ in true },
-        modelOptionsForFolder: @escaping (CanvasNode?) -> [CodexModelOption]? = { _ in nil },
+        availableProviders: @escaping (CanvasNode?) -> [AgentProvider] = { _ in [.codex] },
+        modelOptions: @escaping (AgentProvider, CanvasNode?) -> [AgentModelOption] = { _, _ in [] },
+        providerStatus: @escaping (AgentProvider) -> AgentProviderRuntimeStatus? = { _ in nil },
         mentionCandidatesForFolder: @escaping (CanvasNode?) -> [MentionCandidate] = { _ in [] },
         onSelectedFolderChanged: @escaping (CanvasNode?) -> Void = { _ in },
+        onRefreshProvider: @escaping (AgentProvider) async -> Void = { _ in },
+        onInstallProvider: @escaping (AgentProvider) -> Void = { _ in },
+        onSignInProvider: @escaping (AgentProvider) -> Void = { _ in },
         onCreate: @escaping (NewThreadRequest) async -> Bool,
         onCancel: @escaping () -> Void,
         isFullScreen: Bool = false,
@@ -96,9 +117,14 @@ public struct NewThreadPopoverView: View {
         self.graphStore = graphStore
         self.runtimeStore = runtimeStore
         self.isFolderAvailable = isFolderAvailable
-        self.modelOptionsForFolder = modelOptionsForFolder
+        self.availableProviders = availableProviders
+        self.modelOptions = modelOptions
+        self.providerStatus = providerStatus
         self.mentionCandidatesForFolder = mentionCandidatesForFolder
         self.onSelectedFolderChanged = onSelectedFolderChanged
+        self.onRefreshProvider = onRefreshProvider
+        self.onInstallProvider = onInstallProvider
+        self.onSignInProvider = onSignInProvider
         self.onCreate = onCreate
         self.onCancel = onCancel
         self.isFullScreen = isFullScreen
@@ -153,12 +179,28 @@ public struct NewThreadPopoverView: View {
         .onAppear(perform: syncDefaults)
         .onChange(of: runtimeStore.models) { _, _ in syncDefaults() }
         .onChange(of: catalogRevision) { _, _ in syncDefaults() }
-        .onChange(of: selectedFolderID) { _, _ in onSelectedFolderChanged(selectedTargetNode) }
-        .onChange(of: selectedMachineID) { _, _ in onSelectedFolderChanged(selectedTargetNode) }
-        .onChange(of: selectedTargetKind) { _, _ in onSelectedFolderChanged(selectedTargetNode) }
+        .onChange(of: selectedFolderID) { _, _ in
+            syncDefaults()
+            onSelectedFolderChanged(selectedTargetNode)
+        }
+        .onChange(of: selectedMachineID) { _, _ in
+            syncDefaults()
+            onSelectedFolderChanged(selectedTargetNode)
+        }
+        .onChange(of: selectedTargetKind) { _, _ in
+            syncDefaults()
+            onSelectedFolderChanged(selectedTargetNode)
+        }
+        .onChange(of: selectedProvider) { _, _ in
+            selectedModelID = ""
+            syncDefaults()
+            refreshSelectedProvider()
+        }
         .onChange(of: selectedModelID) { _, _ in syncReasoningDefault() }
         .task(id: selectedFolderPath ?? "") {
             onSelectedFolderChanged(selectedTargetNode)
+            await onRefreshProvider(selectedProvider)
+            syncDefaults()
         }
     }
 
@@ -180,12 +222,12 @@ public struct NewThreadPopoverView: View {
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "plus.bubble")
-                .foregroundStyle(.blue)
+                .foregroundStyle(providerColor)
                 .frame(width: 26, height: 26)
-                .background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                .background(providerColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("New Codex Thread")
+                Text("New Agent Thread")
                     .font(.headline)
 
                 Text(selectedTargetTitle)
@@ -210,15 +252,45 @@ public struct NewThreadPopoverView: View {
     private var setupMessage: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Codex")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.green)
+                HStack(spacing: 6) {
+                    Text(selectedProvider.displayName)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(providerColor)
 
-                Text(isCreating ? "Creating the new thread..." : "Ready for a new thread.")
+                    if selectedProvider != .codex {
+                        Text(providerStatusText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                Text(isCreating ? "Creating the new thread..." : setupStatusText)
                     .font(.callout)
+
+                if selectedProvider != .codex {
+                    HStack(spacing: 8) {
+                        if providerCanInstall {
+                            Button("Install CLI") {
+                                onInstallProvider(selectedProvider)
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            Button(providerIsReady ? "Sign In Again" : "Sign In") {
+                                onSignInProvider(selectedProvider)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        Button("Refresh") {
+                            refreshSelectedProvider()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
             }
             .padding(10)
-            .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            .background(providerColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
             Spacer(minLength: 40)
         }
@@ -226,6 +298,27 @@ public struct NewThreadPopoverView: View {
 
     private var configurationPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                settingCell("Provider") {
+                    Picker("Provider", selection: $selectedProvider) {
+                        ForEach(selectableProviders) { provider in
+                            Text(provider.displayName).tag(provider)
+                        }
+                    }
+                    .labelsHidden()
+                }
+
+                settingCell("Model") {
+                    Picker("Model", selection: $selectedModelID) {
+                        ForEach(models) { model in
+                            Text(model.displayName).tag(model.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .disabled(models.isEmpty)
+                }
+            }
+
             HStack(alignment: .top, spacing: 10) {
                 settingCell("Type") {
                     Picker("Type", selection: $selectedTargetKind) {
@@ -256,16 +349,7 @@ public struct NewThreadPopoverView: View {
                 }
             }
 
-            HStack(alignment: .top, spacing: 10) {
-                settingCell("Model") {
-                    Picker("Model", selection: $selectedModelID) {
-                        ForEach(models) { model in
-                            Text(model.displayName).tag(model.id)
-                        }
-                    }
-                    .labelsHidden()
-                }
-
+            if let currentModel, !currentModel.supportedReasoningEfforts.isEmpty {
                 settingCell("Reasoning") {
                     Picker("Reasoning", selection: $selectedEffort) {
                         ForEach(currentModel.supportedReasoningEfforts, id: \.self) { effort in
@@ -276,28 +360,34 @@ public struct NewThreadPopoverView: View {
                 }
             }
 
-            HStack(alignment: .top, spacing: 10) {
-                settingCell("Approval") {
-                    Picker("Approval", selection: $selectedApprovalPolicy) {
-                        ForEach(CodexApprovalPolicy.allCases) { policy in
-                            Text(policy.displayName).tag(policy)
+            if selectedProvider == .codex {
+                HStack(alignment: .top, spacing: 10) {
+                    settingCell("Approval") {
+                        Picker("Approval", selection: $selectedApprovalPolicy) {
+                            ForEach(AgentApprovalPolicy.allCases) { policy in
+                                Text(policy.displayName).tag(policy)
+                            }
                         }
+                        .labelsHidden()
                     }
-                    .labelsHidden()
+
+                    settingCell("Sandbox") {
+                        Picker("Sandbox", selection: $selectedSandboxMode) {
+                            ForEach(AgentSandboxMode.allCases) { sandbox in
+                                Text(sandbox.displayName).tag(sandbox)
+                            }
+                        }
+                        .labelsHidden()
+                    }
                 }
 
-                settingCell("Sandbox") {
-                    Picker("Sandbox", selection: $selectedSandboxMode) {
-                        ForEach(CodexSandboxMode.allCases) { sandbox in
-                            Text(sandbox.displayName).tag(sandbox)
-                        }
-                    }
-                    .labelsHidden()
+                if selectedSandboxMode == .dangerFullAccess {
+                    dangerFullAccessNotice
                 }
-            }
-
-            if selectedSandboxMode == .dangerFullAccess {
-                dangerFullAccessNotice
+            } else {
+                Text("Approval and sandbox behavior come from the signed-in \(selectedProvider.displayName) CLI configuration.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             TextField("Thread name", text: $threadName)
@@ -340,13 +430,15 @@ public struct NewThreadPopoverView: View {
     private var composer: some View {
         VStack(spacing: 10) {
             HStack(spacing: 8) {
-                Label(currentModel.displayName, systemImage: "cpu")
+                Label(currentModel?.displayName ?? "No model available", systemImage: "cpu")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Label(selectedEffort, systemImage: "dial.medium")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if !selectedEffort.isEmpty {
+                    Label(selectedEffort, systemImage: "dial.medium")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 Spacer()
             }
@@ -361,7 +453,7 @@ public struct NewThreadPopoverView: View {
                         + mentionCandidatesForFolder(selectedTargetNode),
                     minLines: 4,
                     maxLines: 9,
-                    usesLocalMentionCatalog: selectedTargetUsesLocalCatalog,
+                    usesLocalMentionCatalog: selectedProvider == .codex && selectedTargetUsesLocalCatalog,
                     initiallyFocused: true
                 )
                 .disabled(isCreating)
@@ -431,18 +523,56 @@ public struct NewThreadPopoverView: View {
         }
     }
 
-    private var models: [CodexModelOption] {
-        if let remoteModels = modelOptionsForFolder(selectedTargetNode), !remoteModels.isEmpty {
-            return remoteModels
-        }
-        return runtimeStore.models.isEmpty ? [runtimeStore.defaultModel] : runtimeStore.models
+    private var models: [AgentModelOption] {
+        modelOptions(selectedProvider, selectedTargetNode)
+            .filter { $0.provider == selectedProvider }
     }
 
-    private var currentModel: CodexModelOption {
+    private var currentModel: AgentModelOption? {
         models.first(where: { $0.id == selectedModelID })
             ?? models.first(where: \.isDefault)
             ?? models.first
-            ?? runtimeStore.defaultModel
+    }
+
+    private var selectableProviders: [AgentProvider] {
+        let providers = availableProviders(selectedTargetNode)
+        return providers.isEmpty ? [.codex] : providers
+    }
+
+    private var selectedProviderStatus: AgentProviderRuntimeStatus? {
+        providerStatus(selectedProvider)
+    }
+
+    private var providerStatusText: String {
+        selectedProviderStatus?.message ?? "Not available on this target"
+    }
+
+    private var providerIsReady: Bool {
+        selectedProviderStatus?.state == .ready
+    }
+
+    private var providerCanInstall: Bool {
+        selectedProviderStatus?.state == .unavailable
+    }
+
+    private var setupStatusText: String {
+        if selectedProvider == .codex {
+            return models.isEmpty ? "Connect Codex to load its model catalog." : "Ready for a new thread."
+        }
+        return selectedProviderStatus?.state == .ready
+            ? "Ready for a new thread."
+            : providerStatusText
+    }
+
+    private var providerColor: Color {
+        switch selectedProvider {
+        case .codex:
+            return .blue
+        case .gemini:
+            return .purple
+        case .grok:
+            return .orange
+        }
     }
 
     private var resolvedThreadName: String {
@@ -456,7 +586,7 @@ public struct NewThreadPopoverView: View {
         if let selectedMachineID, let machine = graphStore.graph.nodes[selectedMachineID] {
             return "\(machine.title) chat"
         }
-        return "Codex thread"
+        return "\(selectedProvider.displayName) thread"
     }
 
     private var selectedTargetTitle: String {
@@ -515,7 +645,9 @@ public struct NewThreadPopoverView: View {
     }
 
     private var shouldConfirmDangerFullAccess: Bool {
-        selectedSandboxMode == .dangerFullAccess && selectedTargetIsRemote
+        selectedProvider == .codex
+            && selectedSandboxMode == .dangerFullAccess
+            && selectedTargetIsRemote
     }
 
     private var dangerFullAccessWarningText: String {
@@ -534,6 +666,10 @@ public struct NewThreadPopoverView: View {
             return "Select a machine or folder before creating a thread."
         }
 
+        guard selectableProviders.contains(selectedProvider) else {
+            return "\(selectedProvider.displayName) is not available on this machine."
+        }
+
         guard isFolderAvailable(target) else {
             switch selectedTargetKind {
             case .folder:
@@ -541,6 +677,13 @@ public struct NewThreadPopoverView: View {
             case .machine:
                 return "Connect this machine before creating a chat."
             }
+        }
+
+        if models.isEmpty {
+            if selectedProvider == .codex {
+                return "No Codex models are available from this runtime."
+            }
+            return providerStatusText
         }
 
         return nil
@@ -556,9 +699,18 @@ public struct NewThreadPopoverView: View {
         performCreate()
     }
 
+    private func refreshSelectedProvider() {
+        let provider = selectedProvider
+        Task {
+            await onRefreshProvider(provider)
+            guard selectedProvider == provider else { return }
+            syncDefaults()
+        }
+    }
+
     private func performCreate() {
         guard !isCreating else { return }
-        guard let target = selectedTargetNode else { return }
+        guard let target = selectedTargetNode, let currentModel else { return }
         let resolvedEffort = currentModel.supportedReasoningEfforts.contains(selectedEffort)
             ? selectedEffort
             : currentModel.defaultReasoningEffort
@@ -566,13 +718,15 @@ public struct NewThreadPopoverView: View {
             targetNodeID: target.id,
             targetKind: selectedTargetKind,
             name: resolvedThreadName,
-            model: currentModel.id,
+            provider: selectedProvider,
+            modelID: currentModel.id,
             reasoningEffort: resolvedEffort,
-            permissions: CodexThreadPermissions(
+            permissions: AgentThreadPermissions(
                 approvalPolicy: selectedApprovalPolicy,
                 sandboxMode: selectedSandboxMode
             ),
-            initialPrompt: initialPrompt
+            initialPrompt: initialPrompt,
+            adoptProviderGeneratedTitle: threadName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
 
         isCreating = true
@@ -614,14 +768,22 @@ public struct NewThreadPopoverView: View {
             selectedMachineID = machineNodes.first?.id
         }
 
+        if !selectableProviders.contains(selectedProvider) {
+            selectedProvider = selectableProviders.first ?? .codex
+        }
+
         if selectedModelID.isEmpty || !models.contains(where: { $0.id == selectedModelID }) {
-            selectedModelID = currentModel.id
+            selectedModelID = currentModel?.id ?? ""
         }
 
         syncReasoningDefault()
     }
 
     private func syncReasoningDefault() {
+        guard let currentModel else {
+            selectedEffort = ""
+            return
+        }
         if !currentModel.supportedReasoningEfforts.contains(selectedEffort) {
             selectedEffort = currentModel.defaultReasoningEffort
         }

@@ -587,7 +587,7 @@ public actor AppServerWebSocketWorkflowRelay {
         name: String,
         model: String,
         reasoningEffort: String,
-        permissions: CodexThreadPermissions = .default,
+        permissions: AgentThreadPermissions = .default,
         initialPrompt: String
     ) async throws -> ThreadCreationOutcome {
         try await ensureConnected()
@@ -609,7 +609,7 @@ public actor AppServerWebSocketWorkflowRelay {
         name: String,
         model: String,
         reasoningEffort: String,
-        permissions: CodexThreadPermissions = .default,
+        permissions: AgentThreadPermissions = .default,
         initialPrompt: String,
         request: @escaping @Sendable (AppServerMethod, JSONValue) async throws -> JSONValue
     ) async throws -> ThreadCreationOutcome {
@@ -669,7 +669,7 @@ public actor AppServerWebSocketWorkflowRelay {
         )
     }
 
-    public func listModels() async throws -> [CodexModelOption] {
+    public func listModels() async throws -> [AgentModelOption] {
         try await ensureConnected()
         let result = try await request(
             method: .listModels,
@@ -939,7 +939,7 @@ public actor AppServerWebSocketWorkflowRelay {
         to threadRef: ThreadRef,
         model: String?,
         reasoningEffort: String?,
-        permissions: CodexThreadPermissions? = nil,
+        permissions: AgentThreadPermissions? = nil,
         attachments: [ChatInputAttachment] = []
     ) async throws {
         try await ensureConnected()

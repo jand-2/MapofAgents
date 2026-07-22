@@ -169,6 +169,19 @@ func messageEdgesPersistRouteMetadataAndDeleteWithEdge() async throws {
     #expect(route.eventIDs == ["event-1"])
     #expect(route.canvasEdgeID == edge.id)
 
+    await graphStore.createMessageEdge(
+        from: source.id,
+        to: target.id,
+        snippet: "delivered message",
+        deliveryState: .delivered
+    )
+
+    let resolvedRoute = try #require(graphStore.graph.messageRoutes.values.first)
+    #expect(graphStore.graph.messageRoutes.count == 1)
+    #expect(resolvedRoute.id == route.id)
+    #expect(resolvedRoute.snippet == "delivered message")
+    #expect(resolvedRoute.deliveryState == .delivered)
+
     await graphStore.deleteManualEdge(edge.id)
     #expect(graphStore.graph.manualEdges.isEmpty)
     #expect(graphStore.graph.messageRoutes.isEmpty)
@@ -1291,6 +1304,35 @@ func supervisorMachinesCreateAndUpdateMachineNodes() async throws {
 
     await graphStore.applySupervisorMachines([])
     #expect(graphStore.graph.nodes[node.id]?.metadata.hostStatus == .disconnected)
+
+    try? FileManager.default.removeItem(at: directory)
+}
+
+@Test
+@MainActor
+func unchangedSupervisorMachinePresentationDoesNotRewriteGraph() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-machine-noop-tests-\(UUID().uuidString)", isDirectory: true)
+    let store = LocalControlRoomStore(paths: ApplicationPaths(applicationSupportDirectory: directory))
+    let graphStore = GraphStore(repository: store)
+    let machine = SupervisorMachine(
+        id: HostID(rawValue: "remote-a"),
+        name: "Remote A",
+        endpointDescription: "ws://127.0.0.1:18945",
+        status: .connected,
+        platform: .linux,
+        lastEventAt: Date(timeIntervalSince1970: 10)
+    )
+
+    await graphStore.applySupervisorMachine(machine)
+    let graphAfterInitialApply = graphStore.graph
+
+    var healthOnlyUpdate = machine
+    healthOnlyUpdate.lastEventAt = Date(timeIntervalSince1970: 20)
+    await graphStore.applySupervisorMachine(healthOnlyUpdate)
+    await graphStore.applySupervisorMachines([healthOnlyUpdate])
+
+    #expect(graphStore.graph == graphAfterInitialApply)
 
     try? FileManager.default.removeItem(at: directory)
 }

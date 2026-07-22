@@ -167,7 +167,10 @@ struct IPhoneRootView: View {
                 graphStore: graphStore,
                 runtimeStore: runtimeStore,
                 isFolderAvailable: isFolderAvailable,
-                modelOptionsForFolder: modelOptions(for:),
+                availableProviders: { _ in [.codex] },
+                modelOptions: { provider, target in
+                    provider == .codex ? (modelOptions(for: target) ?? []) : []
+                },
                 mentionCandidatesForFolder: mentionCandidates(for:),
                 onSelectedFolderChanged: refreshThreadFormCatalog(for:),
                 onCreate: createThread,
@@ -748,7 +751,7 @@ struct IPhoneRootView: View {
         }
     }
 
-    private func modelOptions(for folder: CanvasNode?) -> [CodexModelOption]? {
+    private func modelOptions(for folder: CanvasNode?) -> [AgentModelOption]? {
         threadCreation.modelOptions(for: folder, localHostID: runtimeStore.localHost.id)
     }
 
@@ -785,6 +788,7 @@ struct IPhoneRootView: View {
             request,
             graphStore: graphStore,
             runtimeStore: runtimeStore,
+            providerRuntimeStore: nil,
             supervisorStore: supervisorStore,
             allowsLocalRuntime: false,
             localDefaultDirectory: "/",

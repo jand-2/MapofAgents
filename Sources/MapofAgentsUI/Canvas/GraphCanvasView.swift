@@ -26,8 +26,9 @@ public struct GraphCanvasView: View {
 
         var title: String {
             switch self {
-            case .archiveThread:
-                return "Archive Codex Thread?"
+            case .archiveThread(let node):
+                let provider = node.metadata.threadRef?.provider.displayName ?? AgentProvider.codex.displayName
+                return "Archive \(provider) Thread?"
             case .deleteNode:
                 return "Delete Canvas Node?"
             case .deleteManualEdge:
@@ -49,9 +50,13 @@ public struct GraphCanvasView: View {
         var message: String {
             switch self {
             case .archiveThread(let node):
-                return "This archives the Codex thread \"\(node.title)\" on its owning machine and removes the node from this workflow map."
+                let provider = node.metadata.threadRef?.provider.displayName ?? AgentProvider.codex.displayName
+                if node.metadata.threadRef?.provider == .codex {
+                    return "This archives the \(provider) thread \"\(node.title)\" on its owning machine and removes the node from this workflow map."
+                }
+                return "This removes the \(provider) thread \"\(node.title)\" from this workflow map. Its provider session and MapofAgents transcript remain on this Mac."
             case .deleteNode(let node):
-                return "This removes \"\(node.title)\" and its connected lines from this workflow map. It does not delete Codex thread history from disk."
+                return "This removes \"\(node.title)\" and its connected lines from this workflow map. It does not delete provider thread history from disk."
             case .deleteManualEdge:
                 return "This removes the selected manual line from this workflow map."
             }
@@ -67,10 +72,11 @@ public struct GraphCanvasView: View {
         var mode: RemoteFolderPickerView.Mode = .chooseProject
     }
 
-    private static let threadAutomationRefreshInterval: Duration = .seconds(10)
+    private static let threadAutomationRefreshInterval: Duration = .seconds(60)
 
     @Bindable private var graphStore: GraphStore
     @Bindable private var runtimeStore: CodexRuntimeStore
+    private var providerRuntimeStore: AgentProviderRuntimeStore?
     @Bindable private var supervisorStore: WorkflowSupervisorStore
     @Bindable private var threadCatalogStore: ThreadCatalogStore
     private var workflowEvents: [WorkflowEvent]
@@ -109,6 +115,7 @@ public struct GraphCanvasView: View {
     public init(
         graphStore: GraphStore,
         runtimeStore: CodexRuntimeStore,
+        providerRuntimeStore: AgentProviderRuntimeStore? = nil,
         supervisorStore: WorkflowSupervisorStore,
         threadCatalogStore: ThreadCatalogStore,
         workflowEvents: [WorkflowEvent],
@@ -129,6 +136,7 @@ public struct GraphCanvasView: View {
     ) {
         self.graphStore = graphStore
         self.runtimeStore = runtimeStore
+        self.providerRuntimeStore = providerRuntimeStore
         self.supervisorStore = supervisorStore
         self.threadCatalogStore = threadCatalogStore
         self.workflowEvents = workflowEvents
@@ -566,10 +574,12 @@ public struct GraphCanvasView: View {
 
     private func attentionRequests(for threadNode: CanvasNode) -> [RuntimeAttentionRequest] {
         guard let threadRef = threadNode.metadata.threadRef else { return [] }
-        return (runtimeStore.pendingAttentionRequests + supervisorStore.pendingAttentionRequests)
+        let providerRequests = providerRuntimeStore?.pendingAttentionRequests ?? []
+        return (runtimeStore.pendingAttentionRequests + supervisorStore.pendingAttentionRequests + providerRequests)
             .filter { request in
                 request.threadID == threadRef.threadID
                     && (request.hostID == nil || request.hostID == threadRef.hostID)
+                    && (request.requestParams?["provider"]?.stringValue.flatMap(AgentProvider.init(rawValue:)) ?? .codex) == threadRef.provider
             }
             .sorted { $0.createdAt < $1.createdAt }
     }
@@ -724,7 +734,9 @@ public struct GraphCanvasView: View {
     }
 
     private func threadInboxLayer() -> some View {
-        let attentionRequests = runtimeStore.pendingAttentionRequests + supervisorStore.pendingAttentionRequests
+        let attentionRequests = runtimeStore.pendingAttentionRequests
+            + supervisorStore.pendingAttentionRequests
+            + (providerRuntimeStore?.pendingAttentionRequests ?? [])
         return ThreadInboxPanelView(
             catalogStore: threadCatalogStore,
             onRefresh: {
@@ -804,7 +816,7 @@ public struct GraphCanvasView: View {
                 Task { await openThreadInReader(nodeID: nodeID) }
             },
             onRename: { nodeID, title in
-                Task { await graphStore.updateNodeTitle(id: nodeID, title: title) }
+                Task { await renameThreadNode(nodeID: nodeID, title: title) }
             },
             onRefresh: { nodeID in
                 Task { await loadReadingTranscript(for: nodeID, force: true) }
@@ -1022,7 +1034,7 @@ public struct GraphCanvasView: View {
             attentionRequests: attentionRequests(for: threadNode),
             threadAutomation: automation(for: threadNode),
             onRename: { title in
-                Task { await graphStore.updateNodeTitle(id: threadNode.id, title: title) }
+                Task { await renameThreadNode(nodeID: threadNode.id, title: title) }
             },
             onRefresh: {
                 Task { await loadTranscript(for: threadNode, force: true) }
@@ -1080,7 +1092,7 @@ public struct GraphCanvasView: View {
             canvasSize: canvasSize,
             rightInset: rightRailReservedWidth(in: canvasSize),
             onRename: { title in
-                Task { await graphStore.updateNodeTitle(id: threadNode.id, title: title) }
+                Task { await renameThreadNode(nodeID: threadNode.id, title: title) }
             },
             onCommitOffset: { offset in
                 Task { await graphStore.updateNodePopoverOffset(id: threadNode.id, offset: offset) }
@@ -1550,7 +1562,10 @@ public struct GraphCanvasView: View {
             .reader(nodeID),
             threadRef: threadRef,
             loader: { cursor in
-                if isLocalThread(threadRef) {
+                if threadRef.provider != .codex {
+                    return try await providerRuntimeStore?.loadTranscript(for: threadRef)
+                        ?? ThreadTranscript(threadRef: threadRef)
+                } else if isLocalThread(threadRef) {
                     return try await runtimeStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
                 }
                 return try await supervisorStore.loadOlderTranscriptPage(for: threadRef, cursor: cursor)
@@ -1601,7 +1616,15 @@ public struct GraphCanvasView: View {
 
         do {
             for mention in mentionedThreads {
-                await graphStore.createMessageEdge(from: node.id, to: mention.nodeID, snippet: text)
+                await graphStore.createMessageEdge(
+                    from: node.id,
+                    to: mention.nodeID,
+                    snippet: text,
+                    deliveryState: workflowMentionDeliveryState(
+                        source: threadRef,
+                        target: mention.threadRef
+                    )
+                )
             }
 
             let outboundText = messageWithWorkflowThreadContext(
@@ -1610,6 +1633,10 @@ public struct GraphCanvasView: View {
                 folderMentions: mentionedFolders,
                 sourceThreadRef: threadRef
             )
+
+            if threadRef.provider != .codex {
+                scheduleProviderLiveTranscriptRefresh(for: threadRef)
+            }
 
             try await sendMessage(
                 outboundText,
@@ -1620,7 +1647,11 @@ public struct GraphCanvasView: View {
                 attachments: attachments
             )
             didStartTurn = true
-            startLiveTranscriptRefreshIfNeeded(for: threadRef)
+            if threadRef.provider == .codex {
+                startLiveTranscriptRefreshIfNeeded(for: threadRef)
+            } else {
+                await refreshOpenTranscripts(for: threadRef)
+            }
         } catch {
             removeLocalMessage(id: localMessageID, threadRef: threadRef)
             let message = displayMessage(for: error, threadRef: threadRef)
@@ -1665,7 +1696,15 @@ public struct GraphCanvasView: View {
 
         do {
             for mention in mentionedThreads {
-                await graphStore.createMessageEdge(from: node.id, to: mention.nodeID, snippet: text)
+                await graphStore.createMessageEdge(
+                    from: node.id,
+                    to: mention.nodeID,
+                    snippet: text,
+                    deliveryState: workflowMentionDeliveryState(
+                        source: threadRef,
+                        target: mention.threadRef
+                    )
+                )
             }
 
             let outboundText = messageWithWorkflowThreadContext(
@@ -1674,6 +1713,10 @@ public struct GraphCanvasView: View {
                 folderMentions: mentionedFolders,
                 sourceThreadRef: threadRef
             )
+
+            if threadRef.provider != .codex {
+                scheduleProviderLiveTranscriptRefresh(for: threadRef)
+            }
 
             try await sendMessage(
                 outboundText,
@@ -1684,7 +1727,11 @@ public struct GraphCanvasView: View {
                 attachments: attachments
             )
             didStartTurn = true
-            startLiveTranscriptRefreshIfNeeded(for: threadRef)
+            if threadRef.provider == .codex {
+                startLiveTranscriptRefreshIfNeeded(for: threadRef)
+            } else {
+                await refreshOpenTranscripts(for: threadRef)
+            }
         } catch {
             removeLocalMessage(id: localMessageID, threadRef: threadRef, nodeID: nodeID)
             let message = displayMessage(for: error, threadRef: threadRef)
@@ -1719,7 +1766,12 @@ public struct GraphCanvasView: View {
     }
 
     private func loadTranscript(for threadRef: ThreadRef) async throws -> ThreadTranscript {
-        if isLocalThread(threadRef) {
+        if threadRef.provider != .codex {
+            guard let providerRuntimeStore else {
+                throw AgentProviderRuntimeError.unsupportedPlatform
+            }
+            return try await providerRuntimeStore.loadTranscript(for: threadRef)
+        } else if isLocalThread(threadRef) {
             return try await runtimeStore.loadTranscript(for: threadRef)
         }
         return try await supervisorStore.loadTranscript(for: threadRef)
@@ -1736,12 +1788,18 @@ public struct GraphCanvasView: View {
     private func refreshThreadAutomations() async {
         let store = CodexAutomationStore()
         do {
-            let automations = try store.loadAutomationsByThreadID()
+            let automations = try await Task.detached(priority: .utility) {
+                try store.loadAutomationsByThreadID()
+            }.value
             guard !Task.isCancelled else { return }
-            threadAutomationsByThreadID = automations
+            if threadAutomationsByThreadID != automations {
+                threadAutomationsByThreadID = automations
+            }
         } catch {
             guard !Task.isCancelled else { return }
-            threadAutomationsByThreadID = [:]
+            if !threadAutomationsByThreadID.isEmpty {
+                threadAutomationsByThreadID = [:]
+            }
         }
     }
 
@@ -1929,8 +1987,8 @@ public struct GraphCanvasView: View {
         }?.metadata.platform ?? .macOS
         await graphStore.addThreadNode(
             threadRef: entry.threadRef,
-            model: entry.model ?? "gpt-5.5",
-            reasoningEffort: entry.reasoningEffort ?? "high",
+            model: entry.model ?? "",
+            reasoningEffort: entry.reasoningEffort ?? "",
             title: entry.title,
             anchorFolderID: anchorFolderID(for: entry.threadRef),
             platform: platform,
@@ -1977,6 +2035,7 @@ public struct GraphCanvasView: View {
 
         if let node = graphStore.graph.nodes.values.first(where: {
             $0.kind == .codexThread
+                && $0.metadata.threadRef?.provider == targetRef.provider
                 && $0.metadata.threadRef?.matches(hostID: hostID, threadID: threadID) == true
         }), let threadRef = node.metadata.threadRef {
             openInboxThread(
@@ -2002,13 +2061,14 @@ public struct GraphCanvasView: View {
         openInboxThread(
             ThreadCatalogEntry(
                 threadRef: ThreadRef(
+                    provider: targetRef.provider,
                     hostID: hostID,
                     threadID: threadID,
                     cwd: targetRef.cwd,
                     name: nil
                 ),
                 hostName: hostName(for: hostID),
-                title: "Codex thread",
+                title: "\(targetRef.provider.displayName) thread",
                 preview: request.summary,
                 source: "attention",
                 loadedStatus: .needsInput,
@@ -2055,10 +2115,21 @@ public struct GraphCanvasView: View {
         to threadRef: ThreadRef,
         model: String?,
         reasoningEffort: String?,
-        permissions: CodexThreadPermissions? = nil,
+        permissions: AgentThreadPermissions? = nil,
         attachments: [ChatInputAttachment] = []
     ) async throws {
-        if isLocalThread(threadRef) {
+        if threadRef.provider != .codex {
+            guard let providerRuntimeStore else {
+                throw AgentProviderRuntimeError.unsupportedPlatform
+            }
+            try await providerRuntimeStore.sendMessage(
+                text,
+                to: threadRef,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                attachments: attachments
+            )
+        } else if isLocalThread(threadRef) {
             try await runtimeStore.sendMessage(
                 text,
                 to: threadRef,
@@ -2081,7 +2152,12 @@ public struct GraphCanvasView: View {
 
     private func respondToAttentionRequest(_ request: RuntimeAttentionRequest, allow: Bool) async {
         do {
-            if request.hostID == runtimeStore.localHost.id || request.hostID == nil {
+            if request.requestParams?["provider"]?.stringValue == AgentProvider.grok.rawValue {
+                guard let providerRuntimeStore else {
+                    throw AgentProviderRuntimeError.unsupportedPlatform
+                }
+                try await providerRuntimeStore.respondToAttentionRequest(request, allow: allow)
+            } else if request.hostID == runtimeStore.localHost.id || request.hostID == nil {
                 try await runtimeStore.respondToAttentionRequest(request, allow: allow)
             } else {
                 try await supervisorStore.respondToAttentionRequest(request, allow: allow)
@@ -2270,6 +2346,7 @@ public struct GraphCanvasView: View {
     private func materializeLocalSubagentsFromRolloutIfAvailable(for node: CanvasNode) async {
         guard
             let threadRef = node.metadata.threadRef,
+            threadRef.provider == .codex,
             isLocalThread(threadRef)
         else {
             return
@@ -2283,6 +2360,9 @@ public struct GraphCanvasView: View {
         guard let threadRef = node.metadata.threadRef else {
             return ""
         }
+        if threadRef.provider != .codex {
+            return providerRuntimeStore?.liveAssistantText(for: threadRef) ?? ""
+        }
         if isLocalThread(threadRef) {
             return runtimeStore.threadRuntimeStates[threadRef.qualifiedID]?.liveAssistantText
                 ?? runtimeStore.liveAssistantTextByThreadID[threadRef.threadID]
@@ -2295,6 +2375,24 @@ public struct GraphCanvasView: View {
         guard node.kind == .codexThread,
               let threadRef = node.metadata.threadRef else {
             return nil
+        }
+
+        if threadRef.provider != .codex,
+           let providerRuntimeStore,
+           let providerStatus = providerRuntimeStore.runStatus(for: threadRef) {
+            return ThreadCatalogEntry(
+                threadRef: threadRef,
+                hostName: threadRef.hostID.rawValue,
+                title: node.title,
+                preview: node.subtitle,
+                loadedStatus: providerStatus,
+                lastActivityAt: providerRuntimeStore.lastActivity(for: threadRef) ?? Date(),
+                unread: false,
+                materializedNodeID: node.id,
+                model: node.metadata.model,
+                reasoningEffort: node.metadata.reasoningEffort,
+                threadKind: node.metadata.threadKind ?? .thread
+            ).liveStateSummary
         }
 
         if let entry = threadCatalogStore.entry(for: threadRef) {
@@ -2520,12 +2618,21 @@ public struct GraphCanvasView: View {
         guard let threadRef = node.metadata.threadRef else {
             return false
         }
+        if threadRef.provider != .codex {
+            return providerRuntimeStore != nil && isLocalThread(threadRef)
+        }
         return isLocalThread(threadRef) || supervisorStore.hasRelay(for: threadRef.hostID)
     }
 
     private func canStopThread(_ node: CanvasNode) -> Bool {
         guard let threadRef = node.metadata.threadRef else {
             return false
+        }
+        if threadRef.provider != .codex {
+            return threadRef.provider == .grok
+                && providerRuntimeStore != nil
+                && isLocalThread(threadRef)
+                && isThreadActivelyRunning(threadRef)
         }
         return canControlThread(node) && isThreadActivelyRunning(threadRef)
     }
@@ -2563,7 +2670,12 @@ public struct GraphCanvasView: View {
 
         do {
             let turnID: String
-            if isLocalThread(threadRef) {
+            if threadRef.provider != .codex {
+                guard let providerRuntimeStore else {
+                    throw AgentProviderRuntimeError.unsupportedPlatform
+                }
+                turnID = try await providerRuntimeStore.interruptThread(threadRef)
+            } else if isLocalThread(threadRef) {
                 turnID = try await runtimeStore.interruptThread(threadRef)
             } else {
                 turnID = try await supervisorStore.interruptThread(threadRef)
@@ -2598,7 +2710,10 @@ public struct GraphCanvasView: View {
         }
 
         do {
-            if isLocalThread(threadRef) {
+            if threadRef.provider != .codex {
+                await deleteCanvasNode(node)
+                return
+            } else if isLocalThread(threadRef) {
                 try await runtimeStore.archiveThread(threadRef)
             } else {
                 try await supervisorStore.archiveThread(threadRef)
@@ -2617,22 +2732,47 @@ public struct GraphCanvasView: View {
 
         do {
             let forkedRef: ThreadRef
-            if isLocalThread(threadRef) {
+            if threadRef.provider != .codex {
+                guard let providerRuntimeStore else {
+                    throw AgentProviderRuntimeError.unsupportedPlatform
+                }
+                forkedRef = try await providerRuntimeStore.forkThread(
+                    threadRef,
+                    name: "\(node.title) fork"
+                )
+            } else if isLocalThread(threadRef) {
                 forkedRef = try await runtimeStore.forkThread(threadRef, model: node.metadata.model)
             } else {
                 forkedRef = try await supervisorStore.forkThread(threadRef, model: node.metadata.model)
             }
 
+            let storedModel = node.metadata.model?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let model: String
+            if let storedModel, !storedModel.isEmpty {
+                model = storedModel
+            } else {
+                model = fallbackModelID(for: threadRef.provider) ?? ""
+            }
             await graphStore.addThreadNode(
                 threadRef: forkedRef,
-                model: node.metadata.model ?? "gpt-5.5",
-                reasoningEffort: node.metadata.reasoningEffort ?? "high",
+                model: model,
+                reasoningEffort: node.metadata.reasoningEffort ?? "",
                 title: "\(node.title) fork",
                 anchorFolderID: anchorFolderID(for: forkedRef)
             )
         } catch {
             graphStore.errorMessage = error.localizedDescription
             transcriptSessions.setError(error.localizedDescription, for: .popover)
+        }
+    }
+
+    private func fallbackModelID(for provider: AgentProvider) -> String? {
+        switch provider {
+        case .codex:
+            return runtimeStore.defaultModel?.id
+        case .gemini, .grok:
+            guard let models = providerRuntimeStore?.models(for: provider) else { return nil }
+            return models.first(where: \.isDefault)?.id ?? models.first?.id
         }
     }
 
@@ -2842,6 +2982,9 @@ public struct GraphCanvasView: View {
     }
 
     private func isThreadActivelyRunning(_ threadRef: ThreadRef) -> Bool {
+        if threadRef.provider != .codex {
+            return providerRuntimeStore?.runningThreadKeys.contains(threadRef.qualifiedID) == true
+        }
         let state = isLocalThread(threadRef)
             ? runtimeStore.threadRuntimeStates[threadRef.qualifiedID]
             : supervisorStore.threadRuntimeStates[threadRef.qualifiedID]
@@ -2905,6 +3048,19 @@ public struct GraphCanvasView: View {
         )
     }
 
+    private func scheduleProviderLiveTranscriptRefresh(for threadRef: ThreadRef) {
+        Task { @MainActor in
+            for _ in 0..<40 {
+                guard !Task.isCancelled else { return }
+                if isThreadActivelyRunning(threadRef) {
+                    startLiveTranscriptRefreshIfNeeded(for: threadRef)
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
     private func cancelLiveTranscriptRefreshIfClosed(_ threadRef: ThreadRef) {
         guard !isThreadOpen(hostID: threadRef.hostID, threadID: threadRef.threadID) else { return }
         cancelLiveTranscriptRefresh(for: threadRef.qualifiedID)
@@ -2921,6 +3077,10 @@ public struct GraphCanvasView: View {
 
         do {
             let refreshedTranscript = try await loadTranscript(for: threadRef)
+            await adoptProviderGeneratedTitleIfNeeded(
+                from: refreshedTranscript,
+                for: threadRef
+            )
             if (transientThreadNode ?? selectedThreadNode)?.metadata.threadRef?.matches(hostID: threadRef.hostID, threadID: threadRef.threadID) == true {
                 transcriptSessions.merge(refreshedTranscript, into: .popover)
             }
@@ -2945,11 +3105,40 @@ public struct GraphCanvasView: View {
     }
 
     private func reconcileGraphRunStatus(for threadRef: ThreadRef) async {
+        if threadRef.provider != .codex {
+            guard let status = providerRuntimeStore?.runStatus(for: threadRef) else { return }
+            await graphStore.updateThreadRunStatus(for: threadRef, status: status)
+            return
+        }
         let state = isLocalThread(threadRef)
             ? runtimeStore.threadRuntimeStates[threadRef.qualifiedID]
             : supervisorStore.threadRuntimeStates[threadRef.qualifiedID]
         guard let state else { return }
         await graphStore.updateThreadRunStatus(for: threadRef, status: state.status)
+    }
+
+    private func renameThreadNode(nodeID: NodeID, title: String) async {
+        let threadRef = graphStore.graph.nodes[nodeID]?.metadata.threadRef
+        await graphStore.updateNodeTitle(id: nodeID, title: title)
+        if let threadRef, threadRef.provider != .codex {
+            await providerRuntimeStore?.keepMapofAgentsTitle(for: threadRef)
+        }
+    }
+
+    private func adoptProviderGeneratedTitleIfNeeded(
+        from transcript: ThreadTranscript,
+        for threadRef: ThreadRef
+    ) async {
+        guard threadRef.provider != .codex,
+              transcript.providerMetadata?.prefersGeneratedTitle == true,
+              let title = transcript.providerMetadata?.generatedTitle?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty,
+              let node = sourceNode(for: threadRef) else {
+            return
+        }
+        await graphStore.synchronizeNodeTitle(id: node.id, title: title)
+        await providerRuntimeStore?.keepMapofAgentsTitle(for: threadRef)
     }
 
     private func removeLocalMessage(id: String, threadRef: ThreadRef, nodeID: NodeID? = nil) {
@@ -2995,7 +3184,11 @@ public struct GraphCanvasView: View {
             defaultHostID: runtimeStore.localHost.id
         )
         threadCatalogStore.applyWorkflowMemberships(effectiveWorkflowMemberships)
-        threadCatalogStore.apply(attentionRequests: runtimeStore.pendingAttentionRequests + supervisorStore.pendingAttentionRequests)
+        threadCatalogStore.apply(
+            attentionRequests: runtimeStore.pendingAttentionRequests
+                + supervisorStore.pendingAttentionRequests
+                + (providerRuntimeStore?.pendingAttentionRequests ?? [])
+        )
         reconcileOpenThreadsAsRead()
     }
 
@@ -3227,7 +3420,12 @@ public struct GraphCanvasView: View {
 
             let encodedHost = Self.percentEncoded(threadRef.hostID.rawValue).lowercased()
             let encodedThreadID = Self.percentEncoded(threadRef.threadID).lowercased()
-            let mentionURL = "codex-thread://\(encodedHost)/\(encodedThreadID)"
+            let mentionURL: String
+            if threadRef.provider == .codex {
+                mentionURL = "codex-thread://\(encodedHost)/\(encodedThreadID)"
+            } else {
+                mentionURL = "agent-thread://\(threadRef.provider.rawValue)/\(encodedHost)/\(encodedThreadID)"
+            }
             guard lowercasedText.contains(mentionURL) else { return nil }
 
             seenThreadKeys.insert(threadRef.qualifiedID)
@@ -3284,15 +3482,20 @@ public struct GraphCanvasView: View {
 
         let contextLines = mentions.map { mention in
             let reachability = mention.threadRef.hostID == sourceThreadRef.hostID ? "same host" : "different host"
-            return "- title=\(Self.redactedContextLabel(mention.title)); reachability=\(reachability); hostID=\(Self.contextValue(mention.threadRef.hostID.rawValue)); threadID=\(Self.contextValue(mention.threadRef.threadID)); model=\(Self.contextValue(mention.model ?? "unknown")); reasoning=\(Self.contextValue(mention.reasoningEffort ?? "unknown")); cwd=redacted"
+            return "- title=\(Self.redactedContextLabel(mention.title)); provider=\(Self.contextValue(mention.threadRef.provider.rawValue)); reachability=\(reachability); hostID=\(Self.contextValue(mention.threadRef.hostID.rawValue)); threadID=\(Self.contextValue(mention.threadRef.threadID)); model=\(Self.contextValue(mention.model ?? "unknown")); reasoning=\(Self.contextValue(mention.reasoningEffort ?? "unknown")); cwd=redacted"
         }
         let folderContextLines = folderMentions.map { mention in
             let reachability = mention.hostID == sourceThreadRef.hostID ? "same host" : "different host"
             return "- title=\(Self.redactedContextLabel(mention.title)); reachability=\(reachability); folderNodeID=\(Self.contextValue(mention.nodeID.rawValue)); hostID=\(Self.contextValue(mention.hostID.rawValue)); machine=\(Self.redactedContextLabel(mention.machineTitle ?? "unknown")); platform=\(Self.contextValue(mention.platform.rawValue)); folderPath=redacted"
         }
-        var targetHostIDs = Set(mentions.map(\.threadRef.hostID))
-        targetHostIDs.formUnion(folderMentions.map(\.hostID))
-        let routeLines = workflowRouteContextLines(for: targetHostIDs, sourceThreadRef: sourceThreadRef)
+        let threadRouteLines = mentions.map {
+            workflowThreadRouteContextLine(for: $0, sourceThreadRef: sourceThreadRef)
+        }
+        let folderRouteLines = workflowRouteContextLines(
+            for: Set(folderMentions.map(\.hostID)),
+            sourceThreadRef: sourceThreadRef
+        )
+        let routeLines = threadRouteLines + folderRouteLines
 
         return """
         \(text)
@@ -3306,15 +3509,49 @@ public struct GraphCanvasView: View {
         Workflow route map:
         \(routeLines.joined(separator: "\n"))
 
-        You are running as hostID=\(Self.contextValue(sourceThreadRef.hostID.rawValue)). Only use these references because the user inserted explicit workflow mention tokens. Ask before using paths, endpoints, SSH details, or identity files; those values are intentionally not included here.
+        Provider relay usage:
+        - When a route is `mapofagents provider relay`, send only the intended target message on stdin to `relayExecutable` and pass the exact route fields as `--source-provider`, `--source-host`, `--source-thread`, `--target-provider`, `--target-host`, and `--target-thread`.
+        - The relay validates both thread nodes against the active map, starts the target provider turn, and prints a JSON result. For Gemini and Grok, a successful result includes the target assistant's reply when available.
+        - Treat `success=true` as delivered. On failure or an unknown outcome, report it and do not retry automatically because provider turns are not idempotent.
+        - Do not use the Codex App Server to load a Gemini or Grok thread, and do not ask for its cwd; MapofAgents owns that provider session state.
+
+        You are running as provider=\(Self.contextValue(sourceThreadRef.provider.rawValue)); hostID=\(Self.contextValue(sourceThreadRef.hostID.rawValue)); threadID=\(Self.contextValue(sourceThreadRef.threadID)). Only use these references because the user inserted explicit workflow mention tokens. Ask before using paths, endpoints, SSH details, or identity files; those values are intentionally not included here.
         """
     }
 
-    private func workflowRouteContextLines(
-        for mentions: [WorkflowThreadMentionContext],
+    private func workflowMentionDeliveryState(
+        source: ThreadRef,
+        target: ThreadRef
+    ) -> MessageRouteDeliveryState {
+        source.provider == .codex && target.provider == .codex ? .delivered : .pending
+    }
+
+    private func workflowThreadRouteContextLine(
+        for mention: WorkflowThreadMentionContext,
         sourceThreadRef: ThreadRef
-    ) -> [String] {
-        workflowRouteContextLines(for: Set(mentions.map(\.threadRef.hostID)), sourceThreadRef: sourceThreadRef)
+    ) -> String {
+        let target = mention.threadRef
+        if sourceThreadRef.provider == .codex, target.provider == .codex {
+            return workflowRouteContextLine(
+                for: target.hostID,
+                sourceHostID: sourceThreadRef.hostID
+            ) + "; sourceProvider=\(Self.contextValue(sourceThreadRef.provider.rawValue)); targetProvider=\(Self.contextValue(target.provider.rawValue)); targetThreadID=\(Self.contextValue(target.threadID))"
+        }
+
+        let sourceIsLocal = sourceThreadRef.hostID == runtimeStore.localHost.id
+        let targetIsReachable = target.hostID == runtimeStore.localHost.id
+            || (target.provider == .codex && supervisorStore.hasRelay(for: target.hostID))
+        let canUseRelay = providerRuntimeStore != nil && sourceIsLocal && targetIsReachable
+        guard canUseRelay else {
+            let note = sourceIsLocal
+                ? "The target provider is not reachable by the local MapofAgents relay."
+                : "The provider relay is local to the MapofAgents Mac and cannot be invoked from the current source host."
+            return "- sourceProvider=\(Self.contextValue(sourceThreadRef.provider.rawValue)); sourceHostID=\(Self.contextValue(sourceThreadRef.hostID.rawValue)); sourceThreadID=\(Self.contextValue(sourceThreadRef.threadID)); targetProvider=\(Self.contextValue(target.provider.rawValue)); targetHostID=\(Self.contextValue(target.hostID.rawValue)); targetThreadID=\(Self.contextValue(target.threadID)); route=none; currentSourceCanUse=false; note=\(Self.contextValue(note))"
+        }
+
+        let helperPath = WorkflowMessageFileRelay.defaultHelperExecutableURL.path
+        let waitsForReply = target.provider == .codex ? "false" : "true"
+        return "- sourceProvider=\(Self.contextValue(sourceThreadRef.provider.rawValue)); sourceHostID=\(Self.contextValue(sourceThreadRef.hostID.rawValue)); sourceThreadID=\(Self.contextValue(sourceThreadRef.threadID)); targetProvider=\(Self.contextValue(target.provider.rawValue)); targetHostID=\(Self.contextValue(target.hostID.rawValue)); targetThreadID=\(Self.contextValue(target.threadID)); route=mapofagents provider relay; relayExecutable=\(Self.contextValue(helperPath)); messageInput=stdin; waitsForProviderReply=\(waitsForReply); currentSourceCanUse=true; note=\(Self.contextValue("Invoke the relay executable with these exact source and target fields. It validates both nodes against the active map and returns JSON."))"
     }
 
     private func workflowRouteContextLines(

@@ -6,13 +6,13 @@ import Observation
 @MainActor
 @Observable
 final class ThreadCreationCoordinator {
-    var remoteModelsByHostID: [HostID: [CodexModelOption]] = [:]
+    var remoteModelsByHostID: [HostID: [AgentModelOption]] = [:]
     var remoteMentionCandidatesByContext: [String: [MentionCandidate]] = [:]
     var catalogRevision = 0
     var errorMessage: String?
     private var pendingCreateKeys: Set<String> = []
 
-    func modelOptions(for target: CanvasNode?, localHostID: HostID) -> [CodexModelOption]? {
+    func modelOptions(for target: CanvasNode?, localHostID: HostID) -> [AgentModelOption]? {
         guard let hostID = remoteHostID(for: target, localHostID: localHostID) else {
             return nil
         }
@@ -75,6 +75,7 @@ final class ThreadCreationCoordinator {
         _ request: NewThreadRequest,
         graphStore: GraphStore,
         runtimeStore: CodexRuntimeStore,
+        providerRuntimeStore: AgentProviderRuntimeStore?,
         supervisorStore: WorkflowSupervisorStore,
         allowsLocalRuntime: Bool,
         localDefaultDirectory: String,
@@ -90,12 +91,20 @@ final class ThreadCreationCoordinator {
             return false
         }
 
-        if targetContext.hostID == runtimeStore.localHost.id && !allowsLocalRuntime {
+        if request.provider != .codex,
+           targetContext.hostID != runtimeStore.localHost.id {
+            errorMessage = "\(request.provider.displayName) threads currently run on this Mac. Select a local machine or project."
+            return false
+        }
+
+        if request.provider == .codex,
+           targetContext.hostID == runtimeStore.localHost.id && !allowsLocalRuntime {
             errorMessage = localRuntimeUnavailableMessage
             return false
         }
 
-        if targetContext.hostID != runtimeStore.localHost.id,
+        if request.provider == .codex,
+           targetContext.hostID != runtimeStore.localHost.id,
            !supervisorStore.hasRelay(for: targetContext.hostID) {
             errorMessage = "Connect this folder's machine before creating a thread."
             return false
@@ -114,24 +123,40 @@ final class ThreadCreationCoordinator {
         do {
             let creationOutcome: ThreadCreationOutcome
             let trimmedInitialPrompt = request.initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            if targetContext.hostID == runtimeStore.localHost.id {
-                creationOutcome = try await runtimeStore.createThread(
+            switch request.provider {
+            case .codex:
+                if targetContext.hostID == runtimeStore.localHost.id {
+                    creationOutcome = try await runtimeStore.createThread(
+                        cwd: targetContext.cwd,
+                        name: request.name,
+                        model: request.modelID,
+                        reasoningEffort: request.reasoningEffort,
+                        permissions: request.permissions,
+                        initialPrompt: ""
+                    )
+                } else {
+                    creationOutcome = try await supervisorStore.createThread(
+                        on: targetContext.hostID,
+                        cwd: targetContext.cwd,
+                        name: request.name,
+                        model: request.modelID,
+                        reasoningEffort: request.reasoningEffort,
+                        permissions: request.permissions,
+                        initialPrompt: ""
+                    )
+                }
+            case .gemini, .grok:
+                guard let providerRuntimeStore else {
+                    throw AgentProviderRuntimeError.unsupportedPlatform
+                }
+                creationOutcome = try await providerRuntimeStore.createThread(
+                    provider: request.provider,
+                    hostID: targetContext.hostID,
                     cwd: targetContext.cwd,
                     name: request.name,
-                    model: request.model,
+                    model: request.modelID,
                     reasoningEffort: request.reasoningEffort,
-                    permissions: request.permissions,
-                    initialPrompt: ""
-                )
-            } else {
-                creationOutcome = try await supervisorStore.createThread(
-                    on: targetContext.hostID,
-                    cwd: targetContext.cwd,
-                    name: request.name,
-                    model: request.model,
-                    reasoningEffort: request.reasoningEffort,
-                    permissions: request.permissions,
-                    initialPrompt: ""
+                    adoptProviderGeneratedTitle: request.adoptProviderGeneratedTitle
                 )
             }
             let threadRef = creationOutcome.threadRef
@@ -139,7 +164,7 @@ final class ThreadCreationCoordinator {
 
             await graphStore.addThreadNode(
                 threadRef: threadRef,
-                model: request.model,
+                model: request.modelID,
                 reasoningEffort: request.reasoningEffort,
                 title: threadRef.name ?? request.name,
                 anchorFolderID: targetContext.anchorFolderID,
@@ -149,11 +174,21 @@ final class ThreadCreationCoordinator {
 
             if !trimmedInitialPrompt.isEmpty {
                 do {
-                    if targetContext.hostID == runtimeStore.localHost.id {
+                    if request.provider != .codex {
+                        guard let providerRuntimeStore else {
+                            throw AgentProviderRuntimeError.unsupportedPlatform
+                        }
+                        try await providerRuntimeStore.sendMessage(
+                            trimmedInitialPrompt,
+                            to: threadRef,
+                            model: request.modelID,
+                            reasoningEffort: request.reasoningEffort
+                        )
+                    } else if targetContext.hostID == runtimeStore.localHost.id {
                         try await runtimeStore.sendMessage(
                             trimmedInitialPrompt,
                             to: threadRef,
-                            model: request.model,
+                            model: request.modelID,
                             reasoningEffort: request.reasoningEffort,
                             permissions: request.permissions
                         )
@@ -161,7 +196,7 @@ final class ThreadCreationCoordinator {
                         try await supervisorStore.sendMessage(
                             trimmedInitialPrompt,
                             to: threadRef,
-                            model: request.model,
+                            model: request.modelID,
                             reasoningEffort: request.reasoningEffort,
                             permissions: request.permissions
                         )
@@ -294,14 +329,16 @@ final class ThreadCreationCoordinator {
     private func pendingCreateKey(for request: NewThreadRequest, context: ThreadTargetContext) -> String {
         [
             request.targetKind.rawValue,
+            request.provider.rawValue,
             context.hostID.rawValue,
             context.cwd,
             request.name.trimmingCharacters(in: .whitespacesAndNewlines),
-            request.model,
+            request.modelID,
             request.reasoningEffort,
             request.permissions.approvalPolicy.rawValue,
             request.permissions.sandboxMode.rawValue,
             request.initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
+            request.adoptProviderGeneratedTitle ? "provider-title" : "map-title",
         ].joined(separator: "\u{1F}")
     }
 }

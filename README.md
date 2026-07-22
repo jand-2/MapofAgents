@@ -1,11 +1,14 @@
 # MapofAgents
 
-MapofAgents is a native SwiftUI control room for Codex App Server. It shows
-machines, folders, and Codex threads on a canvas so you can create threads, read
-thread history, send messages, and sketch workflow relationships between them.
+MapofAgents is a native SwiftUI control room for Codex, Gemini through the
+official Antigravity CLI, and Grok through the official Grok Build CLI. It shows
+machines, folders, and provider-owned threads on a canvas so you can create
+threads, read thread history, send messages, and sketch workflow relationships
+between them.
 
-Codex App Server remains the runtime boundary. It owns authentication, model
-configuration, approvals, tools, command execution, and thread history.
+Each provider's official runtime remains its execution and authentication
+boundary: Codex App Server for Codex, `agy` for Gemini, and `grok` for Grok.
+MapofAgents coordinates those runtimes without reading their login credentials.
 MapofAgents stores visual control-room metadata such as node positions, manual
 connections, and non-secret endpoint descriptors.
 
@@ -28,6 +31,9 @@ Codex App Server endpoints; it does not run Codex locally on the phone.
 - macOS 14 or newer for the desktop app.
 - Swift 6 toolchain, usually from Xcode 16 or newer.
 - The Codex CLI with `codex app-server` available on `PATH` for runtime use.
+- Optional: the Antigravity CLI (`agy`) for Gemini threads and the Grok Build
+  CLI (`grok`) for Grok threads. The new-thread panel can launch each official
+  installer and sign-in flow.
 - Full Xcode for iOS builds.
 - XcodeGen only when regenerating `mapofagents.xcodeproj` from `project.yml`.
 - Tailscale on the Mac and iPhone, signed in to the same tailnet, when using
@@ -76,6 +82,33 @@ case MapofAgents falls back to the stdio listener.
 
 For Codex desktop run actions, keep local `.codex/` files out of git and use the
 sample in `examples/codex-environment.toml` as a starting point.
+
+## Model Providers
+
+The macOS new-thread panel offers Codex, Gemini, and Grok for local projects.
+Remote machines and the iOS companion remain Codex-only until the relay
+protocol can advertise provider capabilities. A thread's provider is persisted
+when the thread is created and cannot be changed afterward. Canvas nodes use a
+provider color and an explicit Codex, Gemini, or Grok badge.
+
+MapofAgents never embeds model identifiers. It reads the current catalog from
+`model/list`, `agy models`, or the `grok agent stdio` ACP handshake, and disables
+creation when the selected provider has no live catalog. Authentication remains
+inside each first-party runtime: Codex owns its App Server login, `agy` opens
+Google sign-in, and `grok login` opens Grok sign-in. MapofAgents does not read or
+copy their tokens.
+
+Grok threads use the CLI's ACP session IDs. ACP streams assistant, reasoning,
+tool, and permission events into the transcript; permission requests stay
+interactive and default to one-time allow or deny decisions. MapofAgents never
+enables Grok's always-approve mode. The current Grok ACP handshake does not
+advertise a fork operation, so the first turn on a fork uses the documented
+`--fork-session` headless path with `dontAsk` permissions, then returns to ACP.
+Antigravity print mode does not currently return a machine-readable ID for a
+newly created conversation, so MapofAgents persists that thread's transcript
+under Application Support and supplies its recent context to later `agy
+--print` turns. This avoids guessing which workspace conversation `--continue`
+would select.
 
 ## iOS Companion
 

@@ -36,6 +36,19 @@ struct NodeView: View {
                             .lineLimit(1)
                             .layoutPriority(1)
 
+                        if node.kind == .codexThread {
+                            Text(threadProvider.displayName)
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(providerColor)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(providerColor.opacity(0.12), in: Capsule())
+                                .help("Provider: \(threadProvider.displayName)")
+                                .accessibilityLabel("Provider \(threadProvider.displayName)")
+                        }
+
                         if node.kind == .codexThread && threadKind == .subagent {
                             Text("agent")
                                 .font(.caption2.weight(.bold))
@@ -133,7 +146,7 @@ struct NodeView: View {
 
                 Spacer(minLength: 0)
 
-                if let model = node.metadata.model {
+                if let model = node.metadata.model, !model.isEmpty {
                     Text(model)
                         .font(.caption2.weight(.medium))
                         .lineLimit(1)
@@ -143,7 +156,7 @@ struct NodeView: View {
                         .background(.quaternary, in: Capsule())
                 }
 
-                if let effort = node.metadata.reasoningEffort {
+                if let effort = node.metadata.reasoningEffort, !effort.isEmpty {
                     Text(effort)
                         .font(.caption2.weight(.medium))
                         .lineLimit(1)
@@ -187,7 +200,9 @@ struct NodeView: View {
         case .folder:
             return "Project folder"
         case .codexThread:
-            return threadKind == .subagent ? "Subagent thread" : "Codex thread"
+            return threadKind == .subagent
+                ? "\(threadProvider.displayName) subagent thread"
+                : "\(threadProvider.displayName) thread"
         }
     }
 
@@ -302,7 +317,7 @@ struct NodeView: View {
         case .folder:
             return .yellow
         case .codexThread:
-            return threadKind == .subagent ? .purple : .blue
+            return providerColor
         }
     }
 
@@ -325,7 +340,22 @@ struct NodeView: View {
         case .folder:
             return .yellow.opacity(0.82)
         case .codexThread:
-            return (threadKind == .subagent ? Color.purple : Color.blue).opacity(0.78)
+            return providerColor.opacity(0.78)
+        }
+    }
+
+    private var threadProvider: AgentProvider {
+        node.metadata.threadRef?.provider ?? .codex
+    }
+
+    private var providerColor: Color {
+        switch threadProvider {
+        case .codex:
+            return .blue
+        case .gemini:
+            return .purple
+        case .grok:
+            return .orange
         }
     }
 

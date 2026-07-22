@@ -931,6 +931,7 @@ public struct ThreadCatalogEntry: Codable, Identifiable, Hashable, Sendable {
 public enum ThreadTurnItemKind: String, Codable, CaseIterable, Sendable {
     case userMessage
     case assistantMessage
+    case progress
     case reasoning
     case tool
     case artifact
@@ -1036,7 +1037,9 @@ public struct ThreadTurnTimeline: Codable, Hashable, Sendable {
                 usedMessageIDs.insert(message.id)
                 return ThreadTurnItem(
                     id: item.effectiveAttachments.isEmpty ? message.id : item.id,
-                    kind: item.effectiveAttachments.isEmpty ? ThreadTurnItemKind(message) : item.kind,
+                    kind: item.effectiveAttachments.isEmpty
+                        ? (item.kind == .progress ? .progress : ThreadTurnItemKind(message))
+                        : item.kind,
                     message: message,
                     attachments: item.effectiveAttachments
                 )
@@ -1315,12 +1318,14 @@ public struct ThreadTurnTimeline: Codable, Hashable, Sendable {
             return 0
         case .reasoning:
             return 1
-        case .tool, .artifact, .imageArtifact, .fileArtifact, .diffArtifact:
+        case .progress:
             return 2
-        case .assistantMessage:
+        case .tool, .artifact, .imageArtifact, .fileArtifact, .diffArtifact:
             return 3
-        case .system:
+        case .assistantMessage:
             return 4
+        case .system:
+            return 5
         }
     }
 

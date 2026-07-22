@@ -428,7 +428,11 @@ final class TranscriptSessionStore {
 
     private func waitForLiveRefreshPassToFinish(threadKey: String) async {
         while activeLiveRefreshPasses.contains(threadKey), !Task.isCancelled {
-            await Task.yield()
+            do {
+                try await Task.sleep(for: .milliseconds(20))
+            } catch {
+                return
+            }
         }
     }
 
