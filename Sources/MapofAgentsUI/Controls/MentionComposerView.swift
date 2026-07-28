@@ -2,6 +2,27 @@ import MapofAgentsCore
 import Foundation
 import SwiftUI
 
+enum MentionComposerReturnAction: Equatable {
+    case insertSelectedMention
+    case submit
+    case insertNewline
+}
+
+enum MentionComposerKeyboardPolicy {
+    static func returnAction(
+        shiftPressed: Bool,
+        hasActiveMentionSuggestions: Bool
+    ) -> MentionComposerReturnAction {
+        if shiftPressed {
+            return .insertNewline
+        }
+        if hasActiveMentionSuggestions {
+            return .insertSelectedMention
+        }
+        return .submit
+    }
+}
+
 struct MentionComposerView: View {
     @Binding var text: String
     @Bindable var runtimeStore: CodexRuntimeStore
@@ -18,6 +39,7 @@ struct MentionComposerView: View {
     @State private var catalogCandidates: [MentionCandidate] = []
     @State private var selectedMentionIndex = 0
     @FocusState private var isEditorFocused: Bool
+    @AccessibilityFocusState private var isEditorAccessibilityFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -37,6 +59,8 @@ struct MentionComposerView: View {
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $text)
                     .focused($isEditorFocused)
+                    .accessibilityFocused($isEditorAccessibilityFocused)
+                    .accessibilityLabel(placeholder)
                     .font(.body)
                     .scrollContentBackground(.hidden)
                     .padding(.horizontal, 6)
@@ -67,17 +91,33 @@ struct MentionComposerView: View {
                             selectedMentionIndex = (selectedMentionIndex - 1 + candidates.count) % candidates.count
                             return .handled
                         }
-                        if keyPress.key == .return, !keyPress.modifiers.contains(.shift) {
+                        if keyPress.key == .return,
+                           MentionComposerKeyboardPolicy.returnAction(
+                               shiftPressed: keyPress.modifiers.contains(.shift),
+                               hasActiveMentionSuggestions: true
+                           ) == .insertSelectedMention {
                             insert(candidates[min(selectedMentionIndex, candidates.count - 1)])
                             return .handled
                         }
                     }
                 }
-                guard keyPress.key == .return, !keyPress.modifiers.contains(.shift) else {
+
+                guard keyPress.key == .return else {
                     return .ignored
                 }
-                onSubmit()
-                return .handled
+
+                switch MentionComposerKeyboardPolicy.returnAction(
+                    shiftPressed: keyPress.modifiers.contains(.shift),
+                    hasActiveMentionSuggestions: false
+                ) {
+                case .insertSelectedMention:
+                    return .ignored
+                case .submit:
+                    onSubmit()
+                    return .handled
+                case .insertNewline:
+                    return .ignored
+                }
             }
             .animation(.snappy(duration: 0.16), value: composerHeight)
         }
@@ -92,6 +132,7 @@ struct MentionComposerView: View {
             Task { @MainActor in
                 await Task.yield()
                 isEditorFocused = true
+                isEditorAccessibilityFocused = true
             }
         }
     }

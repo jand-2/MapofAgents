@@ -1,0 +1,219 @@
+{
+  "layoutCoordinateSpace" : "center",
+  "manualEdges" : {
+    "edge-example" : {
+      "id" : "edge-example",
+      "isManual" : true,
+      "kind" : "manualNote",
+      "label" : "Compare providers",
+      "source" : "thread-example",
+      "target" : "thread-codex-example"
+    }
+  },
+  "messageRoutes" : {
+    "route-1" : {
+      "deliveryState" : "delivered",
+      "eventIDs" : [
+        "event-1"
+      ],
+      "id" : "route-1",
+      "snippet" : "Example handoff",
+      "sourceHostID" : "example-host",
+      "sourceThreadID" : "thread-17",
+      "targetHostID" : "example-host",
+      "targetThreadID" : "thread-18",
+      "timestamp" : "2026-06-02T00:01:00.000Z"
+    }
+  },
+  "nodes" : {
+    "machine-example" : {
+      "id" : "machine-example",
+      "kind" : "machine",
+      "metadata" : {
+        "appServerEndpointUrl" : "wss://example-host.local/app-server",
+        "codexHome" : "C:\\Users\\example\\.codex",
+        "hostID" : "example-host",
+        "hostLastError" : "Example transient connection error",
+        "hostStatus" : "unavailable",
+        "platform" : "windows"
+      },
+      "position" : {
+        "x" : 80.25,
+        "y" : 64.5
+      },
+      "size" : {
+        "height" : 90,
+        "width" : 190
+      },
+      "subtitle" : "Unavailable",
+      "title" : "Example host",
+      "zIndex" : 0
+    },
+    "thread-codex-example" : {
+      "id" : "thread-codex-example",
+      "kind" : "codexThread",
+      "metadata" : {
+        "hostID" : "example-host",
+        "hostStatus" : "connected",
+        "platform" : "windows",
+        "runStatus" : "idle",
+        "threadKind" : "thread",
+        "threadPermissions" : {
+          "approvalPolicy" : "on-request",
+          "sandboxMode" : "workspace-write"
+        },
+        "threadRef" : {
+          "cwd" : "C:\\Users\\example\\project",
+          "hostID" : "example-host",
+          "name" : "Codex example",
+          "provider" : "codex",
+          "threadID" : "thread-17"
+        }
+      },
+      "position" : {
+        "x" : 500,
+        "y" : 180
+      },
+      "size" : {
+        "height" : 132,
+        "width" : 200
+      },
+      "subtitle" : "Ready",
+      "title" : "Same runtime ID, different provider",
+      "zIndex" : 2
+    },
+    "thread-example" : {
+      "id" : "thread-example",
+      "kind" : "codexThread",
+      "metadata" : {
+        "hasManualPosition" : true,
+        "hostID" : "example-host",
+        "hostStatus" : "connected",
+        "initialPrompt" : "Hello",
+        "isArchived" : false,
+        "isUnread" : false,
+        "localTranscript" : [
+          {
+            "createdAt" : "2026-06-02T00:00:00.125Z",
+            "id" : "message-1",
+            "role" : "user",
+            "text" : "Hello"
+          },
+          {
+            "createdAt" : "2026-06-02T00:00:30.000Z",
+            "id" : "attachment-1",
+            "role" : "file",
+            "text" : "File artifact: example.txt"
+          }
+        ],
+        "localTranscriptTurns" : [
+          {
+            "completedAt" : "2026-06-02T00:00:30.000Z",
+            "durationMilliseconds" : 30000,
+            "id" : "turn-1",
+            "itemMessageIds" : [
+              "message-1",
+              "attachment-1"
+            ],
+            "itemsView" : "full",
+            "startedAt" : "2026-06-02T00:00:00.000Z",
+            "status" : "complete"
+          }
+        ],
+        "model" : "example-model",
+        "platform" : "windows",
+        "reasoningEffort" : "medium",
+        "runStatus" : "idle",
+        "threadKind" : "thread",
+        "threadPermissions" : {
+          "approvalPolicy" : "on-request",
+          "sandboxMode" : "workspace-write"
+        },
+        "threadRef" : {
+          "cwd" : "C:\\Users\\example\\project",
+          "hostID" : "example-host",
+          "name" : "Example thread",
+          "provider" : "gemini",
+          "threadID" : "thread-17"
+        }
+      },
+      "position" : {
+        "x" : 240.5,
+        "y" : 180
+      },
+      "size" : {
+        "height" : 132,
+        "width" : 200
+      },
+      "subtitle" : "Ready",
+      "title" : "Example thread",
+      "zIndex" : 1
+    }
+  },
+  "pendingAttentionRequests" : [
+    {
+      "createdAt" : "2026-06-02T00:00:15.000Z",
+      "hostID" : "example-host",
+      "id" : "attention-1",
+      "method" : "item/commandExecution/requestApproval",
+      "prompt" : "Approve example command",
+      "requestID" : "approval-1",
+      "responseChoices" : [
+        {
+          "label" : "Approve",
+          "value" : "accept"
+        },
+        {
+          "label" : "Decline",
+          "value" : "decline"
+        }
+      ],
+      "summary" : "Approve example command",
+      "threadID" : "thread-17",
+      "turnID" : "turn-1"
+    },
+    {
+      "createdAt" : "2026-06-02T00:00:16.500Z",
+      "hostID" : "example-host",
+      "id" : "attention-2",
+      "method" : "item/tool/requestUserInput",
+      "prompt" : "Choose a safe mode",
+      "requestID" : 17,
+      "responseChoices" : [
+        {
+          "label" : "Workspace write",
+          "value" : "workspace-write"
+        },
+        {
+          "label" : "Read only",
+          "value" : "read-only"
+        }
+      ],
+      "summary" : "Choose a safe mode",
+      "threadID" : "thread-17",
+      "turnID" : "turn-1"
+    }
+  ],
+  "runtimeDiagnostics" : [
+    {
+      "detail" : "Ready",
+      "evidence" : "Fixture",
+      "id" : "runtime",
+      "status" : "passed",
+      "title" : "Runtime"
+    }
+  ],
+  "suppressedAutoMaterializedThreadIDs" : [
+
+  ],
+  "title" : "Cross-platform example",
+  "updatedAt" : "2026-06-02T00:02:00.125Z",
+  "viewport" : {
+    "offset" : {
+      "x" : 0,
+      "y" : 0
+    },
+    "scale" : 1
+  },
+  "workspaceID" : "workflow-example"
+}

@@ -260,7 +260,10 @@ public actor CodexAppServerClient {
         #endif
     }
 
-    public func request(_ call: AppServerCall) async throws -> JSONValue {
+    public func request(
+        _ call: AppServerCall,
+        timeoutOverride: Duration? = nil
+    ) async throws -> JSONValue {
         try start()
         #if os(macOS)
         guard let connectionID else { throw CodexAppServerError.disconnected }
@@ -271,7 +274,8 @@ public actor CodexAppServerClient {
             return try await session.request(
                 call,
                 connectionID: connectionID,
-                timeoutContext: timeoutContext
+                timeoutContext: timeoutContext,
+                timeoutOverride: timeoutOverride
             ) { [weak self] message, expectedConnectionID in
                 guard let self else { throw CodexAppServerError.disconnected }
                 try await self.sendSessionMessage(message, connectionID: expectedConnectionID)
@@ -722,8 +726,16 @@ public actor CodexAppServerClient {
         return Data(bytes).base64EncodedString()
     }
 
-    private func handleLine(_ data: Data, connectionID: AppServerConnectionID) async {
-        switch await session.receive(data, connectionID: connectionID) {
+    private func handleLine(
+        _ data: Data,
+        connectionID: AppServerConnectionID,
+        allowsUnownedTestConnection: Bool = false
+    ) async {
+        let inboundEvent = await session.receive(data, connectionID: connectionID)
+        guard allowsUnownedTestConnection || self.connectionID == connectionID else {
+            return
+        }
+        switch inboundEvent {
         case .notification(let notification):
             notificationHandler?(notification)
         case .diagnostic(let diagnostic):
@@ -735,7 +747,11 @@ public actor CodexAppServerClient {
 
     func ingestTestLine(_ data: Data) async {
         let connectionID = self.connectionID ?? AppServerConnectionID()
-        await handleLine(data, connectionID: connectionID)
+        await handleLine(
+            data,
+            connectionID: connectionID,
+            allowsUnownedTestConnection: true
+        )
     }
 
     private static func stderrDiagnostic(from data: Data) -> String {

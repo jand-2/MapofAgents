@@ -60,6 +60,7 @@ public final class WorkflowSupervisorStore {
     private let supervisor: WorkflowSupervisor
     private var relays: [HostID: AppServerWebSocketWorkflowRelay] = [:]
     private var relayGenerations: [HostID: UUID] = [:]
+    private var relayConnectionIDs: [HostID: AppServerConnectionID] = [:]
     private var remoteTunnels: [HostID: CodexRemoteTunnel] = [:]
     private var activeRelayEndpointsByHostID: [HostID: AppServerRelayEndpoint] = [:]
     private var codexRemoteRecoveryFailures: [HostID: Int] = [:]
@@ -67,6 +68,7 @@ public final class WorkflowSupervisorStore {
     @ObservationIgnored nonisolated(unsafe) private var snapshotTask: Task<Void, Never>?
     private var localHostID = HostID(rawValue: "local")
     private var workflowThreadRefs: [ThreadRef] = []
+    private var reconnectingRuntimeStateIDs: Set<String> = []
     private var hasAttemptedTailnetDiscovery = false
     private var hasAttemptedCodexRemoteDiscovery = false
     private let hostRegistry: HostRegistry
@@ -1066,6 +1068,8 @@ public final class WorkflowSupervisorStore {
 
         await hostRegistry.record(id: relayEndpoint.id, name: relayEndpoint.name, endpointURL: relayEndpoint.url)
 
+        markHostRuntimeStatesReconciling(hostID: relayEndpoint.id)
+        relayConnectionIDs[relayEndpoint.id] = nil
         if let existingRelay = relays[relayEndpoint.id] {
             await existingRelay.stop(markDisconnected: false)
         }
@@ -1091,22 +1095,37 @@ public final class WorkflowSupervisorStore {
                     self?.removeAttentionRequest(hostID: hostID, requestID: requestID)
                 }
             },
+            onConnected: { [weak self] hostID, connectionID in
+                await MainActor.run {
+                    guard self?.relayGenerations[hostID] == relayGeneration else { return }
+                    self?.recordRelayConnectionReady(
+                        hostID: hostID,
+                        connectionID: connectionID
+                    )
+                }
+            },
             onNotification: { [weak self] hostID, notification in
-                Task { @MainActor in
+                await MainActor.run {
                     guard self?.relayGenerations[hostID] == relayGeneration else { return }
                     self?.handleRemoteNotification(notification, hostID: hostID)
                 }
             },
             onDisconnected: { [weak self] hostID in
-                Task { @MainActor in
-                    guard self?.relayGenerations[hostID] == relayGeneration else { return }
-                    await self?.handleRelayDisconnected(hostID: hostID)
-                }
+                await self?.handleRelayDisconnected(
+                    hostID: hostID,
+                    expectedRelayGeneration: relayGeneration
+                )
             },
             onWriteReconciled: { [weak self] reconciliation in
                 Task { @MainActor in
                     guard self?.relayGenerations[reconciliation.hostID] == relayGeneration else { return }
                     self?.applyWriteReconciliation(reconciliation)
+                }
+            },
+            onReconnectReconciled: { [weak self] reconciliation in
+                await MainActor.run {
+                    guard self?.relayGenerations[reconciliation.hostID] == relayGeneration else { return }
+                    self?.applyReconnectReconciliation(reconciliation)
                 }
             }
         )
@@ -1212,8 +1231,119 @@ public final class WorkflowSupervisorStore {
         }
     }
 
-    private func handleRelayDisconnected(hostID: HostID) async {
-        clearHostScopedRuntimeState(hostID: hostID)
+    func applyReconnectReconciliation(_ reconciliation: AppServerReconnectReconciliation) {
+        if let connectionID = reconciliation.connectionID {
+            guard relayConnectionIDs[reconciliation.hostID] == connectionID else {
+                return
+            }
+            if let connectionEpochGate = reconciliation.connectionEpochGate {
+                guard connectionEpochGate.accepts(connectionID) else {
+                    return
+                }
+            }
+        }
+
+        let eligibleThreadIDs = Set(
+            reconciliation.targetThreadIDs.filter { threadID in
+                guard !reconciliation.skippedThreadIDsDueToLiveUpdates.contains(threadID) else {
+                    return false
+                }
+                let key = ThreadRef.qualifiedID(
+                    hostID: reconciliation.hostID,
+                    threadID: threadID
+                )
+                // New loaded threads have no prior state and may be created by
+                // the snapshot. Existing states must still carry the marker
+                // installed at disconnect; a live event removes that marker.
+                return threadRuntimeStates[key] == nil
+                    || reconnectingRuntimeStateIDs.contains(key)
+            }
+        )
+        let entriesByThreadID = Dictionary(
+            uniqueKeysWithValues: reconciliation.catalogEntries.map {
+                ($0.threadRef.threadID, $0)
+            }
+        )
+        for entry in reconciliation.catalogEntries
+        where eligibleThreadIDs.contains(entry.threadRef.threadID) {
+            reconciledThreadCatalogEntries[entry.id] = entry
+        }
+
+        for threadID in reconciliation.targetThreadIDs.sorted() {
+            let key = ThreadRef.qualifiedID(hostID: reconciliation.hostID, threadID: threadID)
+            guard eligibleThreadIDs.contains(threadID) else {
+                reconnectingRuntimeStateIDs.remove(key)
+                continue
+            }
+            let failure = reconciliation.failuresByThreadID[threadID]
+            let transcript = reconciliation.transcriptsByThreadID[threadID]
+            let entry = entriesByThreadID[threadID]
+
+            upsertRuntimeState(hostID: reconciliation.hostID, threadID: threadID) { state in
+                AppServerReconnectStateReducer.apply(
+                    catalogEntry: entry,
+                    transcript: transcript,
+                    catalogStatusIsAuthoritative: reconciliation
+                        .authoritativeCatalogStatusThreadIDs
+                        .contains(threadID),
+                    to: &state
+                )
+
+                if let failure {
+                    state.currentActivitySummary = "Could not fully verify after reconnect — last known state"
+                    state.lastError = state.lastError ?? failure
+                } else if state.currentActivitySummary == nil {
+                    state.currentActivitySummary = Self.reconciledActivitySummary(for: state.status)
+                }
+            }
+
+            if failure == nil {
+                reconnectingRuntimeStateIDs.remove(key)
+            }
+        }
+
+        for key in reconnectingRuntimeStateIDs.sorted() {
+            guard var state = threadRuntimeStates[key],
+                  state.hostID == reconciliation.hostID,
+                  !reconciliation.targetThreadIDs.contains(state.threadID) else {
+                continue
+            }
+            if reconciliation.omittedThreadIDs.contains(state.threadID) {
+                state.currentActivitySummary = "Last known state — deferred by bounded reconnect scan"
+                reconnectingRuntimeStateIDs.remove(key)
+            } else {
+                state.currentActivitySummary = reconciliation.loadedThreadListError == nil
+                    ? "Last known state — thread was not loaded after reconnect"
+                    : "Could not verify loaded threads after reconnect — last known state"
+            }
+            threadRuntimeStates[key] = state
+        }
+    }
+
+    private static func reconciledActivitySummary(for status: ThreadRunStatus) -> String {
+        switch status {
+        case .running:
+            return "Turn running"
+        case .needsInput:
+            return "Waiting for input"
+        case .failed:
+            return "Turn failed"
+        case .complete:
+            return "Turn completed"
+        case .idle, .unknown:
+            return AppServerReconnectStateReducer.activitySummary(for: status)
+        }
+    }
+
+    private func handleRelayDisconnected(
+        hostID: HostID,
+        expectedRelayGeneration: UUID
+    ) async {
+        guard relayGenerations[hostID] == expectedRelayGeneration else {
+            return
+        }
+        relayConnectionIDs[hostID] = nil
+        markHostRuntimeStatesReconciling(hostID: hostID)
         guard remoteTunnels[hostID] != nil else {
             return
         }
@@ -1237,6 +1367,9 @@ public final class WorkflowSupervisorStore {
         guard let threadID = Self.threadID(from: notification.params) else {
             return
         }
+        reconnectingRuntimeStateIDs.remove(
+            ThreadRef.qualifiedID(hostID: hostID, threadID: threadID)
+        )
 
         if notification.method == "item/agentMessage/delta",
            let delta = notification.params?["delta"]?.stringValue {
@@ -1266,6 +1399,9 @@ public final class WorkflowSupervisorStore {
     private func reduceRuntimeState(event: WorkflowEvent) {
         guard let threadID = event.threadID else { return }
         let hostID = event.hostID ?? localHostID
+        reconnectingRuntimeStateIDs.remove(
+            ThreadRef.qualifiedID(hostID: hostID, threadID: threadID)
+        )
         upsertRuntimeState(hostID: hostID, threadID: threadID) { state in
             state.apply(event: event, markUnread: event.kind != .turnStarted)
         }
@@ -1295,6 +1431,32 @@ public final class WorkflowSupervisorStore {
         AppServerNotificationNormalizer.threadID(from: params)
     }
 
+    func markHostRuntimeStatesReconciling(hostID: HostID) {
+        pendingAttentionRequests.removeAll { $0.hostID == hostID }
+        lastWriteReconciliations[hostID] = nil
+
+        for key in threadRuntimeStates.keys.sorted() {
+            guard var state = threadRuntimeStates[key],
+                  state.hostID == hostID || key.hasPrefix("\(hostID.rawValue)::") else {
+                continue
+            }
+            reconnectingRuntimeStateIDs.insert(key)
+            state.pendingRequestIDs = []
+            state.activeFlags.remove(.waitingOnApproval)
+            state.activeFlags.remove(.waitingOnUserInput)
+            state.liveAssistantText = ""
+            state.currentActivitySummary = "Reconnecting — showing last known state"
+            threadRuntimeStates[key] = state
+        }
+    }
+
+    func recordRelayConnectionReady(
+        hostID: HostID,
+        connectionID: AppServerConnectionID
+    ) {
+        relayConnectionIDs[hostID] = connectionID
+    }
+
     private func clearHostScopedRuntimeState(hostID: HostID) {
         pendingAttentionRequests.removeAll { $0.hostID == hostID }
         lastWriteReconciliations[hostID] = nil
@@ -1304,6 +1466,10 @@ public final class WorkflowSupervisorStore {
         threadRuntimeStates = threadRuntimeStates.filter { key, state in
             state.hostID != hostID && !key.hasPrefix("\(hostID.rawValue)::")
         }
+        reconnectingRuntimeStateIDs = reconnectingRuntimeStateIDs.filter {
+            !$0.hasPrefix("\(hostID.rawValue)::")
+        }
+        relayConnectionIDs[hostID] = nil
     }
 
     private static func defaultName(for url: URL) -> String {

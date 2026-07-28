@@ -31,6 +31,7 @@ enum AppServerRelayConnectionPhase: Equatable, Sendable {
     case stopped
     case disconnected
     case connecting
+    case reconciling
     case connected
 }
 
@@ -221,9 +222,79 @@ public struct AppServerWriteReconciliation: Sendable {
     }
 }
 
+public struct AppServerReconnectReconciliation: Sendable {
+    public var hostID: HostID
+    public var connectionID: AppServerConnectionID?
+    public var targetThreadIDs: Set<String>
+    public var loadedThreadIDs: Set<String>
+    public var catalogEntries: [ThreadCatalogEntry]
+    public var transcriptsByThreadID: [String: ThreadTranscript]
+    public var failuresByThreadID: [String: String]
+    public var loadedThreadListError: String?
+    public var authoritativeCatalogStatusThreadIDs: Set<String>
+    public var omittedThreadIDs: Set<String>
+    public var skippedThreadIDsDueToLiveUpdates: Set<String>
+    var connectionEpochGate: AppServerConnectionEpochGate?
+
+    public init(
+        hostID: HostID,
+        connectionID: AppServerConnectionID? = nil,
+        targetThreadIDs: Set<String>,
+        loadedThreadIDs: Set<String>,
+        catalogEntries: [ThreadCatalogEntry] = [],
+        transcriptsByThreadID: [String: ThreadTranscript] = [:],
+        failuresByThreadID: [String: String] = [:],
+        loadedThreadListError: String? = nil,
+        authoritativeCatalogStatusThreadIDs: Set<String> = [],
+        omittedThreadIDs: Set<String> = [],
+        skippedThreadIDsDueToLiveUpdates: Set<String> = []
+    ) {
+        self.hostID = hostID
+        self.connectionID = connectionID
+        self.targetThreadIDs = targetThreadIDs
+        self.loadedThreadIDs = loadedThreadIDs
+        self.catalogEntries = catalogEntries
+        self.transcriptsByThreadID = transcriptsByThreadID
+        self.failuresByThreadID = failuresByThreadID
+        self.loadedThreadListError = loadedThreadListError
+        self.authoritativeCatalogStatusThreadIDs = authoritativeCatalogStatusThreadIDs
+        self.omittedThreadIDs = omittedThreadIDs
+        self.skippedThreadIDsDueToLiveUpdates = skippedThreadIDsDueToLiveUpdates
+        self.connectionEpochGate = nil
+    }
+}
+
 struct AppServerReconciliationObservation: Sendable {
     var call: AppServerCall
     var result: JSONValue
+}
+
+/// Lock-backed connection epoch marker used only to close the actor
+/// reentrancy window between a relay callback and its MainActor consumer.
+final class AppServerConnectionEpochGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeConnectionID: AppServerConnectionID?
+
+    func activate(_ connectionID: AppServerConnectionID) {
+        lock.lock()
+        activeConnectionID = connectionID
+        lock.unlock()
+    }
+
+    func invalidate(_ connectionID: AppServerConnectionID? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard connectionID == nil || activeConnectionID == connectionID else {
+            return
+        }
+        activeConnectionID = nil
+    }
+
+    func accepts(_ connectionID: AppServerConnectionID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeConnectionID == connectionID
+    }
 }
 
 public actor AppServerWebSocketWorkflowRelay {
@@ -231,11 +302,14 @@ public actor AppServerWebSocketWorkflowRelay {
         case stopped
         case disconnected
         case connecting(AppServerConnectionID)
+        case reconciling(AppServerConnectionID)
         case connected(AppServerConnectionID)
 
         var connectionID: AppServerConnectionID? {
             switch self {
-            case .connecting(let connectionID), .connected(let connectionID):
+            case .connecting(let connectionID),
+                 .reconciling(let connectionID),
+                 .connected(let connectionID):
                 return connectionID
             case .stopped, .disconnected:
                 return nil
@@ -250,6 +324,15 @@ public actor AppServerWebSocketWorkflowRelay {
             if case .connected = self { return true }
             return false
         }
+
+        var isTransportReady: Bool {
+            switch self {
+            case .reconciling, .connected:
+                return true
+            case .stopped, .disconnected, .connecting:
+                return false
+            }
+        }
     }
 
     private let endpoint: AppServerRelayEndpoint
@@ -258,6 +341,8 @@ public actor AppServerWebSocketWorkflowRelay {
     private let attachmentStagingRoot: String?
     private let webSocketTaskFactory: @Sendable (URLRequest) -> URLSessionWebSocketTask
     private let session = AppServerSession()
+    private let threadCommandLane = ThreadCommandLane()
+    private let connectionEpochGate = AppServerConnectionEpochGate()
     private var connectionState: ConnectionState = .stopped
     private var connectionTask: Task<Bool, Never>?
     private var webSocketTask: URLSessionWebSocketTask?
@@ -265,6 +350,8 @@ public actor AppServerWebSocketWorkflowRelay {
     private var pingTask: Task<Void, Never>?
     private var accessTokenExpiryTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var reconciliationTask: Task<Void, Never>?
+    private var liveNotificationRevisionsByThreadID: [String: UInt64] = [:]
     private var desiredThreads: [String: ThreadRef] = [:]
     private var workflowDesiredThreads: [String: ThreadRef] = [:]
     private var subscriptionOwners: [String: [String: ThreadRef]] = [:]
@@ -278,9 +365,11 @@ public actor AppServerWebSocketWorkflowRelay {
     private var reportsConnectionFailures: Bool
     private let onAttentionRequest: (@Sendable (RuntimeAttentionRequest) -> Void)?
     private let onAttentionResolved: (@Sendable (HostID, String) -> Void)?
-    private let onNotification: (@Sendable (HostID, CodexServerNotification) -> Void)?
-    private let onDisconnected: (@Sendable (HostID) -> Void)?
+    private let onConnected: (@Sendable (HostID, AppServerConnectionID) async -> Void)?
+    private let onNotification: (@Sendable (HostID, CodexServerNotification) async -> Void)?
+    private let onDisconnected: (@Sendable (HostID) async -> Void)?
     private let onWriteReconciled: (@Sendable (AppServerWriteReconciliation) -> Void)?
+    private let onReconnectReconciled: (@Sendable (AppServerReconnectReconciliation) async -> Void)?
 
     private var connectionID: AppServerConnectionID? {
         connectionState.connectionID
@@ -294,6 +383,10 @@ public actor AppServerWebSocketWorkflowRelay {
         connectionState.isConnected
     }
 
+    private var isTransportReady: Bool {
+        connectionState.isTransportReady
+    }
+
     public init(
         endpoint: AppServerRelayEndpoint,
         supervisor: WorkflowSupervisor,
@@ -305,9 +398,11 @@ public actor AppServerWebSocketWorkflowRelay {
         reportsConnectionFailures: Bool = true,
         onAttentionRequest: (@Sendable (RuntimeAttentionRequest) -> Void)? = nil,
         onAttentionResolved: (@Sendable (HostID, String) -> Void)? = nil,
-        onNotification: (@Sendable (HostID, CodexServerNotification) -> Void)? = nil,
-        onDisconnected: (@Sendable (HostID) -> Void)? = nil,
-        onWriteReconciled: (@Sendable (AppServerWriteReconciliation) -> Void)? = nil
+        onConnected: (@Sendable (HostID, AppServerConnectionID) async -> Void)? = nil,
+        onNotification: (@Sendable (HostID, CodexServerNotification) async -> Void)? = nil,
+        onDisconnected: (@Sendable (HostID) async -> Void)? = nil,
+        onWriteReconciled: (@Sendable (AppServerWriteReconciliation) -> Void)? = nil,
+        onReconnectReconciled: (@Sendable (AppServerReconnectReconciliation) async -> Void)? = nil
     ) {
         self.endpoint = endpoint
         self.supervisor = supervisor
@@ -319,9 +414,11 @@ public actor AppServerWebSocketWorkflowRelay {
         self.reportsConnectionFailures = reportsConnectionFailures
         self.onAttentionRequest = onAttentionRequest
         self.onAttentionResolved = onAttentionResolved
+        self.onConnected = onConnected
         self.onNotification = onNotification
         self.onDisconnected = onDisconnected
         self.onWriteReconciled = onWriteReconciled
+        self.onReconnectReconciled = onReconnectReconciled
     }
 
     public func start() async -> Bool {
@@ -333,9 +430,6 @@ public actor AppServerWebSocketWorkflowRelay {
 
     private func connectIfNeeded() async -> Bool {
         guard isStarted else { return false }
-        if isConnected {
-            return true
-        }
         if let connectionTask {
             let expectedConnectionID = connectionID
             let didConnect = await connectionTask.value
@@ -345,6 +439,9 @@ public actor AppServerWebSocketWorkflowRelay {
                 return false
             }
             return didConnect && isConnected
+        }
+        if isConnected {
+            return true
         }
 
         reconnectTask?.cancel()
@@ -454,21 +551,34 @@ public actor AppServerWebSocketWorkflowRelay {
                 closeSocket(connectionID: connectionID)
                 return false
             }
+            // Initialization is the transport readiness boundary. Reconnect
+            // reconciliation is advisory background repair and must not block
+            // health checks, subscriptions, or user commands.
             connectionState = .connected(connectionID)
+            connectionEpochGate.activate(connectionID)
             reconnectAttempts = 0
             lastFailureMessageValue = nil
+            startPingLoop(connectionID: connectionID)
+            scheduleAccessTokenExpiry(accessToken?.expiresAt, connectionID: connectionID)
+            guard isCurrentConnectionAttempt(connectionID), isConnected else {
+                closeSocket(connectionID: connectionID)
+                return false
+            }
+            await onConnected?(endpoint.id, connectionID)
+            guard isCurrentConnectionAttempt(connectionID), isConnected else {
+                closeSocket(connectionID: connectionID)
+                return false
+            }
+
             await supervisor.upsertMachine(machine(from: initializeResult, status: .connected))
             guard isCurrentConnectionAttempt(connectionID), isConnected else {
                 closeSocket(connectionID: connectionID)
                 return false
             }
-            startPingLoop(connectionID: connectionID)
-            scheduleAccessTokenExpiry(accessToken?.expiresAt, connectionID: connectionID)
-            await subscribeDesiredThreads()
-            guard isCurrentConnectionAttempt(connectionID), isConnected else {
-                closeSocket(connectionID: connectionID)
-                return false
+            Task { [weak self] in
+                await self?.subscribeDesiredThreads()
             }
+            startReconnectReconciliation(connectionID: connectionID)
             return true
         } catch {
             guard isCurrentConnectionAttempt(connectionID) else { return false }
@@ -484,6 +594,8 @@ public actor AppServerWebSocketWorkflowRelay {
         connectionTask = nil
         reconnectTask?.cancel()
         reconnectTask = nil
+        reconciliationTask?.cancel()
+        reconciliationTask = nil
         pingTask?.cancel()
         pingTask = nil
         accessTokenExpiryTask?.cancel()
@@ -494,8 +606,9 @@ public actor AppServerWebSocketWorkflowRelay {
         subscribedThreadIDs.removeAll()
         subscriptionAttempts.removeAll()
         closeSocket(connectionID: activeConnectionID)
+        await threadCommandLane.cancelAll()
         if markDisconnected {
-            onDisconnected?(endpoint.id)
+            await onDisconnected?(endpoint.id)
         }
         if markDisconnected {
             await supervisor.updateMachineStatus(endpoint.id, status: .disconnected)
@@ -515,6 +628,7 @@ public actor AppServerWebSocketWorkflowRelay {
         case .stopped: .stopped
         case .disconnected: .disconnected
         case .connecting: .connecting
+        case .reconciling: .reconciling
         case .connected: .connected
         }
         return AppServerRelayConnectionSnapshot(
@@ -772,6 +886,83 @@ public actor AppServerWebSocketWorkflowRelay {
         return entries
     }
 
+    /// Rereads the authoritative App Server state needed to rebuild live
+    /// supervisor status after a transport reconnect. The read function is
+    /// injectable so the reconciliation contract can be tested without a
+    /// socket.
+    func reconcileAuthoritativeThreadsUsingRequest(
+        request: @escaping @Sendable (AppServerMethod, JSONValue) async throws -> JSONValue
+    ) async -> AppServerReconnectReconciliation {
+        await AppServerReconnectReconciler.reconcile(
+            hostID: endpoint.id,
+            hostName: endpoint.name,
+            desiredThreads: desiredThreads
+        ) { method, params, _ in
+            try await request(method, params)
+        }
+    }
+
+    private func startReconnectReconciliation(connectionID: AppServerConnectionID) {
+        reconciliationTask?.cancel()
+        let desiredSnapshot = desiredThreads
+        let baselineRevisions = liveNotificationRevisionsByThreadID
+        reconciliationTask = Task { [weak self] in
+            await self?.performReconnectReconciliation(
+                connectionID: connectionID,
+                desiredThreads: desiredSnapshot,
+                baselineRevisions: baselineRevisions
+            )
+        }
+    }
+
+    private func performReconnectReconciliation(
+        connectionID: AppServerConnectionID,
+        desiredThreads: [String: ThreadRef],
+        baselineRevisions: [String: UInt64]
+    ) async {
+        guard isCurrentConnectionAttempt(connectionID), isConnected, !Task.isCancelled else {
+            return
+        }
+
+        var reconciliation = await AppServerReconnectReconciler.reconcile(
+            hostID: endpoint.id,
+            hostName: endpoint.name,
+            desiredThreads: desiredThreads
+        ) { [weak self] method, params, timeout in
+            guard let self else { throw CodexAppServerError.disconnected }
+            guard await self.isActiveConnection(connectionID) else {
+                throw CodexAppServerError.disconnected
+            }
+            return try await self.request(
+                method: method,
+                params: params,
+                mayReplayRead: false,
+                timeoutOverride: timeout
+            )
+        }
+
+        guard isCurrentConnectionAttempt(connectionID), isConnected, !Task.isCancelled else {
+            return
+        }
+        reconciliation.connectionID = connectionID
+        reconciliation.connectionEpochGate = connectionEpochGate
+        reconciliation.skippedThreadIDsDueToLiveUpdates = Set(
+            reconciliation.targetThreadIDs.filter {
+                liveNotificationRevisionsByThreadID[$0, default: 0]
+                    != baselineRevisions[$0, default: 0]
+            }
+        )
+        await onReconnectReconciled?(reconciliation)
+        guard isCurrentConnectionAttempt(connectionID), !Task.isCancelled else {
+            return
+        }
+        reconciliationTask = nil
+    }
+
+    private func isActiveConnection(_ connectionID: AppServerConnectionID) -> Bool {
+        isCurrentConnectionAttempt(connectionID) && isConnected
+    }
+
     private func readThreadCatalogEntry(threadID: String, cwdHint: String?) async throws -> ThreadCatalogEntry? {
         let result = try await request(
             method: .readThread,
@@ -915,23 +1106,26 @@ public actor AppServerWebSocketWorkflowRelay {
     }
 
     public func interruptThread(_ threadRef: ThreadRef, activeTurnID: String?) async throws -> String {
-        try await ensureConnected()
-        let turnID: String
-        if let activeTurnID,
-           !Self.isSyntheticTranscriptTurnID(activeTurnID, threadRef: threadRef) {
-            turnID = activeTurnID
-        } else {
-            turnID = try await interruptibleTurnID(for: threadRef)
-        }
+        try await withThreadCommandPermit(for: threadRef) {
+            try await ensureConnected()
+            let turnID: String
+            if let activeTurnID,
+               !Self.isSyntheticTranscriptTurnID(activeTurnID, threadRef: threadRef) {
+                turnID = activeTurnID
+            } else {
+                turnID = try await interruptibleTurnID(for: threadRef)
+            }
 
-        _ = try await request(
-            method: .interruptTurn,
-            params: .object([
-                "threadId": .string(threadRef.threadID),
-                "turnId": .string(turnID),
-            ])
-        )
-        return turnID
+            _ = try await request(
+                method: .interruptTurn,
+                params: .object([
+                    "threadId": .string(threadRef.threadID),
+                    "turnId": .string(turnID),
+                ])
+            )
+            recordThreadMutation(threadID: threadRef.threadID)
+            return turnID
+        }
     }
 
     public func sendMessage(
@@ -941,6 +1135,26 @@ public actor AppServerWebSocketWorkflowRelay {
         reasoningEffort: String?,
         permissions: AgentThreadPermissions? = nil,
         attachments: [ChatInputAttachment] = []
+    ) async throws {
+        try await withThreadCommandPermit(for: threadRef) {
+            try await sendMessageWithCommandPermit(
+                text,
+                to: threadRef,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                permissions: permissions,
+                attachments: attachments
+            )
+        }
+    }
+
+    private func sendMessageWithCommandPermit(
+        _ text: String,
+        to threadRef: ThreadRef,
+        model: String?,
+        reasoningEffort: String?,
+        permissions: AgentThreadPermissions?,
+        attachments: [ChatInputAttachment]
     ) async throws {
         try await ensureConnected()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else {
@@ -963,6 +1177,12 @@ public actor AppServerWebSocketWorkflowRelay {
         }
 
         _ = try await request(method: .resumeThread, params: .object(resumeParams))
+        if desiredThreads[threadRef.threadID] != nil {
+            subscribedThreadIDs.insert(threadRef.threadID)
+            subscriptionAttempts[threadRef.threadID] = 0
+            subscriptionRetryTasks[threadRef.threadID]?.cancel()
+            subscriptionRetryTasks[threadRef.threadID] = nil
+        }
 
         var params: [String: JSONValue] = [
             "threadId": .string(threadRef.threadID),
@@ -982,6 +1202,7 @@ public actor AppServerWebSocketWorkflowRelay {
         }
 
         _ = try await request(method: .startTurn, params: .object(params))
+        recordThreadMutation(threadID: threadRef.threadID)
     }
 
     private func interruptibleTurnID(for threadRef: ThreadRef) async throws -> String {
@@ -1048,13 +1269,16 @@ public actor AppServerWebSocketWorkflowRelay {
     }
 
     public func archiveThread(_ threadRef: ThreadRef) async throws {
-        try await ensureConnected()
-        _ = try await request(
-            method: .archiveThread,
-            params: .object([
-                "threadId": .string(threadRef.threadID),
-            ])
-        )
+        try await withThreadCommandPermit(for: threadRef) {
+            try await ensureConnected()
+            _ = try await request(
+                method: .archiveThread,
+                params: .object([
+                    "threadId": .string(threadRef.threadID),
+                ])
+            )
+            recordThreadMutation(threadID: threadRef.threadID)
+        }
     }
 
     public func respondToServerRequest(
@@ -1074,30 +1298,54 @@ public actor AppServerWebSocketWorkflowRelay {
     }
 
     public func forkThread(_ threadRef: ThreadRef, model: String?) async throws -> ThreadRef {
-        try await ensureConnected()
-        var params: [String: JSONValue] = [
-            "threadId": .string(threadRef.threadID),
-            "cwd": .string(threadRef.cwd),
-        ]
-        if let model, !model.isEmpty {
-            params["model"] = .string(model)
-        }
+        try await withThreadCommandPermit(for: threadRef) {
+            try await ensureConnected()
+            var params: [String: JSONValue] = [
+                "threadId": .string(threadRef.threadID),
+                "cwd": .string(threadRef.cwd),
+            ]
+            if let model, !model.isEmpty {
+                params["model"] = .string(model)
+            }
 
-        let result = try await request(method: .forkThread, params: .object(params))
-        guard
-            let thread = result["thread"],
-            let threadID = thread["id"]?.stringValue,
-            let cwd = thread["cwd"]?.stringValue ?? result["cwd"]?.stringValue
-        else {
-            throw CodexAppServerError.invalidResponse
-        }
+            let result = try await request(method: .forkThread, params: .object(params))
+            guard
+                let thread = result["thread"],
+                let threadID = thread["id"]?.stringValue,
+                let cwd = thread["cwd"]?.stringValue ?? result["cwd"]?.stringValue
+            else {
+                throw CodexAppServerError.invalidResponse
+            }
 
-        return ThreadRef(
-            hostID: endpoint.id,
-            threadID: threadID,
-            cwd: cwd,
-            name: thread["name"]?.stringValue ?? threadRef.name
-        )
+            recordThreadMutation(threadID: threadRef.threadID)
+            return ThreadRef(
+                hostID: endpoint.id,
+                threadID: threadID,
+                cwd: cwd,
+                name: thread["name"]?.stringValue ?? threadRef.name
+            )
+        }
+    }
+
+    private func recordThreadMutation(threadID: String) {
+        guard !threadID.isEmpty else { return }
+        liveNotificationRevisionsByThreadID[threadID, default: 0] &+= 1
+    }
+
+    private func withThreadCommandPermit<T>(
+        for threadRef: ThreadRef,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let permit = try await threadCommandLane.acquire(for: threadRef.qualifiedID)
+        do {
+            try Task.checkCancellation()
+            let value = try await operation()
+            await threadCommandLane.release(permit)
+            return value
+        } catch {
+            await threadCommandLane.release(permit)
+            throw error
+        }
     }
 
     private func receiveLoop(
@@ -1162,7 +1410,9 @@ public actor AppServerWebSocketWorkflowRelay {
         pingTask = nil
         pendingSubscriptionThreadIDs.removeAll()
         subscribedThreadIDs.removeAll()
-        onDisconnected?(endpoint.id)
+        await threadCommandLane.cancelAll()
+        await onDisconnected?(endpoint.id)
+        guard isStarted, self.connectionID == nil else { return }
         _ = await connectIfNeeded()
     }
 
@@ -1182,7 +1432,8 @@ public actor AppServerWebSocketWorkflowRelay {
     private func request(
         method: AppServerMethod,
         params: JSONValue = .object([:]),
-        mayReplayRead: Bool = true
+        mayReplayRead: Bool = true,
+        timeoutOverride: Duration? = nil
     ) async throws -> JSONValue {
         guard let connectionID else {
             throw CodexAppServerError.disconnected
@@ -1191,7 +1442,8 @@ public actor AppServerWebSocketWorkflowRelay {
             return try await session.request(
                 AppServerCall(method, params: params),
                 connectionID: connectionID,
-                timeoutContext: .remote(endpoint.name)
+                timeoutContext: .remote(endpoint.name),
+                timeoutOverride: timeoutOverride
             ) { [weak self] message, expectedConnectionID in
                 guard let self else { throw CodexAppServerError.disconnected }
                 try await self.send(message, connectionID: expectedConnectionID)
@@ -1212,7 +1464,8 @@ public actor AppServerWebSocketWorkflowRelay {
                 return try await request(
                     method: method,
                     params: params,
-                    mayReplayRead: false
+                    mayReplayRead: false,
+                    timeoutOverride: timeoutOverride
                 )
             }
             throw error
@@ -1241,10 +1494,17 @@ public actor AppServerWebSocketWorkflowRelay {
         method: AppServerMethod,
         params: JSONValue
     ) async -> JSONValue? {
-        guard await connectIfNeeded(), isConnected else { return nil }
+        if !isTransportReady {
+            guard await connectIfNeeded() else { return nil }
+        }
+        guard isTransportReady else { return nil }
         var observations: [AppServerReconciliationObservation] = []
         for call in Self.reconciliationCalls(after: method, params: params) {
-            guard let result = try? await request(method: call.method, params: call.params) else {
+            guard let result = try? await request(
+                method: call.method,
+                params: call.params,
+                mayReplayRead: false
+            ) else {
                 continue
             }
             observations.append(AppServerReconciliationObservation(call: call, result: result))
@@ -1607,9 +1867,15 @@ public actor AppServerWebSocketWorkflowRelay {
             return
         }
 
-        switch await session.receive(data, connectionID: connectionID) {
+        let inboundEvent = await session.receive(data, connectionID: connectionID)
+        // `session.receive` crosses an actor boundary. A replacement socket may
+        // become current while this actor is suspended, so validate the epoch
+        // again before publishing anything decoded from the old socket.
+        guard self.connectionID == connectionID else { return }
+
+        switch inboundEvent {
         case .notification(let notification):
-            handleNotification(notification)
+            await handleNotification(notification, connectionID: connectionID)
         case .diagnostic:
             break
         case nil:
@@ -1617,11 +1883,22 @@ public actor AppServerWebSocketWorkflowRelay {
         }
     }
 
-    private func handleNotification(_ notification: CodexServerNotification) {
-        onNotification?(endpoint.id, notification)
+    private func handleNotification(
+        _ notification: CodexServerNotification,
+        connectionID: AppServerConnectionID
+    ) async {
+        guard self.connectionID == connectionID,
+              notification.connectionID == nil || notification.connectionID == connectionID else {
+            return
+        }
+        if let threadID = Self.threadID(from: notification.params) {
+            liveNotificationRevisionsByThreadID[threadID, default: 0] &+= 1
+        }
+        await onNotification?(endpoint.id, notification)
+        guard self.connectionID == connectionID else { return }
         handleSubscriptionSignal(notification)
         handleAttentionSignal(notification)
-        ingest(notification)
+        await ingest(notification)
     }
 
     private func handleAttentionSignal(_ notification: CodexServerNotification) {
@@ -1636,14 +1913,11 @@ public actor AppServerWebSocketWorkflowRelay {
         onAttentionRequest?(request)
     }
 
-    private func ingest(_ notification: CodexServerNotification) {
+    private func ingest(_ notification: CodexServerNotification) async {
         guard let event = WorkflowEvent.appServerEvent(from: notification, hostID: endpoint.id) else {
             return
         }
-
-        Task {
-            await supervisor.ingest(event, from: endpoint.id)
-        }
+        await supervisor.ingest(event, from: endpoint.id)
     }
 
     private func subscribeDesiredThreads() async {
@@ -1653,7 +1927,7 @@ public actor AppServerWebSocketWorkflowRelay {
     }
 
     private func subscribeIfNeeded(to threadRef: ThreadRef) async {
-        guard isStarted, isConnected else { return }
+        guard isStarted, isTransportReady else { return }
         guard desiredThreads[threadRef.threadID] == threadRef else { return }
         guard !subscribedThreadIDs.contains(threadRef.threadID) else { return }
         guard !pendingSubscriptionThreadIDs.contains(threadRef.threadID) else { return }
@@ -1664,26 +1938,38 @@ public actor AppServerWebSocketWorkflowRelay {
         }
 
         do {
-            _ = try await request(
-                method: .resumeThread,
-                params: .object([
-                    "threadId": .string(threadRef.threadID),
-                    "cwd": .string(threadRef.cwd),
-                ])
-            )
+            let didSubscribe = try await withThreadCommandPermit(for: threadRef) {
+                guard isStarted,
+                      isTransportReady,
+                      desiredThreads[threadRef.threadID] == threadRef,
+                      !subscribedThreadIDs.contains(threadRef.threadID) else {
+                    return false
+                }
 
-            guard desiredThreads[threadRef.threadID] == threadRef else {
-                _ = try? await request(
-                    method: .unsubscribeThread,
-                    params: .object(["threadId": .string(threadRef.threadID)])
+                _ = try await request(
+                    method: .resumeThread,
+                    params: .object([
+                        "threadId": .string(threadRef.threadID),
+                        "cwd": .string(threadRef.cwd),
+                    ])
                 )
-                return
+
+                guard desiredThreads[threadRef.threadID] == threadRef else {
+                    _ = try? await request(
+                        method: .unsubscribeThread,
+                        params: .object(["threadId": .string(threadRef.threadID)])
+                    )
+                    return false
+                }
+                return true
             }
 
-            subscribedThreadIDs.insert(threadRef.threadID)
-            subscriptionAttempts[threadRef.threadID] = 0
-            subscriptionRetryTasks[threadRef.threadID]?.cancel()
-            subscriptionRetryTasks[threadRef.threadID] = nil
+            if didSubscribe {
+                subscribedThreadIDs.insert(threadRef.threadID)
+                subscriptionAttempts[threadRef.threadID] = 0
+                subscriptionRetryTasks[threadRef.threadID]?.cancel()
+                subscriptionRetryTasks[threadRef.threadID] = nil
+            }
         } catch {
             subscribedThreadIDs.remove(threadRef.threadID)
             scheduleSubscriptionRetry(for: threadRef.threadID, after: error)
@@ -1697,12 +1983,18 @@ public actor AppServerWebSocketWorkflowRelay {
         pendingSubscriptionThreadIDs.remove(threadID)
 
         let wasSubscribed = subscribedThreadIDs.remove(threadID) != nil
-        guard isConnected, wasSubscribed else { return }
+        guard isTransportReady, wasSubscribed else { return }
 
-        _ = try? await request(
-            method: .unsubscribeThread,
-            params: .object(["threadId": .string(threadID)])
-        )
+        let threadRef = desiredThreads[threadID]
+            ?? workflowDesiredThreads[threadID]
+            ?? ThreadRef(hostID: endpoint.id, threadID: threadID, cwd: "")
+        _ = try? await withThreadCommandPermit(for: threadRef) {
+            guard isTransportReady else { return }
+            _ = try await request(
+                method: .unsubscribeThread,
+                params: .object(["threadId": .string(threadID)])
+            )
+        }
     }
 
     private func handleSubscriptionSignal(_ notification: CodexServerNotification) {
@@ -1780,8 +2072,11 @@ public actor AppServerWebSocketWorkflowRelay {
         if let expectedConnectionID, connectionID != expectedConnectionID {
             return
         }
+        connectionEpochGate.invalidate(expectedConnectionID)
         receiveTask?.cancel()
         receiveTask = nil
+        reconciliationTask?.cancel()
+        reconciliationTask = nil
         accessTokenExpiryTask?.cancel()
         accessTokenExpiryTask = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
@@ -1804,7 +2099,9 @@ public actor AppServerWebSocketWorkflowRelay {
         pingTask = nil
         pendingSubscriptionThreadIDs.removeAll()
         subscribedThreadIDs.removeAll()
-        onDisconnected?(endpoint.id)
+        await threadCommandLane.cancelAll()
+        await onDisconnected?(endpoint.id)
+        guard isStarted, self.connectionID == nil else { return }
         if reportsConnectionFailures {
             await supervisor.updateMachineFailure(endpoint.id, message: error.localizedDescription)
             guard isStarted, self.connectionID == nil, !Task.isCancelled else { return }

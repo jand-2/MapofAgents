@@ -123,6 +123,9 @@ final class ThreadCreationCoordinator {
         do {
             let creationOutcome: ThreadCreationOutcome
             let trimmedInitialPrompt = request.initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let initialPromptExecutionText = WorkflowPromptEnvelope.escapingReservedEnvelope(
+                in: trimmedInitialPrompt
+            )
             switch request.provider {
             case .codex:
                 if targetContext.hostID == runtimeStore.localHost.id {
@@ -179,14 +182,14 @@ final class ThreadCreationCoordinator {
                             throw AgentProviderRuntimeError.unsupportedPlatform
                         }
                         try await providerRuntimeStore.sendMessage(
-                            trimmedInitialPrompt,
+                            initialPromptExecutionText,
                             to: threadRef,
                             model: request.modelID,
                             reasoningEffort: request.reasoningEffort
                         )
                     } else if targetContext.hostID == runtimeStore.localHost.id {
                         try await runtimeStore.sendMessage(
-                            trimmedInitialPrompt,
+                            initialPromptExecutionText,
                             to: threadRef,
                             model: request.modelID,
                             reasoningEffort: request.reasoningEffort,
@@ -194,7 +197,7 @@ final class ThreadCreationCoordinator {
                         )
                     } else {
                         try await supervisorStore.sendMessage(
-                            trimmedInitialPrompt,
+                            initialPromptExecutionText,
                             to: threadRef,
                             model: request.modelID,
                             reasoningEffort: request.reasoningEffort,

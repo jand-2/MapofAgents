@@ -214,6 +214,115 @@ func localStoreReplacesWorkflowSnapshot() async throws {
 }
 
 @Test
+func workflowSnapshotsDoNotPersistConnectionBoundAttentionOrDiagnostics() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mapofagents-snapshot-sanitization-tests-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let paths = ApplicationPaths(applicationSupportDirectory: directory)
+    let store = LocalControlRoomStore(paths: paths)
+    let workflow = WorkflowRecord(id: "main", name: "Main")
+    let connectionID = AppServerConnectionID()
+    let machine = CanvasNode(
+        id: NodeID(rawValue: "machine"),
+        kind: .machine,
+        title: "Example host",
+        position: .zero,
+        size: .machine,
+        metadata: NodeMetadata(
+            hostID: HostID(rawValue: "example-host"),
+            hostLastError: "do-not-persist-runtime-error",
+            appServerEndpointURL: "wss://example-host.local/private-runtime-endpoint"
+        )
+    )
+    var graph = AgentGraph(
+        nodes: [machine.id: machine],
+        pendingAttentionRequests: [
+            RuntimeAttentionRequest(
+                id: "command-approval",
+                hostID: HostID(rawValue: "example-host"),
+                requestID: .string("approval"),
+                connectionID: connectionID,
+                method: "item/commandExecution/requestApproval",
+                threadID: "thread",
+                summary: "Approve command",
+                requestParams: .object([
+                    "command": .string("do-not-persist-command-payload"),
+                ])
+            ),
+            RuntimeAttentionRequest(
+                id: "user-input",
+                hostID: HostID(rawValue: "example-host"),
+                requestID: .int(17),
+                connectionID: connectionID,
+                method: "item/tool/requestUserInput",
+                threadID: "thread",
+                summary: "Input",
+                requestParams: .object([
+                    "questions": .array([
+                        .object([
+                            "id": .string("answer"),
+                            "question": .string("do-not-persist-user-input-prompt"),
+                        ]),
+                    ]),
+                ])
+            ),
+        ],
+        runtimeDiagnostics: [
+            RuntimeDiagnosticStep(
+                id: "runtime",
+                title: "Runtime",
+                status: .failed,
+                detail: "do-not-persist-diagnostic-detail",
+                evidence: "do-not-persist-diagnostic-evidence"
+            ),
+        ]
+    )
+    graph.updatedAt = Date(timeIntervalSince1970: 1_780_358_400)
+    let snapshot = WorkflowSnapshot(
+        library: WorkflowLibrarySnapshot(
+            activeWorkflowID: workflow.id,
+            workflows: [workflow]
+        ),
+        graphsByWorkflowID: [workflow.id: graph]
+    )
+
+    try await store.replaceWorkflowSnapshot(snapshot)
+
+    // Sanitization is performed on a snapshot copy and must not disturb live
+    // runtime state that still needs the connection-bound payload.
+    #expect(graph.pendingAttentionRequests.count == 2)
+    #expect(graph.pendingAttentionRequests.first?.connectionID == connectionID)
+    #expect(
+        graph.pendingAttentionRequests.first?.requestParams?["command"]?.stringValue ==
+            "do-not-persist-command-payload"
+    )
+
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let pointer = try decoder.decode(
+        WorkflowSnapshotPointer.self,
+        from: Data(contentsOf: paths.workflowSnapshotPointerURL)
+    )
+    let graphURL = paths.workflowSnapshotDirectory(for: pointer.activeSnapshotID)
+        .appendingPathComponent("workflows", isDirectory: true)
+        .appendingPathComponent("main.json")
+    let persistedJSON = try String(contentsOf: graphURL, encoding: .utf8)
+    let persistedGraph = try decoder.decode(AgentGraph.self, from: Data(contentsOf: graphURL))
+
+    #expect(persistedGraph.pendingAttentionRequests.isEmpty)
+    #expect(persistedGraph.runtimeDiagnostics.isEmpty)
+    #expect(persistedGraph.nodes[machine.id]?.metadata.hostLastError == nil)
+    #expect(persistedGraph.nodes[machine.id]?.metadata.appServerEndpointURL == nil)
+    #expect(persistedJSON.contains("do-not-persist-command-payload") == false)
+    #expect(persistedJSON.contains("do-not-persist-user-input-prompt") == false)
+    #expect(persistedJSON.contains("do-not-persist-diagnostic") == false)
+    #expect(persistedJSON.contains("do-not-persist-runtime-error") == false)
+    #expect(persistedJSON.contains("private-runtime-endpoint") == false)
+    #expect(persistedJSON.contains(connectionID.rawValue.uuidString) == false)
+}
+
+@Test
 func localStoreRejectsSnapshotMissingNonActiveGraphWithoutOverwriting() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("mapofagents-snapshot-missing-graph-tests-\(UUID().uuidString)", isDirectory: true)

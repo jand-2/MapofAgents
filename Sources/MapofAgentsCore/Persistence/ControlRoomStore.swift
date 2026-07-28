@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 public enum CanvasPatch: Sendable {
     case replace(AgentGraph)
@@ -203,6 +204,26 @@ public struct WorkflowSnapshot: Codable, Hashable, Sendable {
             throw WorkflowSnapshotIntegrityError.missingWorkflowGraph(workflow.id)
         }
     }
+
+    /// Connection-bound approval and diagnostic state is useful only while its
+    /// originating runtime session is alive. Do not copy it into durable graph
+    /// snapshots, where request payloads may also contain commands or user input.
+    public func sanitizingEphemeralRuntimeState() -> WorkflowSnapshot {
+        var sanitized = self
+        sanitized.graphsByWorkflowID = graphsByWorkflowID.mapValues { graph in
+            var graph = graph
+            graph.pendingAttentionRequests = []
+            graph.runtimeDiagnostics = []
+            graph.nodes = graph.nodes.mapValues { node in
+                var node = node
+                node.metadata.hostLastError = nil
+                node.metadata.appServerEndpointURL = nil
+                return node
+            }
+            return graph
+        }
+        return sanitized
+    }
 }
 
 public extension WorkflowLibrarySnapshot {
@@ -389,6 +410,7 @@ public struct ApplicationPaths: Sendable {
 
 public actor LocalControlRoomStore: ControlRoomStore {
     private static let maximumRollbackSnapshots = 2
+    private static let logger = MapofAgentsTelemetry.persistence
 
     private struct RelayCredentialMutation {
         var reference: String
@@ -425,8 +447,8 @@ public actor LocalControlRoomStore: ControlRoomStore {
         self.relayCredentialVault = relayCredentialVault
         self.snapshotFailureInjector = snapshotFailureInjector
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        decoder.dateDecodingStrategy = .iso8601
+        MapofAgentsJSONCoding.configureContractDates(on: encoder)
+        MapofAgentsJSONCoding.configureContractDates(on: decoder)
     }
 
     public func loadCanvas() async throws -> AgentGraph {
@@ -458,6 +480,23 @@ public actor LocalControlRoomStore: ControlRoomStore {
     }
 
     public func applyCanvasPatch(_ patch: CanvasPatch) async throws -> AgentGraph {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let telemetryOperationID = Self.telemetryOperationID()
+        let patchKind = Self.telemetryName(for: patch)
+        var persistedNodeCount = 0
+        var didSucceed = false
+        defer {
+            if didSucceed {
+                Self.logger.info(
+                    "operation=canvas_patch correlation=\(telemetryOperationID, privacy: .public) result=success patch=\(patchKind, privacy: .public) duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) nodes=\(persistedNodeCount, privacy: .public)"
+                )
+            } else {
+                Self.logger.error(
+                    "operation=canvas_patch correlation=\(telemetryOperationID, privacy: .public) result=failure patch=\(patchKind, privacy: .public) duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) nodes=\(persistedNodeCount, privacy: .public)"
+                )
+            }
+        }
+
         var snapshot = try await loadWorkflowSnapshot()
         let workflowID = snapshot.library.activeWorkflowID
         var graph = try snapshot.graphsByWorkflowID[workflowID].requiredWorkflowGraph(workflowID)
@@ -486,6 +525,8 @@ public actor LocalControlRoomStore: ControlRoomStore {
             snapshot.library.workflows[index].updatedAt = Date()
         }
         try await replaceWorkflowSnapshot(snapshot)
+        persistedNodeCount = graph.nodes.count
+        didSucceed = true
         return graph
     }
 
@@ -578,10 +619,13 @@ public actor LocalControlRoomStore: ControlRoomStore {
     }
 
     public func loadWorkflowSnapshot() async throws -> WorkflowSnapshot {
+        let telemetryOperationID = Self.telemetryOperationID()
         if let pointer = try loadSnapshotPointer() {
             var snapshot = try loadWorkflowSnapshot(
                 from: paths.workflowSnapshotDirectory(for: pointer.activeSnapshotID),
-                expectedSnapshotID: pointer.activeSnapshotID
+                expectedSnapshotID: pointer.activeSnapshotID,
+                telemetryPhase: "active",
+                telemetryOperationID: telemetryOperationID
             )
             snapshot.relayEndpoints = try resolveRelayCredentials(in: snapshot.relayEndpoints)
             return snapshot
@@ -609,14 +653,23 @@ public actor LocalControlRoomStore: ControlRoomStore {
             workflowEvents: try await loadWorkflowEvents(),
             relayEndpoints: try await loadRelayEndpoints()
         )
-        try snapshot.validateForActivation()
+        try validateSnapshot(
+            snapshot,
+            phase: "legacy-load",
+            telemetryOperationID: telemetryOperationID
+        )
         return snapshot
     }
 
     public func replaceWorkflowSnapshot(_ snapshot: WorkflowSnapshot) async throws {
-        try snapshot.validateForActivation()
+        let telemetryOperationID = Self.telemetryOperationID()
+        try validateSnapshot(
+            snapshot,
+            phase: "replace-input",
+            telemetryOperationID: telemetryOperationID
+        )
         try ensureDirectories()
-        var securedSnapshot = snapshot
+        var securedSnapshot = snapshot.sanitizingEphemeralRuntimeState()
         let preparedCredentials = try prepareRelayCredentials(in: snapshot.relayEndpoints)
         securedSnapshot.relayEndpoints = preparedCredentials.endpoints
 
@@ -629,13 +682,19 @@ public actor LocalControlRoomStore: ControlRoomStore {
             previousActiveID = existingPointer.activeSnapshotID
             previousRollbackIDs = existingPointer.rollbackSnapshotIDs
         } else {
-            previousActiveID = try stageSnapshot(currentSnapshot)
+            previousActiveID = try stageSnapshot(
+                currentSnapshot,
+                telemetryOperationID: telemetryOperationID
+            )
             previousRollbackIDs = []
         }
 
         let stagedSnapshotID: String
         do {
-            stagedSnapshotID = try stageSnapshot(securedSnapshot)
+            stagedSnapshotID = try stageSnapshot(
+                securedSnapshot,
+                telemetryOperationID: telemetryOperationID
+            )
         } catch {
             if existingPointer == nil {
                 try? FileManager.default.removeItem(at: paths.workflowSnapshotDirectory(for: previousActiveID))
@@ -654,12 +713,19 @@ public actor LocalControlRoomStore: ControlRoomStore {
             preparedCredentials.mutations.map(\.reference)
         )
 
+        let activationStartedAt = DispatchTime.now().uptimeNanoseconds
         do {
             try writeRelayCredentialRecoveryJournal(references: journalReferences)
             try applyRelayCredentialMutations(preparedCredentials.mutations)
             try snapshotFailureInjector?(.activatePointer)
-            try writeSnapshotPointer(pointer)
+            let pointerByteCount = try writeSnapshotPointer(pointer)
+            Self.logger.info(
+                "operation=snapshot_activate correlation=\(telemetryOperationID, privacy: .public) result=success duration_ms=\(Self.elapsedMilliseconds(since: activationStartedAt), privacy: .public) bytes=\(pointerByteCount, privacy: .public) rollback_count=\(pointer.rollbackSnapshotIDs.count, privacy: .public)"
+            )
         } catch let activationError {
+            Self.logger.error(
+                "operation=snapshot_activate correlation=\(telemetryOperationID, privacy: .public) result=failure duration_ms=\(Self.elapsedMilliseconds(since: activationStartedAt), privacy: .public)"
+            )
             try? FileManager.default.removeItem(at: paths.workflowSnapshotDirectory(for: stagedSnapshotID))
             if existingPointer == nil {
                 try? FileManager.default.removeItem(at: paths.workflowSnapshotDirectory(for: previousActiveID))
@@ -675,6 +741,7 @@ public actor LocalControlRoomStore: ControlRoomStore {
     }
 
     public func rollbackWorkflowSnapshot() async throws {
+        let telemetryOperationID = Self.telemetryOperationID()
         guard let pointer = try loadSnapshotPointer(),
               let rollbackID = pointer.rollbackSnapshotIDs.first else {
             throw WorkflowSnapshotPersistenceError.noRollbackAvailable
@@ -682,7 +749,9 @@ public actor LocalControlRoomStore: ControlRoomStore {
 
         let snapshot = try loadWorkflowSnapshot(
             from: paths.workflowSnapshotDirectory(for: rollbackID),
-            expectedSnapshotID: rollbackID
+            expectedSnapshotID: rollbackID,
+            telemetryPhase: "rollback",
+            telemetryOperationID: telemetryOperationID
         )
         let remainingRollbackIDs = Array(pointer.rollbackSnapshotIDs.dropFirst())
         let nextPointer = WorkflowSnapshotPointer(
@@ -692,13 +761,20 @@ public actor LocalControlRoomStore: ControlRoomStore {
                 excluding: rollbackID
             )
         )
+        let activationStartedAt = DispatchTime.now().uptimeNanoseconds
         do {
             try writeRelayCredentialRecoveryJournal(
                 references: try allPersistedRelayCredentialReferences()
             )
             try snapshotFailureInjector?(.activatePointer)
-            try writeSnapshotPointer(nextPointer)
+            let pointerByteCount = try writeSnapshotPointer(nextPointer)
+            Self.logger.info(
+                "operation=snapshot_activate correlation=\(telemetryOperationID, privacy: .public) result=success mode=rollback duration_ms=\(Self.elapsedMilliseconds(since: activationStartedAt), privacy: .public) bytes=\(pointerByteCount, privacy: .public) rollback_count=\(nextPointer.rollbackSnapshotIDs.count, privacy: .public)"
+            )
         } catch {
+            Self.logger.error(
+                "operation=snapshot_activate correlation=\(telemetryOperationID, privacy: .public) result=failure mode=rollback duration_ms=\(Self.elapsedMilliseconds(since: activationStartedAt), privacy: .public)"
+            )
             finishRelayCredentialRecoveryIfPossible()
             throw error
         }
@@ -1001,7 +1077,10 @@ public actor LocalControlRoomStore: ControlRoomStore {
 
     private func writeCanvas(_ graph: AgentGraph, workflowID: String) throws {
         try ensureDirectories()
-        let data = try encoder.encode(graph)
+        var durableGraph = graph
+        durableGraph.pendingAttentionRequests = []
+        durableGraph.runtimeDiagnostics = []
+        let data = try encoder.encode(durableGraph)
         try data.write(to: workflowCanvasURL(for: workflowID), options: [.atomic])
     }
 
@@ -1142,14 +1221,39 @@ public actor LocalControlRoomStore: ControlRoomStore {
         return pointer
     }
 
-    private func writeSnapshotPointer(_ pointer: WorkflowSnapshotPointer) throws {
+    @discardableResult
+    private func writeSnapshotPointer(_ pointer: WorkflowSnapshotPointer) throws -> Int {
         try pointer.validate()
         let data = try encoder.encode(pointer)
         try data.write(to: paths.workflowSnapshotPointerURL, options: [.atomic])
+        return data.count
     }
 
-    private func stageSnapshot(_ snapshot: WorkflowSnapshot) throws -> String {
-        try snapshot.validateForActivation()
+    private func stageSnapshot(
+        _ snapshot: WorkflowSnapshot,
+        telemetryOperationID: String
+    ) throws -> String {
+        let snapshot = snapshot.sanitizingEphemeralRuntimeState()
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        var stagedByteCount = 0
+        var didSucceed = false
+        defer {
+            if didSucceed {
+                Self.logger.info(
+                    "operation=snapshot_stage correlation=\(telemetryOperationID, privacy: .public) result=success duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) bytes=\(stagedByteCount, privacy: .public) workflows=\(snapshot.library.workflows.count, privacy: .public)"
+                )
+            } else {
+                Self.logger.error(
+                    "operation=snapshot_stage correlation=\(telemetryOperationID, privacy: .public) result=failure duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) bytes=\(stagedByteCount, privacy: .public) workflows=\(snapshot.library.workflows.count, privacy: .public)"
+                )
+            }
+        }
+
+        try validateSnapshot(
+            snapshot,
+            phase: "stage-input",
+            telemetryOperationID: telemetryOperationID
+        )
 
         let snapshotID = UUID().uuidString
         let stagingURL = paths.workflowSnapshotsDirectory
@@ -1161,13 +1265,17 @@ public actor LocalControlRoomStore: ControlRoomStore {
         do {
             try snapshotFailureInjector?(.metadata)
             let metadata = WorkflowSnapshotMetadata(snapshotID: snapshotID)
-            try encoder.encode(metadata).write(
+            let metadataData = try encoder.encode(metadata)
+            stagedByteCount += metadataData.count
+            try metadataData.write(
                 to: stagingURL.appendingPathComponent("metadata.json"),
                 options: [.atomic]
             )
 
             try snapshotFailureInjector?(.library)
-            try encoder.encode(snapshot.library).write(
+            let libraryData = try encoder.encode(snapshot.library)
+            stagedByteCount += libraryData.count
+            try libraryData.write(
                 to: workflowsURL.appendingPathComponent("library.json"),
                 options: [.atomic]
             )
@@ -1175,7 +1283,9 @@ public actor LocalControlRoomStore: ControlRoomStore {
             for workflow in snapshot.library.workflows {
                 let graph = try snapshot.graphsByWorkflowID[workflow.id].requiredWorkflowGraph(workflow.id)
                 try snapshotFailureInjector?(.workflowGraph(workflow.id))
-                try encoder.encode(graph).write(
+                let graphData = try encoder.encode(graph)
+                stagedByteCount += graphData.count
+                try graphData.write(
                     to: workflowsURL.appendingPathComponent(
                         "\(ApplicationPaths.safeFileComponent(workflow.id)).json"
                     ),
@@ -1185,19 +1295,29 @@ public actor LocalControlRoomStore: ControlRoomStore {
 
             try snapshotFailureInjector?(.workflowEvents)
             let recentEvents = Array(snapshot.workflowEvents.sorted { $0.createdAt > $1.createdAt }.prefix(200))
-            try encoder.encode(recentEvents).write(
+            let eventsData = try encoder.encode(recentEvents)
+            stagedByteCount += eventsData.count
+            try eventsData.write(
                 to: stagingURL.appendingPathComponent("workflow-events.json"),
                 options: [.atomic]
             )
 
             try snapshotFailureInjector?(.relayEndpoints)
-            try encoder.encode(snapshot.relayEndpoints).write(
+            let endpointsData = try encoder.encode(snapshot.relayEndpoints)
+            stagedByteCount += endpointsData.count
+            try endpointsData.write(
                 to: stagingURL.appendingPathComponent("relay-endpoints.json"),
                 options: [.atomic]
             )
 
-            _ = try loadWorkflowSnapshot(from: stagingURL, expectedSnapshotID: snapshotID)
+            _ = try loadWorkflowSnapshot(
+                from: stagingURL,
+                expectedSnapshotID: snapshotID,
+                telemetryPhase: "staged-validation",
+                telemetryOperationID: telemetryOperationID
+            )
             try FileManager.default.moveItem(at: stagingURL, to: finalURL)
+            didSucceed = true
             return snapshotID
         } catch {
             try? FileManager.default.removeItem(at: stagingURL)
@@ -1207,22 +1327,45 @@ public actor LocalControlRoomStore: ControlRoomStore {
 
     private func loadWorkflowSnapshot(
         from root: URL,
-        expectedSnapshotID: String? = nil
+        expectedSnapshotID: String? = nil,
+        telemetryPhase: String,
+        telemetryOperationID: String
     ) throws -> WorkflowSnapshot {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        var loadedByteCount = 0
+        var loadedWorkflowCount = 0
+        var didSucceed = false
+        defer {
+            if didSucceed {
+                Self.logger.info(
+                    "operation=snapshot_load correlation=\(telemetryOperationID, privacy: .public) result=success phase=\(telemetryPhase, privacy: .public) duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) bytes=\(loadedByteCount, privacy: .public) workflows=\(loadedWorkflowCount, privacy: .public)"
+                )
+            } else {
+                Self.logger.error(
+                    "operation=snapshot_load correlation=\(telemetryOperationID, privacy: .public) result=failure phase=\(telemetryPhase, privacy: .public) duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) bytes=\(loadedByteCount, privacy: .public) workflows=\(loadedWorkflowCount, privacy: .public)"
+                )
+            }
+        }
+
         if let expectedSnapshotID {
             let metadataURL = root.appendingPathComponent("metadata.json")
+            let metadataData = try Data(contentsOf: metadataURL)
+            loadedByteCount += metadataData.count
             let metadata = try decoder.decode(
                 WorkflowSnapshotMetadata.self,
-                from: Data(contentsOf: metadataURL)
+                from: metadataData
             )
             try metadata.validate(expectedSnapshotID: expectedSnapshotID)
         }
 
+        let libraryData = try Data(contentsOf: try workflowLibraryURL(root: root))
+        loadedByteCount += libraryData.count
         let library = try decoder.decode(
             WorkflowLibrarySnapshot.self,
-            from: Data(contentsOf: try workflowLibraryURL(root: root))
+            from: libraryData
         )
         try library.validateWorkflowIDs()
+        loadedWorkflowCount = library.workflows.count
 
         var graphsByWorkflowID: [String: AgentGraph] = [:]
         for workflow in library.workflows {
@@ -1230,16 +1373,20 @@ public actor LocalControlRoomStore: ControlRoomStore {
             guard FileManager.default.fileExists(atPath: graphURL.path) else {
                 throw WorkflowSnapshotIntegrityError.missingWorkflowGraph(workflow.id)
             }
+            let graphData = try Data(contentsOf: graphURL)
+            loadedByteCount += graphData.count
             graphsByWorkflowID[workflow.id] = try decoder.decode(
                 AgentGraph.self,
-                from: Data(contentsOf: graphURL)
+                from: graphData
             )
         }
 
         let eventsURL = try workflowEventsURL(root: root)
         let workflowEvents: [WorkflowEvent]
         if FileManager.default.fileExists(atPath: eventsURL.path) {
-            workflowEvents = try decoder.decode([WorkflowEvent].self, from: Data(contentsOf: eventsURL))
+            let eventsData = try Data(contentsOf: eventsURL)
+            loadedByteCount += eventsData.count
+            workflowEvents = try decoder.decode([WorkflowEvent].self, from: eventsData)
         } else {
             workflowEvents = []
         }
@@ -1247,7 +1394,9 @@ public actor LocalControlRoomStore: ControlRoomStore {
         let endpointsURL = try relayEndpointsURL(root: root)
         let relayEndpoints: [AppServerRelayEndpoint]
         if FileManager.default.fileExists(atPath: endpointsURL.path) {
-            relayEndpoints = try decoder.decode([AppServerRelayEndpoint].self, from: Data(contentsOf: endpointsURL))
+            let endpointsData = try Data(contentsOf: endpointsURL)
+            loadedByteCount += endpointsData.count
+            relayEndpoints = try decoder.decode([AppServerRelayEndpoint].self, from: endpointsData)
         } else {
             relayEndpoints = []
         }
@@ -1258,7 +1407,12 @@ public actor LocalControlRoomStore: ControlRoomStore {
             workflowEvents: workflowEvents,
             relayEndpoints: relayEndpoints
         )
-        try snapshot.validateForActivation()
+        try validateSnapshot(
+            snapshot,
+            phase: "\(telemetryPhase)-output",
+            telemetryOperationID: telemetryOperationID
+        )
+        didSucceed = true
         return snapshot
     }
 
@@ -1284,6 +1438,57 @@ public actor LocalControlRoomStore: ControlRoomStore {
         for url in contents where url.lastPathComponent != paths.workflowSnapshotPointerURL.lastPathComponent {
             guard retainedIDs.contains(url.lastPathComponent) == false else { continue }
             try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func validateSnapshot(
+        _ snapshot: WorkflowSnapshot,
+        phase: String,
+        telemetryOperationID: String
+    ) throws {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        var didSucceed = false
+        defer {
+            if didSucceed {
+                Self.logger.info(
+                    "operation=snapshot_validate correlation=\(telemetryOperationID, privacy: .public) result=success phase=\(phase, privacy: .public) duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) workflows=\(snapshot.library.workflows.count, privacy: .public)"
+                )
+            } else {
+                Self.logger.error(
+                    "operation=snapshot_validate correlation=\(telemetryOperationID, privacy: .public) result=failure phase=\(phase, privacy: .public) duration_ms=\(Self.elapsedMilliseconds(since: startedAt), privacy: .public) workflows=\(snapshot.library.workflows.count, privacy: .public)"
+                )
+            }
+        }
+        try snapshot.validateForActivation()
+        didSucceed = true
+    }
+
+    private static func elapsedMilliseconds(since startedAt: UInt64) -> UInt64 {
+        (DispatchTime.now().uptimeNanoseconds &- startedAt) / 1_000_000
+    }
+
+    private static func telemetryOperationID() -> String {
+        UUID().uuidString.lowercased()
+    }
+
+    private static func telemetryName(for patch: CanvasPatch) -> String {
+        switch patch {
+        case .replace:
+            return "replace"
+        case .upsertNode:
+            return "upsert_node"
+        case .removeNode:
+            return "remove_node"
+        case .moveNode:
+            return "move_node"
+        case .updateViewport:
+            return "update_viewport"
+        case .upsertManualEdge:
+            return "upsert_manual_edge"
+        case .removeManualEdge:
+            return "remove_manual_edge"
+        case .upsertMessageRoute:
+            return "upsert_message_route"
         }
     }
 

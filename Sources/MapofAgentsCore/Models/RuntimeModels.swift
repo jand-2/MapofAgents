@@ -178,14 +178,14 @@ public struct AgentThreadPermissions: Codable, Hashable, Sendable {
 
     public init(
         approvalPolicy: AgentApprovalPolicy = .onRequest,
-        sandboxMode: AgentSandboxMode = .dangerFullAccess
+        sandboxMode: AgentSandboxMode = .workspaceWrite
     ) {
         self.approvalPolicy = approvalPolicy
         self.sandboxMode = sandboxMode
     }
 
-    /// Historical app-server workflows expect the full-access sandbox default.
-    /// New-thread UI warns for this mode and confirms it on remote targets.
+    /// New work starts with filesystem access limited to the selected workspace.
+    /// Historical full-access values remain explicitly decodable.
     public static let `default` = AgentThreadPermissions()
 
     public func threadParams() -> [String: JSONValue] {
@@ -942,7 +942,9 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
     public var threadID: String?
     public var turnID: String?
     public var summary: String
+    public var prompt: String?
     public var requestParams: JSONValue?
+    public var responseChoices: [TypedResponseOption]
     public var createdAt: Date
 
     public init(
@@ -954,7 +956,9 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
         threadID: String?,
         turnID: String? = nil,
         summary: String,
+        prompt: String? = nil,
         requestParams: JSONValue? = nil,
+        responseChoices: [TypedResponseOption] = [],
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -965,8 +969,61 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
         self.threadID = threadID
         self.turnID = turnID
         self.summary = summary
+        self.prompt = prompt
         self.requestParams = requestParams
+        self.responseChoices = responseChoices
         self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case hostID
+        case requestID
+        case connectionID
+        case method
+        case threadID
+        case turnID
+        case summary
+        case prompt
+        case requestParams
+        case responseChoices
+        case createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        hostID = try container.decodeIfPresent(HostID.self, forKey: .hostID)
+        requestID = try container.decodeIfPresent(JSONRPCRequestID.self, forKey: .requestID)
+        connectionID = try container.decodeIfPresent(
+            AppServerConnectionID.self,
+            forKey: .connectionID
+        )
+        method = try container.decode(String.self, forKey: .method)
+        threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
+        turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
+        summary = try container.decode(String.self, forKey: .summary)
+        prompt = try container.decodeIfPresent(String.self, forKey: .prompt)
+        requestParams = try container.decodeIfPresent(JSONValue.self, forKey: .requestParams)
+        responseChoices = try container.decodeIfPresent(
+            [TypedResponseOption].self,
+            forKey: .responseChoices
+        ) ?? []
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(hostID, forKey: .hostID)
+        try container.encodeIfPresent(requestID, forKey: .requestID)
+        try container.encode(method, forKey: .method)
+        try container.encodeIfPresent(threadID, forKey: .threadID)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
+        try container.encode(summary, forKey: .summary)
+        try container.encode(promptText, forKey: .prompt)
+        try container.encode(typedResponseChoices, forKey: .responseChoices)
+        try container.encode(createdAt, forKey: .createdAt)
     }
 
     public static func appServerRequest(
@@ -1050,6 +1107,10 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
     }
 
     public var promptText: String {
+        if let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !prompt.isEmpty {
+            return prompt
+        }
         if let questions = requestParams?["questions"]?.arrayValue, let first = questions.first {
             return first["question"]?.stringValue
                 ?? first["header"]?.stringValue
@@ -1080,6 +1141,9 @@ public struct RuntimeAttentionRequest: Codable, Identifiable, Hashable, Sendable
     }
 
     public var typedResponseChoices: [TypedResponseOption] {
+        if !responseChoices.isEmpty {
+            return responseChoices
+        }
         if let options = requestParams?["questions"]?.arrayValue?.first?["options"]?.arrayValue {
             return options.compactMap { option in
                 guard let label = option["label"]?.stringValue ?? option.stringValue else { return nil }

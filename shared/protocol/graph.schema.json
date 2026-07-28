@@ -145,6 +145,13 @@
         "cwd"
       ],
       "properties": {
+        "provider": {
+          "enum": [
+            "codex",
+            "gemini",
+            "grok"
+          ]
+        },
         "hostID": {
           "$ref": "#/$defs/identifier"
         },
@@ -326,6 +333,8 @@
           ]
         },
         "approvalPolicy": {
+          "description": "Legacy flattened form. Writers must use threadPermissions.",
+          "deprecated": true,
           "enum": [
             "on-request",
             "on-failure",
@@ -334,6 +343,8 @@
           ]
         },
         "sandboxMode": {
+          "description": "Legacy flattened form. Writers must use threadPermissions.",
+          "deprecated": true,
           "enum": [
             "danger-full-access",
             "workspace-write",
@@ -560,9 +571,6 @@
         "requestID": {
           "$ref": "#/$defs/requestID"
         },
-        "connectionID": {
-          "type": "string"
-        },
         "method": {
           "type": "string"
         },
@@ -578,7 +586,6 @@
         "prompt": {
           "type": "string"
         },
-        "requestParams": true,
         "responseChoices": {
           "type": "array",
           "items": {

@@ -513,15 +513,15 @@ final class TranscriptSessionStore {
     ) -> Bool {
         guard serverMessage.role == localMessage.role else { return false }
         if serverMessage.text == localMessage.text { return true }
-        guard localMessage.role == .user,
-              !localMessage.text.isEmpty,
-              serverMessage.text.hasPrefix(localMessage.text),
-              (
-                serverMessage.text.contains("Workflow chat references:")
-                    || serverMessage.text.contains("Workflow folder references:")
-              ) else {
+        guard localMessage.role == .user else {
             return false
         }
-        return true
+        let serverPresentation = WorkflowPromptEnvelope.presentation(for: serverMessage.text)
+        let localPresentation = WorkflowPromptEnvelope.presentation(for: localMessage.text)
+        return serverPresentation.visibleText == localPresentation.visibleText
+            && (
+                serverPresentation.visibleText != serverMessage.text
+                    || localPresentation.visibleText != localMessage.text
+            )
     }
 }

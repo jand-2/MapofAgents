@@ -265,6 +265,7 @@ struct ThreadPopoverView: View {
     var isMoving = false
     var isFullScreen = false
     var allowsMoving = false
+    var initiallyFocusesComposer = false
     var canStopTurn = false
     var isStoppingTurn = false
     var onRename: (String) -> Void
@@ -313,6 +314,7 @@ struct ThreadPopoverView: View {
                 canStopTurn: canStopTurn,
                 isStoppingTurn: isStoppingTurn,
                 isFullScreen: isFullScreen,
+                initiallyFocused: initiallyFocusesComposer,
                 onStopTurn: onStopTurn,
                 onSend: onSend
             )
@@ -1406,7 +1408,10 @@ private struct ThreadUserMessageNavigationEntry: Identifiable, Hashable {
     init(userMessage: ThreadMessage, turnItems: [ThreadTurnItem], index: Int) {
         self.id = userMessage.id
         self.index = index
-        self.userPreview = Self.previewText(for: userMessage.text, limit: 96)
+        self.userPreview = Self.previewText(
+            for: WorkflowPromptEnvelope.presentation(for: userMessage.text).visibleText,
+            limit: 96
+        )
         self.responsePreview = Self.responsePreview(in: turnItems)
         self.artifactSummary = ArtifactSummary(attachments: Self.deduplicatedAttachments(
             turnItems.flatMap(\.effectiveAttachments)
@@ -1417,7 +1422,10 @@ private struct ThreadUserMessageNavigationEntry: Identifiable, Hashable {
     init(userMessage: ThreadMessage, messages: [ThreadMessage], index: Int) {
         self.id = userMessage.id
         self.index = index
-        self.userPreview = Self.previewText(for: userMessage.text, limit: 96)
+        self.userPreview = Self.previewText(
+            for: WorkflowPromptEnvelope.presentation(for: userMessage.text).visibleText,
+            limit: 96
+        )
         self.responsePreview = messages.first {
             $0.role == .assistant && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }.map { Self.previewText(for: $0.text, limit: 150) }
@@ -2068,12 +2076,15 @@ private extension String {
 private struct ThreadMessageRow: View {
     var item: ThreadTurnItem
     var provider: AgentProvider
+    private let messagePresentation: WorkflowPromptPresentation
 
     @State private var isExpanded = false
+    @State private var isWorkflowContextExpanded = false
 
     init(item: ThreadTurnItem, provider: AgentProvider = .codex) {
         self.item = item
         self.provider = provider
+        self.messagePresentation = Self.presentation(for: item.message)
     }
 
     init(message: ThreadMessage, provider: AgentProvider = .codex) {
@@ -2084,6 +2095,7 @@ private struct ThreadMessageRow: View {
             attachments: message.attachments
         )
         self.provider = provider
+        self.messagePresentation = Self.presentation(for: message)
     }
 
     var body: some View {
@@ -2252,7 +2264,7 @@ private struct ThreadMessageRow: View {
                             .minimumAccessibleHitTarget()
                             .accessibilityLabel("Copy \(roleLabel.lowercased()) message")
                             .help("Copy message")
-                            .disabled(message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .disabled(displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
 
                         Text(timestampText)
@@ -2278,6 +2290,8 @@ private struct ThreadMessageRow: View {
                         .buttonStyle(.plain)
                     }
 
+                    workflowContextDisclosure
+
                     artifactGroup
                 }
             }
@@ -2292,13 +2306,13 @@ private struct ThreadMessageRow: View {
 
     private var messageText: String {
         guard isLongMessage, !isExpanded else {
-            return message.text
+            return displayText
         }
-        return String(message.text.prefix(Self.previewCharacterLimit))
+        return String(displayText.prefix(Self.previewCharacterLimit))
     }
 
     private var isLongMessage: Bool {
-        message.text.count > Self.previewCharacterLimit
+        displayText.count > Self.previewCharacterLimit
     }
 
     private static let previewCharacterLimit = 1_500
@@ -2363,6 +2377,20 @@ private struct ThreadMessageRow: View {
         item.message
     }
 
+    private static func presentation(for message: ThreadMessage) -> WorkflowPromptPresentation {
+        guard message.role == .user else {
+            return WorkflowPromptPresentation(
+                visibleText: message.text,
+                executionPayload: message.text
+            )
+        }
+        return WorkflowPromptEnvelope.presentation(for: message.text)
+    }
+
+    private var displayText: String {
+        messagePresentation.visibleText
+    }
+
     private var rowCategory: TranscriptRowCategory {
         item.primaryTranscriptRowCategory
     }
@@ -2413,12 +2441,79 @@ private struct ThreadMessageRow: View {
     }
 
     private func copyMessage() {
+        copyToPasteboard(displayText)
+    }
+
+    private func copyToPasteboard(_ text: String) {
         #if os(macOS)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(message.text, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
         #elseif os(iOS)
-        UIPasteboard.general.string = message.text
+        UIPasteboard.general.string = text
         #endif
+    }
+
+    @ViewBuilder
+    private var workflowContextDisclosure: some View {
+        if let context = messagePresentation.workflowContext {
+            DisclosureGroup(isExpanded: $isWorkflowContextExpanded) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("MapofAgents appended delivery instructions for workflow mentions. The original execution payload remains available for diagnostics.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 12) {
+                        Button {
+                            copyToPasteboard(context.rawText)
+                        } label: {
+                            Label("Copy context", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption.weight(.semibold))
+                        .minimumAccessibleHitTarget()
+                        .accessibilityLabel("Copy workflow context")
+                        .help("Copy appended workflow context")
+
+                        Button {
+                            copyToPasteboard(messagePresentation.executionPayload)
+                        } label: {
+                            Label("Copy full payload", systemImage: "doc.on.clipboard")
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption.weight(.semibold))
+                        .minimumAccessibleHitTarget()
+                        .accessibilityLabel("Copy full execution payload")
+                        .help("Copy the visible message and appended workflow context")
+                    }
+                }
+                .padding(.top, 5)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Workflow context", systemImage: "point.3.connected.trianglepath.dotted")
+                        .font(.caption.weight(.semibold))
+
+                    Text(workflowContextSummary(context))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(8)
+            .background(.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
+            .accessibilityHint("Shows MapofAgents delivery context appended to this message")
+        }
+    }
+
+    private func workflowContextSummary(_ context: WorkflowPromptContextSummary) -> String {
+        [
+            countLabel(context.chatReferenceCount, singular: "chat reference", plural: "chat references"),
+            countLabel(context.folderReferenceCount, singular: "folder reference", plural: "folder references"),
+            countLabel(context.routeCount, singular: "route", plural: "routes"),
+        ].joined(separator: " • ")
+    }
+
+    private func countLabel(_ count: Int, singular: String, plural: String) -> String {
+        "\(count) \(count == 1 ? singular : plural)"
     }
 
     private var timestampText: String {

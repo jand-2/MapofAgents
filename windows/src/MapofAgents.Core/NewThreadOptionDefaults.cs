@@ -5,7 +5,7 @@ public static class NewThreadOptionDefaults
     public const string DefaultModel = "gpt-5.5";
     public const string DefaultReasoningEffort = "high";
     public const string DefaultApprovalPolicy = "on-request";
-    public const string DefaultSandboxMode = "danger-full-access";
+    public const string DefaultSandboxMode = "workspace-write";
 
     public static IReadOnlyList<string> SupportedReasoningEfforts =>
     [
@@ -40,4 +40,12 @@ public static class NewThreadOptionDefaults
         ("Workspace Write", "workspace-write"),
         ("Read Only", "read-only")
     ];
+
+    public static bool RequiresFullAccessConfirmation(string? sandboxMode)
+    {
+        return string.Equals(
+            sandboxMode,
+            "danger-full-access",
+            StringComparison.OrdinalIgnoreCase);
+    }
 }

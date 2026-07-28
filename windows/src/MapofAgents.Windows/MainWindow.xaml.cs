@@ -12150,6 +12150,12 @@ public sealed partial class MainWindow : Window
         UpdateNewThreadCreatingChrome();
         NewThreadNameBox.Text = "";
         NewThreadPromptBox.Text = "";
+        SelectComboBoxTag(
+            NewThreadApprovalPolicyBox,
+            NewThreadOptionDefaults.DefaultApprovalPolicy);
+        SelectComboBoxTag(
+            NewThreadSandboxModeBox,
+            NewThreadOptionDefaults.DefaultSandboxMode);
         SyncNewThreadModelChoices();
         _ = RefreshNewThreadModelOptionsForSelectedTargetAsync();
         UpdateNewThreadComposerSummary();
@@ -12198,8 +12204,8 @@ public sealed partial class MainWindow : Window
             : NewThreadModelCatalog.CurrentReasoningEffort(selectedModel, SelectedNewThreadEffort());
         var approvalPolicy = ComboBoxTag(NewThreadApprovalPolicyBox, NewThreadOptionDefaults.DefaultApprovalPolicy);
         var sandboxMode = ComboBoxTag(NewThreadSandboxModeBox, NewThreadOptionDefaults.DefaultSandboxMode);
-        if (ShouldConfirmNewThreadFullAccess(targetNode, sandboxMode) &&
-            !await ConfirmRemoteFullAccessNewThreadAsync())
+        if (NewThreadOptionDefaults.RequiresFullAccessConfirmation(sandboxMode) &&
+            !await ConfirmFullAccessNewThreadAsync(CurrentNewThreadTargetIsRemote()))
         {
             AddActivity("Canceled Full Access thread creation.");
             return;
@@ -12899,12 +12905,6 @@ public sealed partial class MainWindow : Window
             NewThreadTargetIsRemote(targetNode);
     }
 
-    private static bool ShouldConfirmNewThreadFullAccess(CanvasNode targetNode, string sandboxMode)
-    {
-        return string.Equals(sandboxMode, "danger-full-access", StringComparison.OrdinalIgnoreCase) &&
-            NewThreadTargetIsRemote(targetNode);
-    }
-
     private static bool NewThreadTargetIsRemote(CanvasNode targetNode)
     {
         return !IsLocalHostId(targetNode.Metadata.HostID);
@@ -12915,11 +12915,13 @@ public sealed partial class MainWindow : Window
         return LocalHostIdentity.IsLocalHostID(hostID, Environment.MachineName);
     }
 
-    private Task<bool> ConfirmRemoteFullAccessNewThreadAsync()
+    private Task<bool> ConfirmFullAccessNewThreadAsync(bool isRemote)
     {
         return ConfirmDestructiveActionAsync(
-            "Use Full Access on Remote Machine?",
-            "This lets Codex run without filesystem sandboxing on the selected remote target. Continue only if you trust the machine, workspace, and prompt context.",
+            isRemote ? "Use Full Access on Remote Machine?" : "Use Full Access?",
+            isRemote
+                ? "This lets Codex run without filesystem sandboxing on the selected remote target. Continue only if you trust the machine, workspace, and prompt context."
+                : "This lets Codex run without filesystem sandboxing on this Mac. Continue only if you trust the workspace and prompt context.",
             "Create With Full Access");
     }
 

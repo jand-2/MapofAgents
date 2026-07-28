@@ -6,6 +6,20 @@ public enum NewThreadTargetKind: String, Hashable, Sendable {
     case machine
 }
 
+public enum NewThreadPermissionPolicy {
+    public static let defaultPermissions = AgentThreadPermissions(
+        approvalPolicy: .onRequest,
+        sandboxMode: .workspaceWrite
+    )
+
+    public static func requiresFullAccessConfirmation(
+        provider: AgentProvider,
+        sandboxMode: AgentSandboxMode
+    ) -> Bool {
+        provider == .codex && sandboxMode == .dangerFullAccess
+    }
+}
+
 public struct NewThreadRequest: Sendable {
     public var targetNodeID: NodeID
     public var targetKind: NewThreadTargetKind
@@ -28,7 +42,7 @@ public struct NewThreadRequest: Sendable {
         provider: AgentProvider = .codex,
         modelID: String,
         reasoningEffort: String,
-        permissions: AgentThreadPermissions = .default,
+        permissions: AgentThreadPermissions = NewThreadPermissionPolicy.defaultPermissions,
         initialPrompt: String,
         adoptProviderGeneratedTitle: Bool = false
     ) {
@@ -49,7 +63,7 @@ public struct NewThreadRequest: Sendable {
         provider: AgentProvider = .codex,
         modelID: String,
         reasoningEffort: String,
-        permissions: AgentThreadPermissions = .default,
+        permissions: AgentThreadPermissions = NewThreadPermissionPolicy.defaultPermissions,
         initialPrompt: String,
         adoptProviderGeneratedTitle: Bool = false
     ) {
@@ -90,8 +104,8 @@ public struct NewThreadPopoverView: View {
     @State private var selectedProvider: AgentProvider = .codex
     @State private var selectedModelID = ""
     @State private var selectedEffort = ""
-    @State private var selectedApprovalPolicy = AgentThreadPermissions.default.approvalPolicy
-    @State private var selectedSandboxMode = AgentThreadPermissions.default.sandboxMode
+    @State private var selectedApprovalPolicy = NewThreadPermissionPolicy.defaultPermissions.approvalPolicy
+    @State private var selectedSandboxMode = NewThreadPermissionPolicy.defaultPermissions.sandboxMode
     @State private var threadName = ""
     @State private var initialPrompt = ""
     @State private var isConfirmingDangerFullAccess = false
@@ -164,7 +178,7 @@ public struct NewThreadPopoverView: View {
         }
         .shadow(color: .black.opacity(isFullScreen ? 0 : 0.18), radius: 18, x: 0, y: 10)
         .confirmationDialog(
-            "Use Full Access on Remote Machine?",
+            dangerFullAccessConfirmationTitle,
             isPresented: $isConfirmingDangerFullAccess,
             titleVisibility: .visible
         ) {
@@ -174,8 +188,11 @@ public struct NewThreadPopoverView: View {
             .disabled(isCreating)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This lets Codex run without filesystem sandboxing on the selected remote target. Continue only if you trust the machine, workspace, and prompt context.")
+            Text(dangerFullAccessConfirmationMessage)
         }
+        #if os(macOS)
+        .onExitCommand(perform: onCancel)
+        #endif
         .onAppear(perform: syncDefaults)
         .onChange(of: runtimeStore.models) { _, _ in syncDefaults() }
         .onChange(of: catalogRevision) { _, _ in syncDefaults() }
@@ -244,6 +261,7 @@ public struct NewThreadPopoverView: View {
             .buttonStyle(.plain)
             .help("Close")
             .accessibilityLabel("Close new thread")
+            .keyboardShortcut(.cancelAction)
             .minimumAccessibleHitTarget()
         }
         .padding(14)
@@ -454,7 +472,8 @@ public struct NewThreadPopoverView: View {
                     minLines: 4,
                     maxLines: 9,
                     usesLocalMentionCatalog: selectedProvider == .codex && selectedTargetUsesLocalCatalog,
-                    initiallyFocused: true
+                    initiallyFocused: true,
+                    onSubmit: create
                 )
                 .disabled(isCreating)
 
@@ -645,9 +664,23 @@ public struct NewThreadPopoverView: View {
     }
 
     private var shouldConfirmDangerFullAccess: Bool {
-        selectedProvider == .codex
-            && selectedSandboxMode == .dangerFullAccess
-            && selectedTargetIsRemote
+        NewThreadPermissionPolicy.requiresFullAccessConfirmation(
+            provider: selectedProvider,
+            sandboxMode: selectedSandboxMode
+        )
+    }
+
+    private var dangerFullAccessConfirmationTitle: String {
+        selectedTargetIsRemote
+            ? "Use Full Access on Remote Machine?"
+            : "Use Full Access?"
+    }
+
+    private var dangerFullAccessConfirmationMessage: String {
+        if selectedTargetIsRemote {
+            return "This lets Codex run without filesystem sandboxing on the selected remote target. Continue only if you trust the machine, workspace, and prompt context."
+        }
+        return "This lets Codex run without filesystem sandboxing on this Mac. Continue only if you trust the workspace and prompt context."
     }
 
     private var dangerFullAccessWarningText: String {
@@ -691,7 +724,7 @@ public struct NewThreadPopoverView: View {
 
     private func create() {
         guard !isCreating else { return }
-        guard selectedTargetNode != nil else { return }
+        guard createUnavailableReason == nil else { return }
         if shouldConfirmDangerFullAccess {
             isConfirmingDangerFullAccess = true
             return

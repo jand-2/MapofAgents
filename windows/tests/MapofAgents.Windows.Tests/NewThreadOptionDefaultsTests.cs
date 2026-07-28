@@ -22,13 +22,16 @@ public sealed class NewThreadOptionDefaultsTests
     public void PermissionsMatchMacThreadPermissionDefaults()
     {
         Assert.AreEqual("on-request", NewThreadOptionDefaults.DefaultApprovalPolicy);
-        Assert.AreEqual("danger-full-access", NewThreadOptionDefaults.DefaultSandboxMode);
+        Assert.AreEqual("workspace-write", NewThreadOptionDefaults.DefaultSandboxMode);
         CollectionAssert.AreEqual(
             new[] { "on-request", "on-failure", "untrusted", "never" },
             NewThreadOptionDefaults.ApprovalPolicies.Select(policy => policy.Value).ToArray());
         CollectionAssert.AreEqual(
             new[] { "danger-full-access", "workspace-write", "read-only" },
             NewThreadOptionDefaults.SandboxModes.Select(mode => mode.Value).ToArray());
+        Assert.IsTrue(NewThreadOptionDefaults.RequiresFullAccessConfirmation("danger-full-access"));
+        Assert.IsFalse(NewThreadOptionDefaults.RequiresFullAccessConfirmation("workspace-write"));
+        Assert.IsFalse(NewThreadOptionDefaults.RequiresFullAccessConfirmation("read-only"));
     }
 
     [TestMethod]

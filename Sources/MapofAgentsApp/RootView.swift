@@ -15,6 +15,7 @@ struct RootView: View {
     @State private var folderImportMachine: CanvasNode?
     @State private var isShowingNewThread = false
     @State private var isReadingModePresented = false
+    @State private var hasThreadChatSurface = false
     @State private var readingThreadCount = 0
     @State private var isUpdatesPresented = false
     @State private var isMachinesMenuPresented = false
@@ -54,16 +55,21 @@ struct RootView: View {
     private var threadCreation: ThreadCreationCoordinator { session.threadCreation }
 
     private var activeRootOverlay: RootOverlayFocusTarget? {
-        if isShowingNewThread {
-            return .newThread
-        }
-        if workflowLibrary.editorMode != nil {
-            return .workflowName
-        }
-        if isShowingPairing {
-            return .pairing
-        }
-        return nil
+        RootModalPresentationPolicy.activeTarget(
+            isNewThreadPresented: isShowingNewThread,
+            isWorkflowEditorPresented: workflowLibrary.editorMode != nil,
+            isPairingPresented: isShowingPairing,
+            isThreadChatPresented: hasThreadChatSurface,
+            isReaderPresented: isReadingModePresented
+        )
+    }
+
+    private var isGraphCanvasBlockedByRootOverlay: Bool {
+        RootModalPresentationPolicy.blocksGraphCanvas(activeRootOverlay)
+    }
+
+    private var isRootShellBlockedByModal: Bool {
+        RootModalPresentationPolicy.blocksRootShell(activeRootOverlay)
     }
 
     var body: some View {
@@ -83,11 +89,14 @@ struct RootView: View {
             onThreadMentionCatalogNeeded: refreshMentionCatalog(for:),
             showsSubagents: showsSubagents,
             isReadingModePresented: $isReadingModePresented,
+            hasThreadChatSurface: $hasThreadChatSurface,
             readingThreadCount: $readingThreadCount,
             isMachineRecoveryPresented: $isMachineRecoveryPresented,
             onCanvasSizeChange: { canvasSize = $0 }
         )
-            .accessibilityHidden(activeRootOverlay != nil)
+            .accessibilityHidden(isGraphCanvasBlockedByRootOverlay)
+            .allowsHitTesting(!isGraphCanvasBlockedByRootOverlay)
+            .disabled(isGraphCanvasBlockedByRootOverlay)
             .overlay(alignment: .topLeading) {
                 if !isReadingModePresented {
                     CanvasCommandBar(
@@ -138,8 +147,18 @@ struct RootView: View {
                         showsSubagents: showsSubagents
                     )
                     .accessibilityFocused($accessibilityFocus, equals: .commandBar)
-                    .accessibilityHidden(activeRootOverlay != nil)
+                    .accessibilityHidden(isRootShellBlockedByModal)
+                    .allowsHitTesting(!isRootShellBlockedByModal)
+                    .disabled(isRootShellBlockedByModal)
                     .padding(14)
+                }
+            }
+            .overlay {
+                if isGraphCanvasBlockedByRootOverlay {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture {}
+                        .accessibilityHidden(true)
                 }
             }
             .overlay(alignment: .topLeading) {
@@ -164,6 +183,7 @@ struct RootView: View {
                     .accessibilityLabel("New agent thread")
                     .accessibilityAddTraits(.isModal)
                     .accessibilityFocused($accessibilityFocus, equals: .newThread)
+                    .focusSection()
                     .padding(.leading, 14)
                     .padding(.top, 72)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
@@ -184,6 +204,10 @@ struct RootView: View {
                     .accessibilityLabel(workflowEditorMode.title)
                     .accessibilityAddTraits(.isModal)
                     .accessibilityFocused($accessibilityFocus, equals: .workflowName)
+                    .focusSection()
+                    .onExitCommand {
+                        workflowLibrary.editorMode = nil
+                    }
                     .padding(.leading, 14)
                     .padding(.top, 72)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
@@ -202,28 +226,32 @@ struct RootView: View {
                     .accessibilityLabel("Pair iPhone")
                     .accessibilityAddTraits(.isModal)
                     .accessibilityFocused($accessibilityFocus, equals: .pairing)
+                    .focusSection()
+                    .onExitCommand(perform: dismissPairingPopover)
                     .padding(.leading, 14)
                     .padding(.top, 72)
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
                 }
             }
             .overlay(alignment: .topTrailing) {
-                if isShowingNotificationHistory {
-                    TopNotificationHistoryView(
-                        notifications: topNotificationHistory,
-                        onClose: { isShowingNotificationHistory = false },
-                        onDismissAllCurrent: dismissAllTopNotifications
-                    )
-                    .padding(14)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                } else if !topNotifications.isEmpty {
-                    TopNotificationStackView(
-                        notifications: topNotifications,
-                        onDismiss: dismissTopNotification,
-                        onDismissAll: dismissAllTopNotifications
-                    )
-                    .padding(14)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                if !isRootShellBlockedByModal {
+                    if isShowingNotificationHistory {
+                        TopNotificationHistoryView(
+                            notifications: topNotificationHistory,
+                            onClose: { isShowingNotificationHistory = false },
+                            onDismissAllCurrent: dismissAllTopNotifications
+                        )
+                        .padding(14)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    } else if !topNotifications.isEmpty {
+                        TopNotificationStackView(
+                            notifications: topNotifications,
+                            onDismiss: dismissTopNotification,
+                            onDismissAll: dismissAllTopNotifications
+                        )
+                        .padding(14)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                 }
             }
             .task {
@@ -733,10 +761,24 @@ struct RootView: View {
         to current: RootOverlayFocusTarget?
     ) {
         overlayKeyboardFocusRestorer.transition(from: previous, to: current)
+        if current?.isPresentedInsideGraphCanvas == true {
+            // Release the root-owned focus synchronously. Canvas-owned
+            // modals establish their own focus after presentation; clearing
+            // it after a yield races and can undo the Reader's picker focus.
+            accessibilityFocus = nil
+            return
+        }
         Task { @MainActor in
             await Task.yield()
             guard activeRootOverlay == current else { return }
-            accessibilityFocus = current ?? .commandBar
+            switch current {
+            case .newThread, .workflowName, .pairing:
+                accessibilityFocus = current
+            case .threadChat, .reader:
+                break
+            case .commandBar, nil:
+                accessibilityFocus = .commandBar
+            }
         }
     }
 

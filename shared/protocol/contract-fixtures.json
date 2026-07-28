@@ -21,7 +21,8 @@
       "schema": "graph.schema.json",
       "valid": [
         "fixtures/sample-graph.json",
-        "fixtures/sample-cross-platform-graph.json"
+        "fixtures/sample-cross-platform-graph.json",
+        "fixtures/sample-cross-platform-graph.apple-golden.json"
       ],
       "invalid": [
         "fixtures/invalid/graph-with-unknown-metadata.json"

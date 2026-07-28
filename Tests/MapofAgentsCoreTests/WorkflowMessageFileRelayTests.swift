@@ -61,10 +61,11 @@ func workflowMessageRelayClaimsAndCompletesAProviderRequest() async throws {
     #expect(result.success)
     #expect(result.reply == "Hello from Grok")
     #expect(probe.requests == [request])
+    let claimedURL = relay.claimedDirectoryURL
+        .appendingPathComponent("\(request.requestID).json")
+    try await waitForWorkflowRelayClaimRemoval(at: claimedURL)
     #expect(!FileManager.default.fileExists(atPath: pendingURL.path))
-    #expect(!FileManager.default.fileExists(
-        atPath: relay.claimedDirectoryURL.appendingPathComponent("\(request.requestID).json").path
-    ))
+    #expect(!FileManager.default.fileExists(atPath: claimedURL.path))
 
     let attributes = try FileManager.default.attributesOfItem(atPath: relay.helperExecutableURL.path)
     let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
@@ -139,6 +140,16 @@ private func waitForWorkflowRelayResult(
         if FileManager.default.fileExists(atPath: resultURL.path) {
             let data = try MapofAgentsPrivateFile.read(resultURL, maximumBytes: 1_048_576)
             return try JSONDecoder().decode(WorkflowMessageRelayResult.self, from: data)
+        }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    throw WorkflowMessageRelayTestError.timedOut
+}
+
+private func waitForWorkflowRelayClaimRemoval(at claimedURL: URL) async throws {
+    for _ in 0..<200 {
+        if !FileManager.default.fileExists(atPath: claimedURL.path) {
+            return
         }
         try await Task.sleep(for: .milliseconds(5))
     }

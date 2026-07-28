@@ -66,6 +66,28 @@ public static class ThreadKinds
     public const string Subagent = "subagent";
 }
 
+public static class AgentProviders
+{
+    public const string Codex = "codex";
+    public const string Gemini = "gemini";
+    public const string Grok = "grok";
+}
+
+public static class AgentApprovalPolicies
+{
+    public const string OnRequest = "on-request";
+    public const string OnFailure = "on-failure";
+    public const string Untrusted = "untrusted";
+    public const string Never = "never";
+}
+
+public static class AgentSandboxModes
+{
+    public const string DangerFullAccess = "danger-full-access";
+    public const string WorkspaceWrite = "workspace-write";
+    public const string ReadOnly = "read-only";
+}
+
 public static class EdgeKinds
 {
     public const string MachineFolder = "machineFolder";
@@ -134,6 +156,9 @@ public static class CanvasLayoutCoordinateSpaces
 
 public sealed class ThreadRef
 {
+    [JsonPropertyName("provider")]
+    public string Provider { get; set; } = AgentProviders.Codex;
+
     [JsonPropertyName("hostID")]
     public string HostID { get; set; } = "";
 
@@ -145,10 +170,36 @@ public sealed class ThreadRef
 
     [JsonPropertyName("name")]
     public string? Name { get; set; }
+
+    [JsonIgnore]
+    public string QualifiedID => Provider == AgentProviders.Codex
+        ? $"{HostID}::{ThreadID}"
+        : $"{Provider}::{HostID}::{ThreadID}";
+
+    public bool Matches(ThreadRef other)
+    {
+        return string.Equals(Provider, other.Provider, StringComparison.Ordinal) &&
+            string.Equals(HostID, other.HostID, StringComparison.Ordinal) &&
+            string.Equals(ThreadID, other.ThreadID, StringComparison.Ordinal);
+    }
 }
 
-public sealed class NodeMetadata
+public sealed class AgentThreadPermissions
 {
+    [JsonPropertyName("approvalPolicy")]
+    public string ApprovalPolicy { get; set; } = AgentApprovalPolicies.OnRequest;
+
+    [JsonPropertyName("sandboxMode")]
+    public string SandboxMode { get; set; } = AgentSandboxModes.WorkspaceWrite;
+}
+
+public sealed class NodeMetadata : IJsonOnDeserialized
+{
+    private AgentThreadPermissions? _threadPermissions;
+    private string? _legacyApprovalPolicy;
+    private string? _legacySandboxMode;
+    private bool _hasCanonicalThreadPermissions;
+
     [JsonPropertyName("hostID")]
     public string? HostID { get; set; }
 
@@ -182,11 +233,65 @@ public sealed class NodeMetadata
     [JsonPropertyName("threadKind")]
     public string? ThreadKind { get; set; }
 
+    [JsonPropertyName("threadPermissions")]
+    public AgentThreadPermissions? ThreadPermissions
+    {
+        get => _threadPermissions;
+        set
+        {
+            _threadPermissions = value;
+            _hasCanonicalThreadPermissions = value is not null;
+        }
+    }
+
+    [JsonIgnore]
+    public string? ApprovalPolicy
+    {
+        get => ThreadPermissions?.ApprovalPolicy;
+        set
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            ThreadPermissions ??= new AgentThreadPermissions();
+            ThreadPermissions.ApprovalPolicy = value;
+        }
+    }
+
+    [JsonIgnore]
+    public string? SandboxMode
+    {
+        get => ThreadPermissions?.SandboxMode;
+        set
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            ThreadPermissions ??= new AgentThreadPermissions();
+            ThreadPermissions.SandboxMode = value;
+        }
+    }
+
+    // Decode the pre-contract flattened fields, but never write them back.
     [JsonPropertyName("approvalPolicy")]
-    public string? ApprovalPolicy { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LegacyApprovalPolicy
+    {
+        get => null;
+        set => _legacyApprovalPolicy = value;
+    }
 
     [JsonPropertyName("sandboxMode")]
-    public string? SandboxMode { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LegacySandboxMode
+    {
+        get => null;
+        set => _legacySandboxMode = value;
+    }
 
     [JsonPropertyName("initialPrompt")]
     public string? InitialPrompt { get; set; }
@@ -211,6 +316,22 @@ public sealed class NodeMetadata
 
     [JsonPropertyName("hasManualPosition")]
     public bool? HasManualPosition { get; set; }
+
+    void IJsonOnDeserialized.OnDeserialized()
+    {
+        if (_hasCanonicalThreadPermissions ||
+            (_legacyApprovalPolicy is null && _legacySandboxMode is null))
+        {
+            return;
+        }
+
+        _threadPermissions = new AgentThreadPermissions
+        {
+            ApprovalPolicy = _legacyApprovalPolicy ?? AgentApprovalPolicies.OnRequest,
+            // Preserve the historical fallback for partially flattened documents.
+            SandboxMode = _legacySandboxMode ?? AgentSandboxModes.DangerFullAccess
+        };
+    }
 }
 
 public sealed class LocalThreadMessage
@@ -370,7 +491,7 @@ public sealed class RuntimeAttentionRequest
     public string? HostID { get; set; }
 
     [JsonPropertyName("requestID")]
-    public string? RequestID { get; set; }
+    public JsonRpcRequestId? RequestID { get; set; }
 
     [JsonPropertyName("method")]
     public string Method { get; set; } = "";
@@ -387,8 +508,18 @@ public sealed class RuntimeAttentionRequest
     [JsonPropertyName("prompt")]
     public string? Prompt { get; set; }
 
-    [JsonPropertyName("requestParams")]
+    [JsonIgnore]
     public JsonElement? RequestParams { get; set; }
+
+    // Older graphs may contain the full app-server payload. Decode it for
+    // compatibility and live presentation, but never write it back to disk.
+    [JsonPropertyName("requestParams")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? LegacyRequestParams
+    {
+        get => null;
+        set => RequestParams = value;
+    }
 
     [JsonPropertyName("responseChoices")]
     public List<RuntimeAttentionResponseChoice> ResponseChoices { get; set; } = [];
@@ -447,9 +578,11 @@ public sealed class AgentGraph
     public string? LayoutCoordinateSpace { get; set; }
 
     [JsonPropertyName("nodes")]
+    [JsonConverter(typeof(ObjectOrAlternatingArrayDictionaryConverter<CanvasNode>))]
     public Dictionary<string, CanvasNode> Nodes { get; set; } = [];
 
     [JsonPropertyName("manualEdges")]
+    [JsonConverter(typeof(ObjectOrAlternatingArrayDictionaryConverter<CanvasEdge>))]
     public Dictionary<string, CanvasEdge> ManualEdges { get; set; } = [];
 
     [JsonPropertyName("messageRoutes")]

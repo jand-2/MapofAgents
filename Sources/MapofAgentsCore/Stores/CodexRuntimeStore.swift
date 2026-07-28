@@ -1,14 +1,10 @@
 import Foundation
 import Observation
-import OSLog
 
 @MainActor
 @Observable
 public final class CodexRuntimeStore {
-    private static let logger = Logger(
-        subsystem: "dev.mapofagents",
-        category: "CodexRuntime"
-    )
+    private static let logger = MapofAgentsTelemetry.codexRuntime
 
     public private(set) var connectionState: HostStatus = .disconnected
     public private(set) var statusMessage: String = "Not connected"
@@ -28,6 +24,12 @@ public final class CodexRuntimeStore {
 
     private let client: CodexAppServerClient
     private let mentionCatalogSession: MentionCatalogSession
+    private let threadCommandLane = ThreadCommandLane()
+    private var localReconnectTask: Task<Void, Never>?
+    private var localReconnectGeneration: UUID?
+    private var activeLocalConnectionID: AppServerConnectionID?
+    private var reconnectingLocalRuntimeStateIDs: Set<String> = []
+    private var localRuntimeStateRevisions: [String: UInt64] = [:]
     private var isConnectingRuntime = false
     private var inFlightRuntimeWriteCount = 0
     private var mentionCatalogPublicationGeneration = MentionCatalogPublicationGeneration()
@@ -142,13 +144,18 @@ public final class CodexRuntimeStore {
         // runtime maintenance cannot begin while a normal connection is being
         // admitted.
         if await client.isInitializedAndRunning() {
+            activeLocalConnectionID = await client.currentConnectionID()
             publishConnectedRuntime(
                 launchDescription: await client.currentLaunchDescription(),
                 recordHealthCheck: false
             )
+            scheduleLocalReconnectReconciliationIfNeeded()
             return
         }
 
+        if localReconnectGeneration == nil {
+            _ = markLocalRuntimeStatesReconciling()
+        }
         connectionState = .connecting
         statusMessage = "Starting codex app-server"
         Self.logger.info("Local Codex runtime connection attempt started")
@@ -175,7 +182,10 @@ public final class CodexRuntimeStore {
     }
 
     public func disconnectForRuntimeUpdate() async {
+        _ = markLocalRuntimeStatesReconciling()
+        activeLocalConnectionID = nil
         await client.stop()
+        await threadCommandLane.cancelAll()
         connectionState = .disconnected
         localHost.status = .disconnected
         statusMessage = "Updating Codex runtime"
@@ -205,6 +215,7 @@ public final class CodexRuntimeStore {
 
             try await client.notify(method: "initialized")
             await client.markInitialized()
+            activeLocalConnectionID = await client.currentConnectionID()
             let launchDescription = await client.currentLaunchDescription()
             updateHost(fromInitializeResult: initializeResult, launchDescription: launchDescription)
         } catch {
@@ -212,6 +223,7 @@ public final class CodexRuntimeStore {
                 throw error
             }
             await client.markInitialized()
+            activeLocalConnectionID = await client.currentConnectionID()
             localHost.endpointDescription = await client.currentLaunchDescription()
         }
 
@@ -222,6 +234,7 @@ public final class CodexRuntimeStore {
         let launchDescription = await client.currentLaunchDescription()
         publishConnectedRuntime(launchDescription: launchDescription, recordHealthCheck: true)
         Self.logger.info("Local Codex runtime connected")
+        scheduleLocalReconnectReconciliationIfNeeded()
 
         Task {
             try? await refreshThreads()
@@ -237,6 +250,7 @@ public final class CodexRuntimeStore {
     }
 
     private func applyConnectionFailure(_ error: Error) {
+        activeLocalConnectionID = nil
         let hadSuccessfulConnection = localHost.lastSeenAt != nil
         connectionState = hadSuccessfulConnection ? .disconnected : .unavailable
         localHost.status = hadSuccessfulConnection ? .disconnected : .unavailable
@@ -253,6 +267,173 @@ public final class CodexRuntimeStore {
         if recordHealthCheck || localHost.lastSeenAt == nil {
             localHost.lastSeenAt = Date()
         }
+    }
+
+    /// Marks transient connection-bound state stale while retaining the last
+    /// durable run status until the new App Server generation is observed.
+    @discardableResult
+    func markLocalRuntimeStatesReconciling() -> UUID {
+        localReconnectTask?.cancel()
+        localReconnectTask = nil
+        let generation = UUID()
+        localReconnectGeneration = generation
+        pendingAttentionRequests.removeAll()
+
+        for key in threadRuntimeStates.keys.sorted() {
+            guard var state = threadRuntimeStates[key],
+                  state.hostID == localHost.id else {
+                continue
+            }
+            reconnectingLocalRuntimeStateIDs.insert(key)
+            state.pendingRequestIDs = []
+            state.activeFlags.remove(.waitingOnApproval)
+            state.activeFlags.remove(.waitingOnUserInput)
+            state.liveAssistantText = ""
+            state.currentActivitySummary = "Reconnecting — showing last known state"
+            threadRuntimeStates[key] = state
+        }
+        liveAssistantTextByThreadID.removeAll()
+        return generation
+    }
+
+    private func scheduleLocalReconnectReconciliationIfNeeded() {
+        guard connectionState == .connected,
+              localReconnectTask == nil,
+              let generation = localReconnectGeneration,
+              let expectedConnectionID = activeLocalConnectionID else {
+            return
+        }
+
+        let hostID = localHost.id
+        let hostName = localHost.name
+        let client = client
+        let desiredThreads = localReconnectDesiredThreads()
+        let baselineRevisions = localRuntimeStateRevisions
+
+        localReconnectTask = Task { [weak self] in
+            defer {
+                if self?.localReconnectGeneration == generation {
+                    self?.localReconnectTask = nil
+                }
+            }
+            guard !Task.isCancelled else {
+                return
+            }
+            let reconciliation = await AppServerReconnectReconciler.reconcile(
+                hostID: hostID,
+                hostName: hostName,
+                desiredThreads: desiredThreads
+            ) { method, params, timeout in
+                try await client.request(
+                    AppServerCall(method, params: params),
+                    timeoutOverride: timeout
+                )
+            }
+            guard !Task.isCancelled,
+                  await client.currentConnectionID() == expectedConnectionID else {
+                return
+            }
+            self?.applyLocalReconnectReconciliation(
+                reconciliation,
+                expectedGeneration: generation,
+                baselineRevisions: baselineRevisions
+            )
+        }
+    }
+
+    private func localReconnectDesiredThreads() -> [String: ThreadRef] {
+        var desired = Dictionary(
+            uniqueKeysWithValues: threadSummaries
+                .filter { $0.hostID == localHost.id }
+                .map { ($0.threadID, $0) }
+        )
+        for state in threadRuntimeStates.values where state.hostID == localHost.id {
+            desired[state.threadID] = desired[state.threadID] ?? ThreadRef(
+                hostID: localHost.id,
+                threadID: state.threadID,
+                cwd: ""
+            )
+        }
+        return desired
+    }
+
+    func applyLocalReconnectReconciliation(
+        _ reconciliation: AppServerReconnectReconciliation,
+        expectedGeneration: UUID,
+        baselineRevisions: [String: UInt64]
+    ) {
+        guard localReconnectGeneration == expectedGeneration,
+              reconciliation.hostID == localHost.id else {
+            return
+        }
+
+        let liveUpdatedThreadIDs = Set(
+            reconciliation.targetThreadIDs.filter {
+                localRuntimeStateRevisions[$0, default: 0]
+                    != baselineRevisions[$0, default: 0]
+            }
+        )
+        let entriesByThreadID = Dictionary(
+            uniqueKeysWithValues: reconciliation.catalogEntries.map {
+                ($0.threadRef.threadID, $0)
+            }
+        )
+
+        for entry in reconciliation.catalogEntries
+        where !liveUpdatedThreadIDs.contains(entry.threadRef.threadID) {
+            publishCreatedThread(entry.threadRef)
+        }
+
+        for threadID in reconciliation.targetThreadIDs.sorted() {
+            let key = ThreadRef.qualifiedID(hostID: localHost.id, threadID: threadID)
+            guard !liveUpdatedThreadIDs.contains(threadID) else {
+                reconnectingLocalRuntimeStateIDs.remove(key)
+                continue
+            }
+            let failure = reconciliation.failuresByThreadID[threadID]
+            upsertRuntimeState(hostID: localHost.id, threadID: threadID) { state in
+                AppServerReconnectStateReducer.apply(
+                    catalogEntry: entriesByThreadID[threadID],
+                    transcript: reconciliation.transcriptsByThreadID[threadID],
+                    catalogStatusIsAuthoritative: reconciliation
+                        .authoritativeCatalogStatusThreadIDs
+                        .contains(threadID),
+                    to: &state
+                )
+                if let failure {
+                    state.currentActivitySummary =
+                        "Could not fully verify after reconnect — last known state"
+                    state.lastError = state.lastError ?? failure
+                } else if state.currentActivitySummary == nil {
+                    state.currentActivitySummary =
+                        AppServerReconnectStateReducer.activitySummary(for: state.status)
+                }
+            }
+            if failure == nil {
+                reconnectingLocalRuntimeStateIDs.remove(key)
+            }
+        }
+
+        for key in reconnectingLocalRuntimeStateIDs.sorted() {
+            guard var state = threadRuntimeStates[key],
+                  state.hostID == localHost.id,
+                  !reconciliation.targetThreadIDs.contains(state.threadID) else {
+                continue
+            }
+            if reconciliation.omittedThreadIDs.contains(state.threadID) {
+                state.currentActivitySummary =
+                    "Last known state — deferred by bounded reconnect scan"
+                reconnectingLocalRuntimeStateIDs.remove(key)
+            } else {
+                state.currentActivitySummary = reconciliation.loadedThreadListError == nil
+                    ? "Last known state — thread was not loaded after reconnect"
+                    : "Could not verify loaded threads after reconnect — last known state"
+            }
+            threadRuntimeStates[key] = state
+        }
+
+        localReconnectGeneration = nil
+        localReconnectTask = nil
     }
 
     public func refreshModels() async throws {
@@ -770,6 +951,26 @@ public final class CodexRuntimeStore {
         permissions: AgentThreadPermissions? = nil,
         attachments: [ChatInputAttachment] = []
     ) async throws {
+        try await withThreadCommandPermit(for: threadRef) {
+            try await sendMessageWithCommandPermit(
+                text,
+                to: threadRef,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                permissions: permissions,
+                attachments: attachments
+            )
+        }
+    }
+
+    private func sendMessageWithCommandPermit(
+        _ text: String,
+        to threadRef: ThreadRef,
+        model: String?,
+        reasoningEffort: String?,
+        permissions: AgentThreadPermissions?,
+        attachments: [ChatInputAttachment]
+    ) async throws {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else {
             return
         }
@@ -814,25 +1015,27 @@ public final class CodexRuntimeStore {
     }
 
     public func interruptThread(_ threadRef: ThreadRef) async throws -> String {
-        guard threadRef.hostID == localHost.id else {
-            throw CodexAppServerError.server("This thread belongs to \(threadRef.hostID.rawValue), not the connected local Codex runtime.")
-        }
+        try await withThreadCommandPermit(for: threadRef) {
+            guard threadRef.hostID == localHost.id else {
+                throw CodexAppServerError.server("This thread belongs to \(threadRef.hostID.rawValue), not the connected local Codex runtime.")
+            }
 
-        let turnID = try await interruptibleTurnID(for: threadRef)
-        _ = try await runtimeRequest(
-            method: .interruptTurn,
-            params: .object([
-                "threadId": .string(threadRef.threadID),
-                "turnId": .string(turnID),
-            ])
-        )
-        upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
-            state.status = .complete
-            state.activeFlags.remove(.running)
-            state.liveAssistantText = ""
-            state.currentActivitySummary = "Turn stopped"
+            let turnID = try await interruptibleTurnID(for: threadRef)
+            _ = try await runtimeRequest(
+                method: .interruptTurn,
+                params: .object([
+                    "threadId": .string(threadRef.threadID),
+                    "turnId": .string(turnID),
+                ])
+            )
+            upsertRuntimeState(hostID: threadRef.hostID, threadID: threadRef.threadID) { state in
+                state.status = .complete
+                state.activeFlags.remove(.running)
+                state.liveAssistantText = ""
+                state.currentActivitySummary = "Turn stopped"
+            }
+            return turnID
         }
-        return turnID
     }
 
     private func prepareLocalAttachments(
@@ -857,6 +1060,22 @@ public final class CodexRuntimeStore {
                 path: destination.path,
                 byteCount: data.count
             )
+        }
+    }
+
+    private func withThreadCommandPermit<T>(
+        for threadRef: ThreadRef,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let permit = try await threadCommandLane.acquire(for: threadRef.qualifiedID)
+        do {
+            try Task.checkCancellation()
+            let value = try await operation()
+            await threadCommandLane.release(permit)
+            return value
+        } catch {
+            await threadCommandLane.release(permit)
+            throw error
         }
     }
 
@@ -1076,51 +1295,55 @@ public final class CodexRuntimeStore {
     }
 
     public func archiveThread(_ threadRef: ThreadRef) async throws {
-        guard threadRef.hostID == localHost.id else {
-            throw CodexAppServerError.server("Archive is only available for threads on the connected local Codex runtime.")
-        }
+        try await withThreadCommandPermit(for: threadRef) {
+            guard threadRef.hostID == localHost.id else {
+                throw CodexAppServerError.server("Archive is only available for threads on the connected local Codex runtime.")
+            }
 
-        _ = try await runtimeRequest(
-            method: .archiveThread,
-            params: .object([
-                "threadId": .string(threadRef.threadID),
-            ])
-        )
-        threadSummaries.removeAll {
-            $0.hostID == threadRef.hostID && $0.threadID == threadRef.threadID
+            _ = try await runtimeRequest(
+                method: .archiveThread,
+                params: .object([
+                    "threadId": .string(threadRef.threadID),
+                ])
+            )
+            threadSummaries.removeAll {
+                $0.hostID == threadRef.hostID && $0.threadID == threadRef.threadID
+            }
         }
     }
 
     public func forkThread(_ threadRef: ThreadRef, model: String?) async throws -> ThreadRef {
-        guard threadRef.hostID == localHost.id else {
-            throw CodexAppServerError.server("Fork is only available for threads on the connected local Codex runtime.")
-        }
+        try await withThreadCommandPermit(for: threadRef) {
+            guard threadRef.hostID == localHost.id else {
+                throw CodexAppServerError.server("Fork is only available for threads on the connected local Codex runtime.")
+            }
 
-        var params: [String: JSONValue] = [
-            "threadId": .string(threadRef.threadID),
-            "cwd": .string(threadRef.cwd),
-        ]
-        if let model, !model.isEmpty {
-            params["model"] = .string(model)
-        }
+            var params: [String: JSONValue] = [
+                "threadId": .string(threadRef.threadID),
+                "cwd": .string(threadRef.cwd),
+            ]
+            if let model, !model.isEmpty {
+                params["model"] = .string(model)
+            }
 
-        let result = try await runtimeRequest(method: .forkThread, params: .object(params))
-        guard
-            let thread = result["thread"],
-            let threadID = thread["id"]?.stringValue,
-            let cwd = thread["cwd"]?.stringValue ?? result["cwd"]?.stringValue
-        else {
-            throw CodexAppServerError.invalidResponse
-        }
+            let result = try await runtimeRequest(method: .forkThread, params: .object(params))
+            guard
+                let thread = result["thread"],
+                let threadID = thread["id"]?.stringValue,
+                let cwd = thread["cwd"]?.stringValue ?? result["cwd"]?.stringValue
+            else {
+                throw CodexAppServerError.invalidResponse
+            }
 
-        let threadRef = ThreadRef(
-            hostID: localHost.id,
-            threadID: threadID,
-            cwd: cwd,
-            name: thread["name"]?.stringValue
-        )
-        threadSummaries.insert(threadRef, at: 0)
-        return threadRef
+            let forkedThreadRef = ThreadRef(
+                hostID: localHost.id,
+                threadID: threadID,
+                cwd: cwd,
+                name: thread["name"]?.stringValue
+            )
+            threadSummaries.insert(forkedThreadRef, at: 0)
+            return forkedThreadRef
+        }
     }
 
     public func restoreWorkflowEvents(_ events: [WorkflowEvent]) {
@@ -1190,11 +1413,18 @@ public final class CodexRuntimeStore {
     }
 
     private func record(_ notification: CodexServerNotification) {
+        if let connectionID = notification.connectionID,
+           connectionID != activeLocalConnectionID {
+            return
+        }
         latestNotifications.insert(notification, at: 0)
         if latestNotifications.count > 20 {
             latestNotifications.removeLast()
         }
 
+        if let threadID = Self.threadID(from: notification.params) {
+            recordLocalRuntimeMutation(threadID: threadID)
+        }
         reduceRuntimeState(notification: notification)
 
         if notification.method == "item/agentMessage/delta",
@@ -1320,6 +1550,9 @@ public final class CodexRuntimeStore {
     private func reduceRuntimeState(event: WorkflowEvent) {
         guard let threadID = event.threadID else { return }
         let hostID = event.hostID ?? localHost.id
+        if hostID == localHost.id {
+            recordLocalRuntimeMutation(threadID: threadID)
+        }
         upsertRuntimeState(hostID: hostID, threadID: threadID) { state in
             state.apply(event: event, markUnread: event.kind != .turnStarted)
         }
@@ -1335,6 +1568,18 @@ public final class CodexRuntimeStore {
         var state = threadRuntimeStates[key] ?? ThreadRuntimeState(hostID: hostID, threadID: threadID)
         update(&state)
         threadRuntimeStates[key] = state
+    }
+
+    private func recordLocalRuntimeMutation(threadID: String) {
+        guard !threadID.isEmpty else { return }
+        localRuntimeStateRevisions[threadID, default: 0] &+= 1
+        reconnectingLocalRuntimeStateIDs.remove(
+            ThreadRef.qualifiedID(hostID: localHost.id, threadID: threadID)
+        )
+    }
+
+    func localRuntimeRevisionSnapshot() -> [String: UInt64] {
+        localRuntimeStateRevisions
     }
 
     private func resolveAttentionRequest(id requestID: String) {
@@ -1654,7 +1899,12 @@ public final class CodexRuntimeStore {
         try await ensureConnectedRuntime()
 
         do {
-            return try await client.request(call)
+            let result = try await client.request(call)
+            if holdsWritePermit,
+               let threadID = params["threadId"]?.stringValue {
+                recordLocalRuntimeMutation(threadID: threadID)
+            }
+            return result
         } catch {
             if method.replaySafety == .nonReplayableWrite,
                Self.isAmbiguousWriteFailure(error) {
@@ -1663,6 +1913,9 @@ public final class CodexRuntimeStore {
             }
 
             guard case CodexAppServerError.disconnected = error else { throw error }
+            _ = markLocalRuntimeStatesReconciling()
+            await threadCommandLane.cancelAll()
+            activeLocalConnectionID = nil
             connectionState = .connecting
             localHost.status = .connecting
             statusMessage = "Restoring codex app-server connection"
@@ -1671,7 +1924,12 @@ public final class CodexRuntimeStore {
             guard connectionState == .connected else {
                 throw CodexAppServerError.disconnected
             }
-            return try await client.request(call)
+            let result = try await client.request(call)
+            if holdsWritePermit,
+               let threadID = params["threadId"]?.stringValue {
+                recordLocalRuntimeMutation(threadID: threadID)
+            }
+            return result
         }
     }
 

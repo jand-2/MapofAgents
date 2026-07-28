@@ -47,6 +47,8 @@ struct ThreadReadingDockView: View {
     var onMentionCatalogNeeded: (ThreadRef?) -> Void
 
     @State private var selectedCandidateID: NodeID?
+    @FocusState private var isThreadPickerFocused: Bool
+    @AccessibilityFocusState private var isThreadPickerAccessibilityFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -120,7 +122,14 @@ struct ThreadReadingDockView: View {
                 .fill(.quaternary)
                 .frame(height: 1)
         }
-        .onAppear(perform: selectFirstAvailableCandidateIfNeeded)
+        .onAppear {
+            selectFirstAvailableCandidateIfNeeded()
+            Task { @MainActor in
+                await Task.yield()
+                isThreadPickerFocused = true
+                isThreadPickerAccessibilityFocused = true
+            }
+        }
         .onChange(of: candidates) { _, _ in
             selectFirstAvailableCandidateIfNeeded()
         }
@@ -151,6 +160,9 @@ struct ThreadReadingDockView: View {
                 }
             }
             .labelsHidden()
+            .focusable()
+            .focused($isThreadPickerFocused)
+            .accessibilityFocused($isThreadPickerAccessibilityFocused)
             .frame(width: 260)
             .help("Choose another thread from this workflow")
 

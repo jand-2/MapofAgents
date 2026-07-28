@@ -7,6 +7,53 @@ enum RootOverlayFocusTarget: Hashable {
     case newThread
     case workflowName
     case pairing
+    case threadChat
+    case reader
+
+    var isPresentedInsideGraphCanvas: Bool {
+        switch self {
+        case .threadChat, .reader:
+            return true
+        case .commandBar, .newThread, .workflowName, .pairing:
+            return false
+        }
+    }
+}
+
+enum RootModalPresentationPolicy {
+    static func activeTarget(
+        isNewThreadPresented: Bool,
+        isWorkflowEditorPresented: Bool,
+        isPairingPresented: Bool,
+        isThreadChatPresented: Bool,
+        isReaderPresented: Bool
+    ) -> RootOverlayFocusTarget? {
+        if isNewThreadPresented {
+            return .newThread
+        }
+        if isWorkflowEditorPresented {
+            return .workflowName
+        }
+        if isPairingPresented {
+            return .pairing
+        }
+        if isReaderPresented {
+            return .reader
+        }
+        if isThreadChatPresented {
+            return .threadChat
+        }
+        return nil
+    }
+
+    static func blocksGraphCanvas(_ target: RootOverlayFocusTarget?) -> Bool {
+        guard let target else { return false }
+        return !target.isPresentedInsideGraphCanvas
+    }
+
+    static func blocksRootShell(_ target: RootOverlayFocusTarget?) -> Bool {
+        target != nil
+    }
 }
 
 /// Captures the pre-overlay AppKit responder and restores it after the final

@@ -160,52 +160,246 @@ public struct WorkflowThreadContentSignature: Hashable, Sendable {
     }
 }
 
+public enum LocalThreadMessageRole: String, Codable, CaseIterable, Sendable {
+    case user
+    case assistant
+    case reasoning
+    case tool
+    case system
+    case file
+    case image
+    case diff
+}
+
+public struct LocalThreadMessage: Codable, Identifiable, Hashable, Sendable {
+    public var id: String
+    public var role: LocalThreadMessageRole
+    public var text: String
+    public var createdAt: Date
+
+    public init(
+        id: String = UUID().uuidString,
+        role: LocalThreadMessageRole,
+        text: String,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.createdAt = createdAt
+    }
+}
+
+public enum LocalThreadTurnItemsView: String, Codable, CaseIterable, Sendable {
+    case notLoaded
+    case summary
+    case full
+}
+
+public struct LocalThreadTurn: Codable, Identifiable, Hashable, Sendable {
+    public var id: String
+    public var status: ThreadRunStatus
+    public var startedAt: Date
+    public var completedAt: Date?
+    public var error: String?
+    public var itemsView: LocalThreadTurnItemsView
+    public var durationMilliseconds: Int?
+    public var itemMessageIds: [String]
+
+    public init(
+        id: String = UUID().uuidString,
+        status: ThreadRunStatus = .unknown,
+        startedAt: Date = Date(),
+        completedAt: Date? = nil,
+        error: String? = nil,
+        itemsView: LocalThreadTurnItemsView = .full,
+        durationMilliseconds: Int? = nil,
+        itemMessageIds: [String] = []
+    ) {
+        self.id = id
+        self.status = status
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.error = error
+        self.itemsView = itemsView
+        self.durationMilliseconds = durationMilliseconds
+        self.itemMessageIds = itemMessageIds
+    }
+}
+
 public struct NodeMetadata: Codable, Hashable, Sendable {
     public var hostID: HostID?
     public var platform: HostPlatform?
     public var hostStatus: HostStatus?
+    public var hostLastError: String?
     public var codexHome: String?
+    public var appServerEndpointURL: String?
     public var folderPath: String?
     public var threadRef: ThreadRef?
     public var model: String?
     public var reasoningEffort: String?
     public var threadPermissions: AgentThreadPermissions?
     public var threadKind: CodexThreadNodeKind?
+    public var initialPrompt: String?
+    public var localTranscript: [LocalThreadMessage]
+    public var localTranscriptTurns: [LocalThreadTurn]
     public var runStatus: ThreadRunStatus?
     public var popoverOffset: CanvasPoint?
     public var isUnread: Bool?
+    public var isArchived: Bool?
     public var hasManualPosition: Bool?
 
     public init(
         hostID: HostID? = nil,
         platform: HostPlatform? = nil,
         hostStatus: HostStatus? = nil,
+        hostLastError: String? = nil,
         codexHome: String? = nil,
+        appServerEndpointURL: String? = nil,
         folderPath: String? = nil,
         threadRef: ThreadRef? = nil,
         model: String? = nil,
         reasoningEffort: String? = nil,
         threadPermissions: AgentThreadPermissions? = nil,
         threadKind: CodexThreadNodeKind? = nil,
+        initialPrompt: String? = nil,
+        localTranscript: [LocalThreadMessage] = [],
+        localTranscriptTurns: [LocalThreadTurn] = [],
         runStatus: ThreadRunStatus? = nil,
         popoverOffset: CanvasPoint? = nil,
         isUnread: Bool? = nil,
+        isArchived: Bool? = nil,
         hasManualPosition: Bool? = nil
     ) {
         self.hostID = hostID
         self.platform = platform
         self.hostStatus = hostStatus
+        self.hostLastError = hostLastError
         self.codexHome = codexHome
+        self.appServerEndpointURL = appServerEndpointURL
         self.folderPath = folderPath
         self.threadRef = threadRef
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.threadPermissions = threadPermissions
         self.threadKind = threadKind
+        self.initialPrompt = initialPrompt
+        self.localTranscript = localTranscript
+        self.localTranscriptTurns = localTranscriptTurns
         self.runStatus = runStatus
         self.popoverOffset = popoverOffset
         self.isUnread = isUnread
+        self.isArchived = isArchived
         self.hasManualPosition = hasManualPosition
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hostID
+        case platform
+        case hostStatus
+        case hostLastError
+        case codexHome
+        case appServerEndpointURL = "appServerEndpointUrl"
+        case folderPath
+        case threadRef
+        case model
+        case reasoningEffort
+        case threadPermissions
+        case threadKind
+        case approvalPolicy
+        case sandboxMode
+        case initialPrompt
+        case localTranscript
+        case localTranscriptTurns
+        case runStatus
+        case popoverOffset
+        case isUnread
+        case isArchived
+        case hasManualPosition
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hostID = try container.decodeIfPresent(HostID.self, forKey: .hostID)
+        platform = try container.decodeIfPresent(HostPlatform.self, forKey: .platform)
+        hostStatus = try container.decodeIfPresent(HostStatus.self, forKey: .hostStatus)
+        hostLastError = try container.decodeIfPresent(String.self, forKey: .hostLastError)
+        codexHome = try container.decodeIfPresent(String.self, forKey: .codexHome)
+        appServerEndpointURL = try container.decodeIfPresent(
+            String.self,
+            forKey: .appServerEndpointURL
+        )
+        folderPath = try container.decodeIfPresent(String.self, forKey: .folderPath)
+        threadRef = try container.decodeIfPresent(ThreadRef.self, forKey: .threadRef)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        threadKind = try container.decodeIfPresent(CodexThreadNodeKind.self, forKey: .threadKind)
+        initialPrompt = try container.decodeIfPresent(String.self, forKey: .initialPrompt)
+        localTranscript = try container.decodeIfPresent(
+            [LocalThreadMessage].self,
+            forKey: .localTranscript
+        ) ?? []
+        localTranscriptTurns = try container.decodeIfPresent(
+            [LocalThreadTurn].self,
+            forKey: .localTranscriptTurns
+        ) ?? []
+        runStatus = try container.decodeIfPresent(ThreadRunStatus.self, forKey: .runStatus)
+        popoverOffset = try container.decodeIfPresent(CanvasPoint.self, forKey: .popoverOffset)
+        isUnread = try container.decodeIfPresent(Bool.self, forKey: .isUnread)
+        isArchived = try container.decodeIfPresent(Bool.self, forKey: .isArchived)
+        hasManualPosition = try container.decodeIfPresent(Bool.self, forKey: .hasManualPosition)
+
+        if let canonical = try container.decodeIfPresent(
+            AgentThreadPermissions.self,
+            forKey: .threadPermissions
+        ) {
+            threadPermissions = canonical
+        } else {
+            let legacyApprovalPolicy = try container.decodeIfPresent(
+                AgentApprovalPolicy.self,
+                forKey: .approvalPolicy
+            )
+            let legacySandboxMode = try container.decodeIfPresent(
+                AgentSandboxMode.self,
+                forKey: .sandboxMode
+            )
+            if legacyApprovalPolicy != nil || legacySandboxMode != nil {
+                threadPermissions = AgentThreadPermissions(
+                    approvalPolicy: legacyApprovalPolicy ?? .onRequest,
+                    sandboxMode: legacySandboxMode ?? .dangerFullAccess
+                )
+            } else {
+                threadPermissions = nil
+            }
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(hostID, forKey: .hostID)
+        try container.encodeIfPresent(platform, forKey: .platform)
+        try container.encodeIfPresent(hostStatus, forKey: .hostStatus)
+        try container.encodeIfPresent(hostLastError, forKey: .hostLastError)
+        try container.encodeIfPresent(codexHome, forKey: .codexHome)
+        try container.encodeIfPresent(appServerEndpointURL, forKey: .appServerEndpointURL)
+        try container.encodeIfPresent(folderPath, forKey: .folderPath)
+        try container.encodeIfPresent(threadRef, forKey: .threadRef)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
+        try container.encodeIfPresent(threadPermissions, forKey: .threadPermissions)
+        try container.encodeIfPresent(threadKind, forKey: .threadKind)
+        try container.encodeIfPresent(initialPrompt, forKey: .initialPrompt)
+        if !localTranscript.isEmpty {
+            try container.encode(localTranscript, forKey: .localTranscript)
+        }
+        if !localTranscriptTurns.isEmpty {
+            try container.encode(localTranscriptTurns, forKey: .localTranscriptTurns)
+        }
+        try container.encodeIfPresent(runStatus, forKey: .runStatus)
+        try container.encodeIfPresent(popoverOffset, forKey: .popoverOffset)
+        try container.encodeIfPresent(isUnread, forKey: .isUnread)
+        try container.encodeIfPresent(isArchived, forKey: .isArchived)
+        try container.encodeIfPresent(hasManualPosition, forKey: .hasManualPosition)
     }
 }
 
@@ -268,9 +462,12 @@ public struct CanvasEdge: Codable, Identifiable, Hashable, Sendable {
 public struct AgentGraph: Codable, Hashable, Sendable {
     public var workspaceID: WorkspaceID
     public var title: String
+    public var layoutCoordinateSpace: String
     public var nodes: [NodeID: CanvasNode]
     public var manualEdges: [EdgeID: CanvasEdge]
     public var messageRoutes: [String: MessageRoute]
+    public var pendingAttentionRequests: [RuntimeAttentionRequest]
+    public var runtimeDiagnostics: [RuntimeDiagnosticStep]
     public var suppressedAutoMaterializedThreadIDs: Set<String>
     public var viewport: CanvasViewport
     public var updatedAt: Date
@@ -278,18 +475,24 @@ public struct AgentGraph: Codable, Hashable, Sendable {
     public init(
         workspaceID: WorkspaceID = .fresh(),
         title: String = "mapofagents",
+        layoutCoordinateSpace: String = "center",
         nodes: [NodeID: CanvasNode] = [:],
         manualEdges: [EdgeID: CanvasEdge] = [:],
         messageRoutes: [String: MessageRoute] = [:],
+        pendingAttentionRequests: [RuntimeAttentionRequest] = [],
+        runtimeDiagnostics: [RuntimeDiagnosticStep] = [],
         suppressedAutoMaterializedThreadIDs: Set<String> = [],
         viewport: CanvasViewport = .standard,
         updatedAt: Date = Date()
     ) {
         self.workspaceID = workspaceID
         self.title = title
+        self.layoutCoordinateSpace = layoutCoordinateSpace
         self.nodes = nodes
         self.manualEdges = manualEdges
         self.messageRoutes = messageRoutes
+        self.pendingAttentionRequests = pendingAttentionRequests
+        self.runtimeDiagnostics = runtimeDiagnostics
         self.suppressedAutoMaterializedThreadIDs = suppressedAutoMaterializedThreadIDs
         self.viewport = viewport
         self.updatedAt = updatedAt
@@ -298,9 +501,12 @@ public struct AgentGraph: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case workspaceID
         case title
+        case layoutCoordinateSpace
         case nodes
         case manualEdges
         case messageRoutes
+        case pendingAttentionRequests
+        case runtimeDiagnostics
         case suppressedAutoMaterializedThreadIDs
         case viewport
         case updatedAt
@@ -310,9 +516,44 @@ public struct AgentGraph: Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         workspaceID = try container.decode(WorkspaceID.self, forKey: .workspaceID)
         title = try container.decode(String.self, forKey: .title)
-        nodes = try container.decode([NodeID: CanvasNode].self, forKey: .nodes)
-        manualEdges = try container.decode([EdgeID: CanvasEdge].self, forKey: .manualEdges)
+        layoutCoordinateSpace = try container.decodeIfPresent(
+            String.self,
+            forKey: .layoutCoordinateSpace
+        ) ?? "center"
+        if let canonicalNodes = try? container.decode(
+            [String: CanvasNode].self,
+            forKey: .nodes
+        ) {
+            nodes = Dictionary(
+                uniqueKeysWithValues: canonicalNodes.map { (NodeID(rawValue: $0.key), $0.value) }
+            )
+        } else {
+            // Swift encoded dictionaries with strongly typed keys as alternating
+            // key/value arrays before the shared object-keyed graph contract.
+            nodes = try container.decode([NodeID: CanvasNode].self, forKey: .nodes)
+        }
+        if let canonicalEdges = try? container.decode(
+            [String: CanvasEdge].self,
+            forKey: .manualEdges
+        ) {
+            manualEdges = Dictionary(
+                uniqueKeysWithValues: canonicalEdges.map { (EdgeID(rawValue: $0.key), $0.value) }
+            )
+        } else {
+            manualEdges = try container.decode(
+                [EdgeID: CanvasEdge].self,
+                forKey: .manualEdges
+            )
+        }
         messageRoutes = try container.decodeIfPresent([String: MessageRoute].self, forKey: .messageRoutes) ?? [:]
+        pendingAttentionRequests = try container.decodeIfPresent(
+            [RuntimeAttentionRequest].self,
+            forKey: .pendingAttentionRequests
+        ) ?? []
+        runtimeDiagnostics = try container.decodeIfPresent(
+            [RuntimeDiagnosticStep].self,
+            forKey: .runtimeDiagnostics
+        ) ?? []
         suppressedAutoMaterializedThreadIDs = try container.decodeIfPresent(
             Set<String>.self,
             forKey: .suppressedAutoMaterializedThreadIDs
@@ -325,9 +566,18 @@ public struct AgentGraph: Codable, Hashable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(workspaceID, forKey: .workspaceID)
         try container.encode(title, forKey: .title)
-        try container.encode(nodes, forKey: .nodes)
-        try container.encode(manualEdges, forKey: .manualEdges)
+        try container.encode(layoutCoordinateSpace, forKey: .layoutCoordinateSpace)
+        try container.encode(
+            Dictionary(uniqueKeysWithValues: nodes.map { ($0.key.rawValue, $0.value) }),
+            forKey: .nodes
+        )
+        try container.encode(
+            Dictionary(uniqueKeysWithValues: manualEdges.map { ($0.key.rawValue, $0.value) }),
+            forKey: .manualEdges
+        )
         try container.encode(messageRoutes, forKey: .messageRoutes)
+        try container.encode(pendingAttentionRequests, forKey: .pendingAttentionRequests)
+        try container.encode(runtimeDiagnostics, forKey: .runtimeDiagnostics)
         try container.encode(suppressedAutoMaterializedThreadIDs, forKey: .suppressedAutoMaterializedThreadIDs)
         try container.encode(viewport, forKey: .viewport)
         try container.encode(updatedAt, forKey: .updatedAt)

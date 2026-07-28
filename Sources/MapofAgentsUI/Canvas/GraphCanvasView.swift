@@ -7,6 +7,43 @@ import AppKit
 import UIKit
 #endif
 
+enum GraphCanvasModalPresentation: Equatable {
+    case none
+    case threadChat
+    case reader
+
+    var hidesBackgroundFromAccessibility: Bool {
+        self != .none
+    }
+
+    var allowsBackgroundInteraction: Bool {
+        self == .none
+    }
+
+    var allowsClickOutsideDismissal: Bool {
+        self == .threadChat
+    }
+
+    var showsCanvasChrome: Bool {
+        self == .none
+    }
+}
+
+enum GraphCanvasModalPolicy {
+    static func presentation(
+        isReadingModePresented: Bool,
+        activeThreadKey: String?
+    ) -> GraphCanvasModalPresentation {
+        if isReadingModePresented {
+            return .reader
+        }
+        if activeThreadKey != nil {
+            return .threadChat
+        }
+        return .none
+    }
+}
+
 public struct GraphCanvasView: View {
     private enum PendingDestructiveAction: Identifiable {
         case archiveThread(CanvasNode)
@@ -91,6 +128,7 @@ public struct GraphCanvasView: View {
     private var showsStatusStrip: Bool
     private var showsSubagents: Bool
     @Binding private var isReadingModePresented: Bool
+    @Binding private var hasThreadChatSurface: Bool
     @Binding private var readingThreadCount: Int
     @Binding private var isMachineRecoveryPresented: Bool
     private var onCanvasSizeChange: (CGSize) -> Void
@@ -130,6 +168,7 @@ public struct GraphCanvasView: View {
         showsStatusStrip: Bool = true,
         showsSubagents: Bool = true,
         isReadingModePresented: Binding<Bool> = .constant(false),
+        hasThreadChatSurface: Binding<Bool> = .constant(false),
         readingThreadCount: Binding<Int> = .constant(0),
         isMachineRecoveryPresented: Binding<Bool> = .constant(false),
         onCanvasSizeChange: @escaping (CGSize) -> Void = { _ in }
@@ -151,6 +190,7 @@ public struct GraphCanvasView: View {
         self.showsStatusStrip = showsStatusStrip
         self.showsSubagents = showsSubagents
         self._isReadingModePresented = isReadingModePresented
+        self._hasThreadChatSurface = hasThreadChatSurface
         self._readingThreadCount = readingThreadCount
         self._isMachineRecoveryPresented = isMachineRecoveryPresented
         self.onCanvasSizeChange = onCanvasSizeChange
@@ -164,173 +204,15 @@ public struct GraphCanvasView: View {
                 showsSubagents: showsSubagents,
                 focusedNodeID: focusedCanvasNodeID
             )
-            ZStack(alignment: .topLeading) {
-                let activeThreadNode = isReadingModePresented ? nil : (transientThreadNode ?? selectedThreadNode)
-                let showsInspector = shouldShowSelectionInspector
-                let popoverSize = threadPopoverSize(in: proxy.size)
-                let viewport = displayedViewport
-                let popoverFrame = activeThreadNode.map {
-                    currentPopoverFrame(for: $0, viewport: viewport, popoverSize: popoverSize, in: proxy.size)
-                }
-                let automationPanelFrame = activeThreadAutomationNode.map {
-                    threadAutomationPanelFrame(for: $0, viewport: viewport, canvasSize: proxy.size)
-                }
-                let rightRailFrame = CGRect(
-                    x: max(0, proxy.size.width - rightRailReservedWidth(in: proxy.size) - 14),
-                    y: 0,
-                    width: rightRailReservedWidth(in: proxy.size) + 14,
-                    height: proxy.size.height
-                )
-                let ignoredScrollRects = canvasIgnoredScrollRects(
-                    canvasSize: proxy.size,
-                    popoverFrame: popoverFrame,
-                    rightRailFrame: rightRailFrame,
-                    showsInspector: showsInspector,
-                    selectedEdgePopoverPosition: selectedManualEdge.flatMap { edgePopoverPosition(for: $0, viewport: viewport) },
-                    automationPanelFrame: automationPanelFrame
-                )
+            configuredCanvas(in: proxy.size, presentation: canvasPresentation)
+        }
+    }
 
-                CanvasBackground(reducedDetail: activeThreadNode != nil || selectedManualEdge != nil)
-                    .contentShape(Rectangle())
-                    .gesture(viewportPanGesture)
-                    .simultaneousGesture(viewportMagnificationGesture)
-                    .onTapGesture {
-                        closeActiveThreadPopover()
-                    }
-                    .overlay {
-                        scrollWheelZoomLayer(ignoredRects: ignoredScrollRects)
-                    }
-
-                positionedGraphContentLayer(viewport: viewport, presentation: canvasPresentation)
-
-                if let threadNode = activeThreadNode {
-                    threadPopoverLayer(
-                        for: threadNode,
-                        popoverSize: popoverSize,
-                        viewport: viewport,
-                        canvasSize: proxy.size
-                    )
-                }
-
-                #if os(macOS)
-                if isReadingModePresented {
-                    readingDockLayer(in: proxy.size)
-                }
-                #endif
-
-                GraphCanvasSelectionInspectorLayer(
-                    graphStore: graphStore,
-                    isVisible: showsInspector
-                )
-                .padding(.top, 72)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-
-                if !showsInspector,
-                   let edge = selectedManualEdge,
-                   let position = edgePopoverPosition(for: edge, viewport: viewport) {
-                    edgePopoverLayer(edge: edge, position: position)
-                }
-
-                if let automationNode = activeThreadAutomationNode,
-                   let automation = automation(for: automationNode),
-                   let threadID = automationNode.metadata.threadRef?.threadID {
-                    threadAutomationPanelLayer(
-                        for: automationNode,
-                        automation: automation,
-                        threadID: threadID,
-                        viewport: viewport,
-                        canvasSize: proxy.size
-                    )
-                }
-            }
-            .overlay(alignment: .bottomLeading) {
-                if showsStatusStrip && !isReadingModePresented {
-                    StatusStrip(
-                        graphStore: graphStore,
-                        runtimeStore: runtimeStore,
-                        supervisorStore: supervisorStore
-                    )
-                        .padding(14)
-                }
-            }
-            .overlay(alignment: .topTrailing) {
-                if showsDesktopRails && !isReadingModePresented {
-                    operationalRailsLayer(in: proxy.size)
-                        .padding(.top, 58)
-                }
-            }
-            .overlay(alignment: .bottomTrailing) {
-                if showsDesktopRails && !isReadingModePresented {
-                    threadInboxLayer()
-                        .padding(.trailing, 14)
-                        .padding(.bottom, 14)
-                }
-            }
-            .onChange(of: selectedThreadKey) { previousKey, _ in
-                if let previousKey {
-                    let remainsOpenInReader = readingThreadIDs.contains { nodeID in
-                        graphStore.graph.nodes[nodeID]?.metadata.threadRef?.qualifiedID == previousKey
-                    }
-                    if !remainsOpenInReader {
-                        cancelLiveTranscriptRefresh(for: previousKey)
-                    }
-                }
-                if selectedThreadKey != nil {
-                    transientOpenGeneration &+= 1
-                    transientThreadNode = nil
-                }
-                guard let selectedThreadNode else {
-                    transcriptSessions.cancelPopoverLoad()
-                    if transientThreadNode == nil {
-                        resetThreadPopoverData()
-                    }
-                    return
-                }
-                resetThreadPopoverDataIfNeeded(for: selectedThreadNode.metadata.threadRef)
-                startTranscriptLoad(for: selectedThreadNode, force: true, markRead: true)
-            }
-            .onChange(of: isReadingModePresented) { _, isPresented in
-                handleReadingModeChange(isPresented)
-            }
-            .task {
-                primeHandledWorkflowEvents(workflowEvents)
-                applyThreadCatalogRuntimeState()
-                await syncInboxSubscriptions()
-            }
-            .onChange(of: workflowEvents) { _, events in
-                Task { await handleWorkflowEvents(events) }
-            }
-            .onChange(of: providerActivitySignature) { previous, current in
-                Task {
-                    await refreshOpenProviderTranscripts(
-                        changedFrom: previous,
-                        to: current
-                    )
-                }
-            }
-            .onChange(of: threadCatalogRefreshSignature) { _, _ in
-                Task { await refreshThreadInbox() }
-            }
-            .onChange(of: graphStore.graph.viewport) { _, viewport in
-                viewportInteraction.reconcilePersistedViewport(viewport)
-            }
-            .onChange(of: showsSubagents) { _, isShowing in
-                guard !isShowing else { return }
-                closeHiddenSubagentSurfaces()
-            }
-            .onChange(of: readingThreadIDs) { _, threadIDs in
-                readingThreadCount = threadIDs.count
-            }
-            .task {
-                await refreshThreadInbox()
-            }
-            .task(id: threadAutomationRefreshSignature) {
-                await refreshThreadAutomationsPeriodically()
-            }
-            .onDisappear {
-                transcriptSessions.cancelAll()
-                viewportInteraction.cancel()
-            }
+    private func configuredCanvas(
+        in size: CGSize,
+        presentation: CanvasPresentationModel
+    ) -> some View {
+        observedCanvas(in: size, presentation: presentation)
             .confirmationDialog(
                 pendingDestructiveAction?.title ?? "Confirm Action",
                 isPresented: Binding(
@@ -375,12 +257,231 @@ public struct GraphCanvasView: View {
                 )
             }
             .onAppear {
-                onCanvasSizeChange(proxy.size)
-            }
-            .onChange(of: proxy.size) { _, size in
                 onCanvasSizeChange(size)
             }
+            .onChange(of: size) { _, newSize in
+                onCanvasSizeChange(newSize)
+            }
+    }
+
+    private func observedCanvas(
+        in size: CGSize,
+        presentation: CanvasPresentationModel
+    ) -> some View {
+        canvasSurface(in: size, presentation: presentation)
+            .onChange(of: selectedThreadKey, handleSelectedThreadChange)
+            .onChange(of: isReadingModePresented) { _, isPresented in
+                handleReadingModeChange(isPresented)
+            }
+            .onChange(of: presentedThreadChatKey) { _, threadKey in
+                hasThreadChatSurface = threadKey != nil
+            }
+            .task {
+                hasThreadChatSurface = presentedThreadChatKey != nil
+                primeHandledWorkflowEvents(workflowEvents)
+                applyThreadCatalogRuntimeState()
+                await syncInboxSubscriptions()
+            }
+            .onChange(of: workflowEvents) { _, events in
+                Task { await handleWorkflowEvents(events) }
+            }
+            .onChange(of: providerActivitySignature) { previous, current in
+                Task {
+                    await refreshOpenProviderTranscripts(
+                        changedFrom: previous,
+                        to: current
+                    )
+                }
+            }
+            .onChange(of: threadCatalogRefreshSignature) { _, _ in
+                Task { await refreshThreadInbox() }
+            }
+            .onChange(of: graphStore.graph.viewport) { _, viewport in
+                viewportInteraction.reconcilePersistedViewport(viewport)
+            }
+            .onChange(of: showsSubagents) { _, isShowing in
+                guard !isShowing else { return }
+                closeHiddenSubagentSurfaces()
+            }
+            .onChange(of: readingThreadIDs) { _, threadIDs in
+                readingThreadCount = threadIDs.count
+            }
+            #if os(macOS)
+            .onExitCommand {
+                if isReadingModePresented {
+                    isReadingModePresented = false
+                } else if presentedThreadChatKey != nil {
+                    closeActiveThreadPopover()
+                }
+            }
+            #endif
+            .task {
+                await refreshThreadInbox()
+            }
+            .task(id: threadAutomationRefreshSignature) {
+                await refreshThreadAutomationsPeriodically()
+            }
+            .onDisappear {
+                hasThreadChatSurface = false
+                transcriptSessions.cancelAll()
+                viewportInteraction.cancel()
+            }
+    }
+
+    private func canvasSurface(
+        in size: CGSize,
+        presentation canvasPresentation: CanvasPresentationModel
+    ) -> some View {
+        let activeThreadNode = isReadingModePresented ? nil : (transientThreadNode ?? selectedThreadNode)
+        let modalPresentation = GraphCanvasModalPolicy.presentation(
+            isReadingModePresented: isReadingModePresented,
+            activeThreadKey: activeThreadNode?.metadata.threadRef?.qualifiedID
+                ?? activeThreadNode?.id.rawValue
+        )
+        let showsInspector = shouldShowSelectionInspector
+        let popoverSize = threadPopoverSize(in: size)
+        let viewport = displayedViewport
+        let popoverFrame = activeThreadNode.map {
+            currentPopoverFrame(for: $0, viewport: viewport, popoverSize: popoverSize, in: size)
         }
+        let automationPanelFrame = activeThreadAutomationNode.map {
+            threadAutomationPanelFrame(for: $0, viewport: viewport, canvasSize: size)
+        }
+        let rightRailFrame = CGRect(
+            x: max(0, size.width - rightRailReservedWidth(in: size) - 14),
+            y: 0,
+            width: rightRailReservedWidth(in: size) + 14,
+            height: size.height
+        )
+        let ignoredScrollRects = canvasIgnoredScrollRects(
+            canvasSize: size,
+            popoverFrame: popoverFrame,
+            rightRailFrame: rightRailFrame,
+            showsInspector: showsInspector,
+            selectedEdgePopoverPosition: selectedManualEdge.flatMap {
+                edgePopoverPosition(for: $0, viewport: viewport)
+            },
+            automationPanelFrame: automationPanelFrame
+        )
+
+        return ZStack(alignment: .topLeading) {
+            CanvasBackground(reducedDetail: activeThreadNode != nil || selectedManualEdge != nil)
+                .contentShape(Rectangle())
+                .gesture(viewportPanGesture)
+                .simultaneousGesture(viewportMagnificationGesture)
+                .overlay {
+                    scrollWheelZoomLayer(ignoredRects: ignoredScrollRects)
+                }
+                .accessibilityHidden(modalPresentation.hidesBackgroundFromAccessibility)
+                .allowsHitTesting(modalPresentation.allowsBackgroundInteraction)
+
+            positionedGraphContentLayer(viewport: viewport, presentation: canvasPresentation)
+                .accessibilityHidden(modalPresentation.hidesBackgroundFromAccessibility)
+                .allowsHitTesting(modalPresentation.allowsBackgroundInteraction)
+
+            GraphCanvasSelectionInspectorLayer(
+                graphStore: graphStore,
+                isVisible: showsInspector && modalPresentation.showsCanvasChrome
+            )
+            .padding(.top, 72)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+
+            if modalPresentation.showsCanvasChrome,
+               !showsInspector,
+               let edge = selectedManualEdge,
+               let position = edgePopoverPosition(for: edge, viewport: viewport) {
+                edgePopoverLayer(edge: edge, position: position)
+            }
+
+            if modalPresentation.allowsClickOutsideDismissal {
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: closeActiveThreadPopover)
+                    .accessibilityHidden(true)
+                    .zIndex(19)
+            }
+
+            if let threadNode = activeThreadNode {
+                threadPopoverLayer(
+                    for: threadNode,
+                    popoverSize: popoverSize,
+                    viewport: viewport,
+                    canvasSize: size
+                )
+                .zIndex(20)
+            }
+
+            if !isReadingModePresented,
+               let automationNode = activeThreadAutomationNode,
+               let automation = automation(for: automationNode),
+               let threadID = automationNode.metadata.threadRef?.threadID {
+                threadAutomationPanelLayer(
+                    for: automationNode,
+                    automation: automation,
+                    threadID: threadID,
+                    viewport: viewport,
+                    canvasSize: size
+                )
+                .zIndex(21)
+            }
+
+            #if os(macOS)
+            if isReadingModePresented {
+                readingDockLayer(in: size)
+            }
+            #endif
+        }
+        .overlay(alignment: .bottomLeading) {
+            if showsStatusStrip && !hasActiveCanvasModal {
+                StatusStrip(
+                    graphStore: graphStore,
+                    runtimeStore: runtimeStore,
+                    supervisorStore: supervisorStore
+                )
+                .padding(14)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if showsDesktopRails && !hasActiveCanvasModal {
+                operationalRailsLayer(in: size)
+                    .padding(.top, 58)
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if showsDesktopRails && !hasActiveCanvasModal {
+                threadInboxLayer()
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 14)
+            }
+        }
+    }
+
+    private func handleSelectedThreadChange(
+        from previousKey: String?,
+        to _: String?
+    ) {
+        if let previousKey {
+            let remainsOpenInReader = readingThreadIDs.contains { nodeID in
+                graphStore.graph.nodes[nodeID]?.metadata.threadRef?.qualifiedID == previousKey
+            }
+            if !remainsOpenInReader {
+                cancelLiveTranscriptRefresh(for: previousKey)
+            }
+        }
+        if selectedThreadKey != nil {
+            transientOpenGeneration &+= 1
+            transientThreadNode = nil
+        }
+        guard let selectedThreadNode else {
+            transcriptSessions.cancelPopoverLoad()
+            if transientThreadNode == nil {
+                resetThreadPopoverData()
+            }
+            return
+        }
+        resetThreadPopoverDataIfNeeded(for: selectedThreadNode.metadata.threadRef)
+        startTranscriptLoad(for: selectedThreadNode, force: true, markRead: true)
     }
 
     private var selectedNodeID: NodeID? {
@@ -427,6 +528,18 @@ public struct GraphCanvasView: View {
 
     private var selectedThreadKey: String? {
         selectedThreadNode?.metadata.threadRef?.qualifiedID ?? selectedThreadNode?.id.rawValue
+    }
+
+    private var presentedThreadChatKey: String? {
+        let node = transientThreadNode ?? selectedThreadNode
+        return node?.metadata.threadRef?.qualifiedID ?? node?.id.rawValue
+    }
+
+    private var hasActiveCanvasModal: Bool {
+        GraphCanvasModalPolicy.presentation(
+            isReadingModePresented: isReadingModePresented,
+            activeThreadKey: presentedThreadChatKey
+        ) != .none
     }
 
     private var providerActivitySignature: [String: Date] {
@@ -862,6 +975,13 @@ public struct GraphCanvasView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .transition(.opacity)
         .zIndex(30)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Thread reader")
+        .accessibilityAddTraits(.isModal)
+        .focusSection()
+        .onExitCommand {
+            isReadingModePresented = false
+        }
     }
     #endif
 
@@ -1143,6 +1263,11 @@ public struct GraphCanvasView: View {
             onThreadMentionCatalogNeeded(threadNode.metadata.threadRef)
         }
         .transition(.opacity.combined(with: .scale(scale: 0.98)))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Chat with \(threadNode.title)")
+        .accessibilityAddTraits(.isModal)
+        .focusSection()
+        .onExitCommand(perform: closeActiveThreadPopover)
         #endif
     }
 
@@ -1617,8 +1742,13 @@ public struct GraphCanvasView: View {
         let mentionedFolders = workflowFolderMentions(in: text)
 
         let localMessageID = "local-\(UUID().uuidString)"
+        let localEcho = localEchoText(for: text, attachments: attachments)
         transcriptSessions.appendLocalMessage(
-            ThreadMessage(id: localMessageID, role: .user, text: localEchoText(for: text, attachments: attachments)),
+            ThreadMessage(
+                id: localMessageID,
+                role: .user,
+                text: WorkflowPromptEnvelope.escapingReservedEnvelope(in: localEcho)
+            ),
             to: .popover,
             threadRef: threadRef
         )
@@ -1697,8 +1827,13 @@ public struct GraphCanvasView: View {
         let mentionedFolders = workflowFolderMentions(in: text)
 
         let localMessageID = "local-\(UUID().uuidString)"
+        let localEcho = localEchoText(for: text, attachments: attachments)
         transcriptSessions.appendLocalMessage(
-            ThreadMessage(id: localMessageID, role: .user, text: localEchoText(for: text, attachments: attachments)),
+            ThreadMessage(
+                id: localMessageID,
+                role: .user,
+                text: WorkflowPromptEnvelope.escapingReservedEnvelope(in: localEcho)
+            ),
             to: .reader(nodeID),
             threadRef: threadRef
         )
@@ -3510,8 +3645,9 @@ public struct GraphCanvasView: View {
         folderMentions: [WorkflowFolderMentionContext] = [],
         sourceThreadRef: ThreadRef
     ) -> String {
+        let userExecutionText = WorkflowPromptEnvelope.escapingReservedEnvelope(in: text)
         guard !mentions.isEmpty || !folderMentions.isEmpty else {
-            return text
+            return userExecutionText
         }
 
         let contextLines = mentions.map { mention in
@@ -3531,9 +3667,7 @@ public struct GraphCanvasView: View {
         )
         let routeLines = threadRouteLines + folderRouteLines
 
-        return """
-        \(text)
-
+        let workflowContext = """
         Workflow chat references:
         \(contextLines.isEmpty ? "- none" : contextLines.joined(separator: "\n"))
 
@@ -3551,6 +3685,10 @@ public struct GraphCanvasView: View {
 
         You are running as provider=\(Self.contextValue(sourceThreadRef.provider.rawValue)); hostID=\(Self.contextValue(sourceThreadRef.hostID.rawValue)); threadID=\(Self.contextValue(sourceThreadRef.threadID)). Only use these references because the user inserted explicit workflow mention tokens. Ask before using paths, endpoints, SSH details, or identity files; those values are intentionally not included here.
         """
+        return WorkflowPromptEnvelope.encode(
+            userText: userExecutionText,
+            workflowContext: workflowContext
+        )
     }
 
     private func workflowMentionDeliveryState(
@@ -3777,6 +3915,7 @@ private struct FullScreenThreadPopoverLayer: View {
             threadAutomation: threadAutomation,
             isFullScreen: true,
             allowsMoving: false,
+            initiallyFocusesComposer: true,
             canStopTurn: canStopTurn,
             isStoppingTurn: isStoppingTurn,
             onRename: onRename,
@@ -3851,6 +3990,7 @@ private struct DraggableThreadPopoverLayer: View {
             threadAutomation: threadAutomation,
             isMoving: dragOffset != .zero,
             allowsMoving: true,
+            initiallyFocusesComposer: true,
             canStopTurn: canStopTurn,
             isStoppingTurn: isStoppingTurn,
             onRename: onRename,

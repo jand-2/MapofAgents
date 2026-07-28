@@ -117,6 +117,7 @@ struct ThreadPopoverComposerView: View {
     var canStopTurn: Bool
     var isStoppingTurn: Bool
     var isFullScreen: Bool
+    var initiallyFocused: Bool
     var onStopTurn: () -> Void
     var onSend: (String, [ChatInputAttachment]) async -> Bool
 
@@ -132,6 +133,7 @@ struct ThreadPopoverComposerView: View {
         canStopTurn: Bool,
         isStoppingTurn: Bool,
         isFullScreen: Bool,
+        initiallyFocused: Bool = false,
         onStopTurn: @escaping () -> Void,
         onSend: @escaping (String, [ChatInputAttachment]) async -> Bool
     ) {
@@ -144,6 +146,7 @@ struct ThreadPopoverComposerView: View {
         self.canStopTurn = canStopTurn
         self.isStoppingTurn = isStoppingTurn
         self.isFullScreen = isFullScreen
+        self.initiallyFocused = initiallyFocused
         self.onStopTurn = onStopTurn
         self.onSend = onSend
         _session = State(initialValue: ThreadComposerSession(threadIdentity: threadIdentity))
@@ -178,6 +181,7 @@ struct ThreadPopoverComposerView: View {
                         maxLines: 8,
                         isDisabled: isAwaitingResponse || session.isSubmitting,
                         usesLocalMentionCatalog: usesLocalMentionCatalog,
+                        initiallyFocused: initiallyFocused,
                         onSubmit: sendDraft
                     )
 

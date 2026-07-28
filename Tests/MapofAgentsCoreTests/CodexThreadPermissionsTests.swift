@@ -1,5 +1,20 @@
+import Foundation
 import Testing
 @testable import MapofAgentsCore
+
+@Test
+func historicalFullAccessPermissionsRemainDecodable() throws {
+    let encoded = Data(
+        #"{"approvalPolicy":"on-request","sandboxMode":"danger-full-access"}"#.utf8
+    )
+
+    let decoded = try JSONDecoder().decode(AgentThreadPermissions.self, from: encoded)
+
+    #expect(decoded.approvalPolicy == .onRequest)
+    #expect(decoded.sandboxMode == .dangerFullAccess)
+    #expect(AgentThreadPermissions.default.sandboxMode == .workspaceWrite)
+    #expect(AgentThreadPermissions.default != decoded)
+}
 
 @Test
 func threadPermissionsEncodeLaunchParams() {
